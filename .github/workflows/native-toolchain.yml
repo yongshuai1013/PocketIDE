@@ -54,7 +54,7 @@ jobs:
           grep -Fx 'TARGET=arm64-apple-ios15.0' toolchain/ios-arm64/manifest.txt
           grep -Fx 'POCKETIDE_EMBEDDED_LLVM[sdk=iphoneos*] = 1' toolchain/NativeCompiler.generated.xcconfig
           test -f toolchain/ios-arm64/Toolchain/clang/include/stddef.h
-          xcrun lipo -verify_arch arm64 "$POCKETIDE_TOOLCHAIN_BUILD_DIR/link-check-ios"
+          xcrun lipo "$POCKETIDE_TOOLCHAIN_BUILD_DIR/link-check-ios" -verify_arch arm64
           xcrun vtool -show-build "$POCKETIDE_TOOLCHAIN_BUILD_DIR/link-check-ios" | tee build/native-logs/link-check.txt
           if codesign -dv "$POCKETIDE_TOOLCHAIN_BUILD_DIR/link-check-ios" >/dev/null 2>&1; then
             echo 'Unexpected signature on native link check' >&2

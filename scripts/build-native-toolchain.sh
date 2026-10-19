@@ -87,7 +87,7 @@ while IFS= read -r lib; do LINK_FLAGS+=("-Xlinker" "-force_load" "-Xlinker" "$li
 xcrun --sdk iphoneos clang++ -arch arm64 -isysroot "$SDKROOT" -miphoneos-version-min=15.0 \
   -std=c++17 -I "$BRIDGE/include" "$BUILD_ROOT/link-check.cpp" "$BUILD_ROOT/bridge-ios.o" \
   "${LINK_FLAGS[@]}" -lc++ -Wl,-no_adhoc_codesign -o "$BUILD_ROOT/link-check-ios"
-xcrun lipo -verify_arch arm64 "$BUILD_ROOT/link-check-ios"
+xcrun lipo "$BUILD_ROOT/link-check-ios" -verify_arch arm64
 {
   printf 'LLVM_VERSION=18.1.8\nLLVM_COMMIT=%s\nTARGET=arm64-apple-ios15.0\nXCODE=16.4\n' "$LLVM_COMMIT"
   printf 'IOS_SDK=%s\nSWIFT_FRONTEND=0\n' "$(xcrun --sdk iphoneos --show-sdk-version)"
