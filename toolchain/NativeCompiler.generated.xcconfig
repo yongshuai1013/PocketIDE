@@ -1,0 +1,7 @@
+// Default-off: no prebuilt libraries are assumed to exist.
+POCKETIDE_EMBEDDED_LLVM = 0
+HEADER_SEARCH_PATHS = $(inherited)
+LIBRARY_SEARCH_PATHS = $(inherited)
+OTHER_LDFLAGS = $(inherited)
+CLANG_CXX_LANGUAGE_STANDARD = c++17
+IPHONEOS_DEPLOYMENT_TARGET = 15.0

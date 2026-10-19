@@ -5,7 +5,7 @@ import IDECore
 final class EditorModel: ObservableObject {
     @Published var workspace: Workspace
     @Published var selectedFileID: UUID?
-    @Published var console = "Ready. Native compiler toolchain is unavailable in this app."
+    @Published var console = "Ready. C builds require embedded Clang/LLD and a locally supplied SDK. Swift is not integrated yet."
     @Published var isBuilding = false
     @Published var notice: String?
 
@@ -15,7 +15,7 @@ final class EditorModel: ObservableObject {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         workspaceURL = documents.appendingPathComponent("PocketIDE", isDirectory: true)
             .appendingPathComponent("workspace.json")
-        workspace = Workspace.sample(language: .swift)
+        workspace = Workspace.sample(language: .c)
         selectedFileID = workspace.files.first?.id
     }
 
@@ -44,7 +44,7 @@ final class EditorModel: ObservableObject {
     func choose(_ language: SourceLanguage) {
         workspace = Workspace.sample(language: language)
         selectedFileID = workspace.files.first?.id
-        console = "Loaded the \(language.rawValue.uppercased()) sample. Build is unavailable without a native toolchain."
+        console = "Loaded the \(language.rawValue.uppercased()) sample.\n\(EmbeddedCSetup.status)\nSwift frontend is not integrated yet."
         notice = "Loaded \(language.rawValue.uppercased()) sample"
     }
 
@@ -79,15 +79,17 @@ final class EditorModel: ObservableObject {
     func build() {
         guard !isBuilding else { return }
         isBuilding = true
-        console = "Preparing build…\nNative compilation is unavailable on this device."
+        let snapshot = workspace
+        console = "Preparing in-process C build…"
         Task {
             defer { isBuilding = false }
             do {
-                let backend = UnavailableNativeBackend()
-                let result = try await backend.build(workspace: workspace)
+                guard snapshot.files.allSatisfy({ $0.language == .c }) else { throw NativeCError.swiftNotSupported }
+                let backend = try EmbeddedCSetup.backend()
+                let result = try await backend.build(workspace: snapshot)
                 console = result.output
             } catch {
-                console = "Build unavailable: \(error.localizedDescription)\nNo compilation, signing, installation, or execution was performed."
+                console = "Build failed or unavailable: \(error.localizedDescription)\nNo signing, installation, or execution was performed."
             }
         }
     }
@@ -145,7 +147,7 @@ struct EditorView: View {
                 Text(model.workspace.name)
                     .font(.headline)
                     .lineLimit(1)
-                Text("Local workspace · Build toolchain unavailable")
+                Text(EmbeddedCSetup.status)
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -153,7 +155,7 @@ struct EditorView: View {
             Circle()
                 .fill(Color.orange)
                 .frame(width: 8, height: 8)
-                .accessibilityLabel("Native build unavailable")
+                .accessibilityLabel(EmbeddedCSetup.status)
         }
         .padding(.horizontal)
         .padding(.vertical, 12)
@@ -220,7 +222,7 @@ struct EditorView: View {
                 Label("Build console", systemImage: "terminal")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("NOT RUNNING")
+                Text(model.isBuilding ? "BUILDING" : "NO EXECUTION")
                     .font(.system(size: 9, weight: .bold))
                     .tracking(0.8)
                     .foregroundColor(.orange)
@@ -234,7 +236,7 @@ struct EditorView: View {
             }
             .frame(minHeight: 58, maxHeight: 88)
             .accessibilityLabel("Build console output")
-            Text("This editor does not compile, sign, install, or run code.")
+            Text("C: optional embedded Clang/LLD. Swift: pending. No signing, installation or execution.")
                 .font(.caption2)
                 .foregroundColor(.secondary)
         }

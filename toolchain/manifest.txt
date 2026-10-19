@@ -1,0 +1,7 @@
+# Source pin template only. Successful builds write ios-arm64/manifest.txt; this file is not proof of an installed bundle.
+LLVM_VERSION=18.1.8
+LLVM_COMMIT=3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff
+SOURCE=https://github.com/llvm/llvm-project.git (tag llvmorg-18.1.8 peeled commit)
+TARGET=arm64-apple-ios15.0
+XCODE=16.4
+# Apple iPhoneOS SDK is intentionally not included. See ios-arm64/manifest.txt for a built library list.

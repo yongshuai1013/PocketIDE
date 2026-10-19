@@ -32,6 +32,10 @@ jobs:
           xcrun swift --version
       - name: Test core package
         run: swift test --package-path Packages/IDECore --parallel
+      - name: Build native bridge package (without LLVM)
+        run: swift build --package-path Packages/NativeCompilerBridge
+      - name: Smoke test native bridge stub (not an embedded compiler test)
+        run: bash Packages/NativeCompilerBridge/scripts/host-smoke.sh
       - name: Smoke test macOS host compilers (not iOS native compilation)
         run: bash scripts/host-smoke.sh
 

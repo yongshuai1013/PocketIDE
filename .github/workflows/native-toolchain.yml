@@ -1,0 +1,117 @@
+name: Native LLVM 18.1.8 iOS toolchain
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-toolchain.yml'
+      - 'scripts/build-native-toolchain.sh'
+      - 'Packages/NativeCompilerBridge/**'
+      - 'toolchain/**'
+      - 'project.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-toolchain-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-toolchain:
+    name: LLVM 18.1.8 / iOS 15 / arm64 (unsigned)
+    runs-on: macos-15
+    timeout-minutes: 330
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      JOBS: '3'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Verify Xcode and build prerequisites
+        run: |
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version | grep -Fx 'Xcode 16.4'
+          xcrun --sdk iphoneos --show-sdk-version
+          command -v cmake >/dev/null || brew install cmake
+          command -v ninja >/dev/null || brew install ninja
+          cmake --version
+          ninja --version
+          mkdir -p build/native-logs
+          echo "POCKETIDE_TOOLCHAIN_BUILD_DIR=$RUNNER_TEMP/pocketide-llvm-build" >> "$GITHUB_ENV"
+          df -h . "$RUNNER_TEMP"
+      - name: Build pinned LLVM and link the real bridge for iOS
+        run: |
+          set -o pipefail
+          bash scripts/build-native-toolchain.sh 2>&1 | tee build/native-logs/toolchain.log
+      - name: Verify native bundle and iOS link check
+        run: |
+          grep -Fx 'LLVM_VERSION=18.1.8' toolchain/ios-arm64/manifest.txt
+          grep -Fx 'LLVM_COMMIT=3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff' toolchain/ios-arm64/manifest.txt
+          grep -Fx 'TARGET=arm64-apple-ios15.0' toolchain/ios-arm64/manifest.txt
+          grep -Fx 'POCKETIDE_EMBEDDED_LLVM[sdk=iphoneos*] = 1' toolchain/NativeCompiler.generated.xcconfig
+          test -f toolchain/ios-arm64/Toolchain/clang/include/stddef.h
+          xcrun lipo -verify_arch arm64 "$POCKETIDE_TOOLCHAIN_BUILD_DIR/link-check-ios"
+          xcrun vtool -show-build "$POCKETIDE_TOOLCHAIN_BUILD_DIR/link-check-ios" | tee build/native-logs/link-check.txt
+          if codesign -dv "$POCKETIDE_TOOLCHAIN_BUILD_DIR/link-check-ios" >/dev/null 2>&1; then
+            echo 'Unexpected signature on native link check' >&2
+            exit 1
+          fi
+      - name: Build pinned XcodeGen
+        run: bash scripts/bootstrap-xcodegen.sh
+      - name: Generate project with the native bundle present
+        run: '"$RUNNER_TEMP/xcodegen-bin/xcodegen" generate --spec project.yml'
+      - name: Build unsigned app with embedded Clang and LLD
+        run: |
+          set -o pipefail
+          xcodebuild -project PocketIDE.xcodeproj -scheme PocketIDE \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/NativeDevice ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            IPHONEOS_DEPLOYMENT_TARGET=15.0 build 2>&1 | tee build/native-logs/app.log
+      - name: Verify unsigned app and bundled compiler headers
+        run: |
+          app=build/NativeDevice/Build/Products/Release-iphoneos/PocketIDE.app
+          bash scripts/verify-app.sh "$app"
+          test -f "$app/Toolchain/clang/include/stddef.h"
+          test ! -d "$app/Toolchain/iPhoneOS.sdk"
+          ditto -c -k --sequesterRsrc --keepParent "$app" build/PocketIDE-native-unsigned-app.zip
+      - name: Package toolchain without Apple SDK
+        run: |
+          # Explicit allowlist: LLVM archives/headers/resources/licenses and generated settings only.
+          tar -czf build/PocketIDE-LLVM-18.1.8-ios15-arm64.tar.gz \
+            toolchain/ios-arm64 toolchain/NativeCompiler.generated.xcconfig
+          shasum -a 256 build/PocketIDE-LLVM-18.1.8-ios15-arm64.tar.gz \
+            build/PocketIDE-native-unsigned-app.zip > build/native-artifacts.sha256
+      - name: Upload native toolchain and unsigned app (not installable IPA)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: PocketIDE-LLVM-18.1.8-ios15-arm64
+          path: |
+            build/PocketIDE-LLVM-18.1.8-ios15-arm64.tar.gz
+            build/PocketIDE-native-unsigned-app.zip
+            build/native-artifacts.sha256
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+      - name: Collect configuration diagnostics (no SDK files)
+        if: always()
+        run: |
+          mkdir -p build/native-logs
+          cd "${POCKETIDE_TOOLCHAIN_BUILD_DIR:-$RUNNER_TEMP/pocketide-llvm-build}" || exit 0
+          find . -type f \
+            \( -name CMakeCache.txt -o -name CMakeConfigureLog.yaml -o -name CMakeError.log -o -name CMakeOutput.log \) \
+            -exec sh -c 'for f do mkdir -p "$GITHUB_WORKSPACE/build/native-logs/$(dirname "$f")"; cp "$f" "$GITHUB_WORKSPACE/build/native-logs/$f"; done' sh {} +
+          df -h . > "$GITHUB_WORKSPACE/build/native-logs/disk-space.txt"
+      - name: Upload native build logs even on failure
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-toolchain-build-logs
+          path: build/native-logs/
+          if-no-files-found: warn
+          retention-days: 7

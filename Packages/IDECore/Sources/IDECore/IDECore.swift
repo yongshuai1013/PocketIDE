@@ -177,7 +177,11 @@ public enum BuildPlanner {
 
 public struct BuildResult: Equatable {
     public let output: String
-    public init(output: String) { self.output = output }
+    public let artifactURL: URL?
+    public init(output: String, artifactURL: URL? = nil) {
+        self.output = output
+        self.artifactURL = artifactURL
+    }
 }
 
 public enum CompilerBackendError: Error, Equatable, LocalizedError {

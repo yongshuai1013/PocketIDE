@@ -10,3 +10,5 @@ xcuserdata/
 *.p12
 *.mobileprovision
 .env
+.toolchain-build/
+toolchain/ios-arm64/
