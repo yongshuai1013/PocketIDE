@@ -26,10 +26,13 @@ final class CWorkspaceImportTests: XCTestCase {
     }
 
     private func temporaryRoot() throws -> URL {
-        // Resolve macOS /var -> /private/var aliases before symlink ancestry checks.
-        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true).resolvingSymlinksInPath()
+        // Canonicalize only after creation: Foundation can leave /var aliases
+        // unresolved for a nonexistent leaf on macOS. Keep the importer strict.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        return root
+        let resolved = try XCTUnwrap(realpath(root.path, nil))
+        defer { free(resolved) }
+        return URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
     }
 
     func testValidDecodeCreatesIndependentCFiles() throws {
