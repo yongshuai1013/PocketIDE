@@ -1,0 +1,47 @@
+name: PocketIDE
+options:
+  minimumXcodeGenVersion: 2.44.1
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+packages:
+  IDECore:
+    path: Packages/IDECore
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    CODE_SIGNING_ALLOWED: NO
+    CODE_SIGNING_REQUIRED: NO
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+targets:
+  PocketIDE:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.pocketide.app
+        PRODUCT_NAME: PocketIDE
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Pocket IDE
+        INFOPLIST_KEY_LSRequiresIPhoneOS: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+    dependencies:
+      - package: IDECore
+schemes:
+  PocketIDE:
+    build:
+      targets:
+        PocketIDE: all
+    run:
+      config: Debug
+    archive:
+      config: Release
