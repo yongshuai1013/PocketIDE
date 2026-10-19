@@ -27,7 +27,6 @@ targets:
       - path: toolchain/ios-arm64/Toolchain
         type: folder
         buildPhase: resources
-        optional: true
     settings:
       base:
         SWIFT_OBJC_BRIDGING_HEADER: Packages/NativeCompilerBridge/Sources/NativeCompilerBridge/include/NativeCompilerBridge.h

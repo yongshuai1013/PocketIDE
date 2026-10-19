@@ -18,6 +18,7 @@ App 的 Build 現在接到可選的 **Clang／LLD C ABI 橋接**，不是 shell�
 export DEVELOPER_DIR=/Applications/Xcode_16.4.app/Contents/Developer
 export RUNNER_TEMP="${TMPDIR:-/tmp}/pocketide-tools"
 bash scripts/bootstrap-xcodegen.sh
+bash scripts/prepare-toolchain-resources.sh
 "$RUNNER_TEMP/xcodegen-bin/xcodegen" generate --spec project.yml
 open PocketIDE.xcodeproj
 ```

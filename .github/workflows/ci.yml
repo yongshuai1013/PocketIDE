@@ -56,6 +56,10 @@ jobs:
           xcodebuild -version
       - name: Build pinned XcodeGen
         run: bash scripts/bootstrap-xcodegen.sh
+      - name: Prepare optional native resource folder reference
+        run: |
+          bash scripts/test-prepare-toolchain-resources.sh
+          bash scripts/prepare-toolchain-resources.sh
       - name: Generate Xcode project
         run: '"$RUNNER_TEMP/xcodegen-bin/xcodegen" generate --spec project.yml'
       - name: Build for simulator

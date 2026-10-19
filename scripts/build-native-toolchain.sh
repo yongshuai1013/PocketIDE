@@ -42,8 +42,11 @@ cmake -S "$SRC/llvm" -B "$HOST_BUILD" -G Ninja \
   -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_ZLIB=OFF -DLLVM_ENABLE_ZSTD=OFF \
   -DLLVM_ENABLE_LIBXML2=OFF -DLLVM_ENABLE_LIBEDIT=OFF -DLLVM_ENABLE_LIBPFM=OFF
 cmake --build "$HOST_BUILD" --target llvm-tblgen clang-tblgen --parallel "$JOBS"
+# CMake defaults executables to app bundles for iOS. LLVM's auxiliary tools
+# use RUNTIME install rules, not BUNDLE rules, even when excluded from the build.
 cmake -S "$SRC/llvm" -B "$IOS_BUILD" -G Ninja \
   -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$SDKROOT" -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_MACOSX_BUNDLE=OFF \
   -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
   -DCMAKE_C_COMPILER="$(xcrun --find clang)" -DCMAKE_CXX_COMPILER="$(xcrun --find clang++)" \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DLLVM_BUILD_LLVM_DYLIB=OFF \

@@ -32,7 +32,7 @@ JOBS=4 bash scripts/build-native-toolchain.sh
 
 成功後才生成 `toolchain/NativeCompiler.generated.xcconfig`，供 `project.yml` 的 App target 使用。啟用設定僅套用 `iphoneos`；模擬器仍編譯 stub，不能連入裝置靜態庫。靜態庫使用 `-force_load` 避免註冊碼被漏掉，但會增加體積，也可能暴露缺失依賴或符號衝突；須以實際 Mac link 結果檢查，不可把這份未實跑的配方當成已發布工具鏈。
 
-XcodeGen 同時把 `toolchain/ios-arm64/Toolchain` 以 folder resource 複製進 App，Clang builtin headers 最終位於 `App Bundle/Toolchain/clang/include`。只有先完成工具鏈建置、再產生 Xcode 專案，這個可選目錄才會被納入；若後補工具鏈，請重新執行 XcodeGen。
+XcodeGen 將 `toolchain/ios-arm64/Toolchain` 以 folder resource 複製進 App，Clang builtin headers 最終位於 `App Bundle/Toolchain/clang/include`。XcodeGen 2.44.1 的 `optional: true` 不會避免 Xcode 在資源目錄不存在時複製失敗；一般建置應在產生專案前執行 `bash scripts/prepare-toolchain-resources.sh`，它只建立空目錄且不更動既有原生資源。原生建置成功後，該目錄由真實 Clang headers 填入，native workflow 另行驗證 bundle 內容；不可用空目錄準備步驟取代原生工具鏈建置／驗證。若先前已產生 Xcode 專案而目錄仍不存在，建立目錄後重新執行 XcodeGen。
 
 ### 在 GitHub Actions 建置
 
