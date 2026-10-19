@@ -38,8 +38,9 @@ enum EmbeddedCSetup {
     static var status: String {
         guard EmbeddedCInvoker().isAvailable else { return "Embedded Clang/LLD not linked (stub build)" }
         do {
-            try configuration().validate()
-            return "C toolchain resources found · iOS 15 arm64"
+            let evidence = try configuration().preflight()
+            let unknown = evidence.filter { $0.hasPrefix("Unverified:") }.count
+            return "C preflight · iOS 15 arm64 · \(unknown) unverified checks"
         } catch { return error.localizedDescription }
     }
 

@@ -153,6 +153,32 @@ final class NativeCBackendTests: XCTestCase {
         } catch { XCTAssertTrue(invoker.calls.isEmpty) }
     }
 
+    func testLargeDiagnosticsAreBoundedWithoutLosingFinalStatus() async throws {
+        let invoker = RecordingInvoker()
+        invoker.diagnostics = String(repeating: "diagnostic ", count: 20_000)
+        let result = try await NativeCBackend(configuration: configuration, invoker: invoker).build(workspace: .sample(language: .c))
+        XCTAssertLessThanOrEqual(result.output.utf8.count, BuildRetention.maximumLogBytes)
+        XCTAssertTrue(result.output.contains("[build log truncated]"))
+        XCTAssertTrue(result.output.contains("Not signed, installed, or executed."))
+        let saved = try String(contentsOf: try XCTUnwrap(result.artifactURL).deletingLastPathComponent().appendingPathComponent("build.log"), encoding: .utf8)
+        XCTAssertEqual(saved, result.output)
+    }
+
+    func testSymlinkArtifactRejectedBeforeLinkAndExternalFileUntouched() async throws {
+        let outside = root.appendingPathComponent("external.o")
+        let data = RecordingInvoker.header(fileType: 1)
+        try data.write(to: outside)
+        let invoker = RecordingInvoker()
+        invoker.symlinkTarget = outside
+        do {
+            _ = try await NativeCBackend(configuration: configuration, invoker: invoker).build(workspace: .sample(language: .c))
+            XCTFail("Expected symlink rejection")
+        } catch { XCTAssertTrue(error.localizedDescription.contains("escaped") || error.localizedDescription.contains("symlink")) }
+        XCTAssertEqual(invoker.calls.count, 1)
+        XCTAssertEqual(try Data(contentsOf: outside), data)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: configuration.buildsURL.path).count, 0)
+    }
+
     func testMachOSanityRejectsWrongArchitectureAndFileType() throws {
         let url = root.appendingPathComponent("bad.o")
         try Data(repeating: 0, count: 32).write(to: url)
@@ -172,18 +198,24 @@ private final class RecordingInvoker: NativeCInvoker {
     var calls = [(NativeTool, [String])]()
     var failure: NativeTool?
     var writeArtifacts = true
+    var diagnostics = ""
+    var symlinkTarget: URL?
     func invoke(_ tool: NativeTool, arguments: [String]) -> NativeInvocationResult {
         calls.append((tool, arguments))
         if failure == tool { return NativeInvocationResult(exitCode: 1, diagnostics: "test compiler diagnostic") }
         if writeArtifacts, let index = arguments.firstIndex(of: "-o") {
-            do { try Self.header(fileType: tool == .clang ? 1 : 2).write(to: URL(fileURLWithPath: arguments[index + 1])) }
+            do {
+                let url = URL(fileURLWithPath: arguments[index + 1])
+                if let target = symlinkTarget { try FileManager.default.createSymbolicLink(at: url, withDestinationURL: target) }
+                else { try Self.header(fileType: tool == .clang ? 1 : 2).write(to: url) }
+            }
             catch { return NativeInvocationResult(exitCode: 1, diagnostics: error.localizedDescription) }
         }
-        return NativeInvocationResult(exitCode: 0)
+        return NativeInvocationResult(exitCode: 0, diagnostics: diagnostics)
     }
     static func header(fileType: UInt32) -> Data {
         var data = Data()
-        for word: UInt32 in [0xfeedfacf, 0x0100000c, 0, fileType, 0, 0, 0, 0] {
+        for word: UInt32 in [0xfeedfacf, 0x0100000c, 0, fileType, 1, 24, 0, 0, 0x32, 24, 2, 0x000f0000, 0x00120500, 0] {
             data.append(contentsOf: (0..<4).map { UInt8((word >> (8 * $0)) & 255) })
         }
         return data

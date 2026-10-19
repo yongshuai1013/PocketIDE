@@ -178,9 +178,11 @@ public enum BuildPlanner {
 public struct BuildResult: Equatable {
     public let output: String
     public let artifactURL: URL?
-    public init(output: String, artifactURL: URL? = nil) {
+    public let diagnostics: [BuildDiagnostic]
+    public init(output: String, artifactURL: URL? = nil, diagnostics: [BuildDiagnostic] = []) {
         self.output = output
         self.artifactURL = artifactURL
+        self.diagnostics = diagnostics
     }
 }
 

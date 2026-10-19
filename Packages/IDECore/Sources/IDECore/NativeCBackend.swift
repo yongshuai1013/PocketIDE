@@ -61,11 +61,11 @@ public enum NativeCError: Error, LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .swiftNotSupported: return "The Swift frontend is not integrated yet. Choose a C workspace."
-        case .invalidConfiguration(let reason): return "Invalid native toolchain configuration: \(reason)"
-        case .missingResource(let path): return "Required SDK or Clang resource is missing: \(path)"
+        case .invalidConfiguration(let reason): return "Invalid native toolchain configuration: \(DiagnosticRedactor.redact(reason))"
+        case .missingResource(let path): return "Required SDK or Clang resource is missing: \(DiagnosticRedactor.redact(path))"
         case .workspaceTooLarge: return "This initial backend accepts at most 32 files and 2 MiB of source."
-        case .invocationFailed(let tool, let diagnostics): return "\(tool) failed:\n\(diagnostics)"
-        case .invalidArtifact(let path): return "Compiler did not produce the expected arm64 Mach-O artifact: \(path)"
+        case .invocationFailed(let tool, let diagnostics): return "\(tool) failed:\n\(DiagnosticRedactor.redact(diagnostics))"
+        case .invalidArtifact(let path): return "Compiler did not produce the expected arm64 Mach-O artifact: \(DiagnosticRedactor.redact(path))"
         }
     }
 }
@@ -82,6 +82,12 @@ public actor NativeCBackend: CompilerBackend {
     }
 
     public func build(workspace: Workspace) async throws -> BuildResult {
+        // Retention and compilation share a process-wide critical section: another
+        // backend instance must not prune an in-flight UUID directory.
+        try BuildRetention.serialized { try buildSynchronously(workspace: workspace) }
+    }
+
+    private func buildSynchronously(workspace: Workspace) throws -> BuildResult {
         // Validate editable filenames before creating any output or invoking native code.
         _ = try BuildPlanner.plan(workspace: workspace)
         guard workspace.files.allSatisfy({ $0.language == .c }) else { throw NativeCError.swiftNotSupported }
@@ -90,61 +96,78 @@ public actor NativeCBackend: CompilerBackend {
             throw NativeCError.workspaceTooLarge
         }
         guard invoker.isAvailable else { throw CompilerBackendError.toolchainNotInstalled }
-        try configuration.validate()
+        let preflight = try configuration.preflight()
         try Task.checkCancellation()
 
         let fm = FileManager.default
+        try BuildRetention.prepare(configuration)
         let root = configuration.buildsURL.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        try BuildRetention.checkChild(root, of: configuration.buildsURL)
         var succeeded = false
         defer { if !succeeded { try? fm.removeItem(at: root) } }
-        var log = ["In-process C build · arm64 · iOS 15.0"]
+        let redactor = DiagnosticRedactor(buildRoot: root, sdkRoot: configuration.sdkURL, resourceRoot: configuration.resourceURL)
+        let parser = CBuildDiagnosticParser(buildRoot: root, files: workspace.files, redactor: redactor)
+        var diagnostics = [BuildDiagnostic]()
+        var log = BuildRetention.boundedLog(redactor.redact("In-process C build · arm64 · iOS 15.0\n" + preflight.joined(separator: "\n")))
+        func appendLog(_ text: String) { log = BuildRetention.boundedLog(log + "\n" + BuildRetention.boundedLog(redactor.redact(text))) }
+        func record(_ result: NativeInvocationResult, phase: BuildPhase) {
+            let parsed = parser.parse(result.diagnostics, phase: phase, failed: result.exitCode != 0)
+            diagnostics.append(contentsOf: parsed.prefix(max(0, CBuildDiagnosticParser.maximumDiagnostics - diagnostics.count)))
+            // Even a full warning list must retain the later failure's phase/error.
+            if result.exitCode != 0, let error = parsed.last(where: { $0.severity == .error || $0.severity == .fatal }),
+               !diagnostics.contains(where: { $0.id == error.id }) {
+                if diagnostics.count == CBuildDiagnosticParser.maximumDiagnostics { diagnostics.removeLast() }
+                diagnostics.append(error)
+            }
+        }
         var objects = [URL]()
         for file in workspace.files {
             try Task.checkCancellation()
             let source = root.appendingPathComponent(file.name)
             let object = root.appendingPathComponent((file.name as NSString).deletingPathExtension + ".o")
+            try BuildRetention.checkChild(source, of: root)
+            try BuildRetention.checkChild(object, of: root)
             try file.contents.write(to: source, atomically: true, encoding: .utf8)
             let args = ["clang", "-target", "arm64-apple-ios15.0", "-isysroot", configuration.sdkURL.path,
                         "-resource-dir", configuration.resourceURL.path, "-miphoneos-version-min=15.0",
                         "-std=c17", "-fno-modules", "-fno-color-diagnostics", "-c", source.path, "-o", object.path]
             let result = invoker.invoke(.clang, arguments: args)
-            log.append("Compile \(file.name)\n\(result.diagnostics)")
+            appendLog("Compile \(file.name)\n\(result.diagnostics)")
+            record(result, phase: .compile)
             guard result.exitCode == 0 else {
-                throw NativeCError.invocationFailed(tool: "Clang (\(file.name))", diagnostics: log.joined(separator: "\n"))
+                throw NativeBuildFailure(tool: "Clang (\(file.name))", output: log, diagnostics: diagnostics)
             }
+            try BuildRetention.checkChild(root, of: configuration.buildsURL)
+            try BuildRetention.checkCurrentSize(root)
+            try BuildRetention.checkChild(object, of: root)
             try Self.validateMachO(at: object, fileType: 1)
             objects.append(object)
         }
         try Task.checkCancellation()
         let executable = root.appendingPathComponent("PocketIDE.out")
+        try BuildRetention.checkChild(executable, of: root)
         let args = ["ld64.lld", "-arch", "arm64", "-syslibroot", configuration.sdkURL.path,
                     "-platform_version", "ios", "15.0", configuration.sdkVersion,
                     "-no_adhoc_codesign", "-o", executable.path] + objects.map(\.path) + ["-lSystem"]
         let linked = invoker.invoke(.linker, arguments: args)
-        log.append("Link PocketIDE.out\n\(linked.diagnostics)")
+        appendLog("Link PocketIDE.out\n\(linked.diagnostics)")
+        record(linked, phase: .link)
         guard linked.exitCode == 0 else {
-            throw NativeCError.invocationFailed(tool: "LLD", diagnostics: log.joined(separator: "\n"))
+            throw NativeBuildFailure(tool: "LLD", output: log, diagnostics: diagnostics)
         }
+        try BuildRetention.checkChild(root, of: configuration.buildsURL)
+        try BuildRetention.checkCurrentSize(root)
+        try BuildRetention.checkChild(executable, of: root)
         try Self.validateMachO(at: executable, fileType: 2)
-        log.append("Produced unsigned Mach-O: \(executable.path)\nNot signed, installed, or executed.")
-        let output = log.joined(separator: "\n")
-        try output.write(to: root.appendingPathComponent("build.log"), atomically: true, encoding: .utf8)
+        appendLog("Produced unsigned Mach-O: \(executable.path)\nNot signed, installed, or executed.")
+        let output = log
+        let logURL = root.appendingPathComponent("build.log")
+        try BuildRetention.checkChild(logURL, of: root)
+        try output.write(to: logURL, atomically: true, encoding: .utf8)
+        try BuildRetention.prune(configuration.buildsURL, keeping: root)
         succeeded = true
-        return BuildResult(output: output, artifactURL: executable)
+        return BuildResult(output: output, artifactURL: executable, diagnostics: diagnostics)
     }
 
-    /// A sanity check, not a substitute for a full Mach-O parser or device validation.
-    public static func validateMachO(at url: URL, fileType: UInt32) throws {
-        guard let handle = try? FileHandle(forReadingFrom: url) else { throw NativeCError.invalidArtifact(url.path) }
-        defer { try? handle.close() }
-        let data = try handle.read(upToCount: 32) ?? Data()
-        func word(_ index: Int) -> UInt32 {
-            let start = index * 4
-            return (0..<4).reduce(UInt32(0)) { $0 | (UInt32(data[start + $1]) << (8 * $1)) }
-        }
-        guard data.count == 32, word(0) == 0xfeedfacf, word(1) == 0x0100000c, word(3) == fileType else {
-            throw NativeCError.invalidArtifact(url.path)
-        }
-    }
 }

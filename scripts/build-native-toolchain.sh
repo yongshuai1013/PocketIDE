@@ -89,11 +89,12 @@ xcrun --sdk iphoneos clang++ -arch arm64 -isysroot "$SDKROOT" -miphoneos-version
   "${LINK_FLAGS[@]}" -lc++ -Wl,-no_adhoc_codesign -o "$BUILD_ROOT/link-check-ios"
 xcrun lipo "$BUILD_ROOT/link-check-ios" -verify_arch arm64
 {
-  printf 'LLVM_VERSION=18.1.8\nLLVM_COMMIT=%s\nTARGET=arm64-apple-ios15.0\nXCODE=16.4\n' "$LLVM_COMMIT"
+  printf 'LLVM_VERSION=18.1.8\nBUILTIN_HEADERS_VERSION=18.1.8\nLLVM_COMMIT=%s\nTARGET=arm64-apple-ios15.0\nXCODE=16.4\n' "$LLVM_COMMIT"
   printf 'IOS_SDK=%s\nSWIFT_FRONTEND=0\n' "$(xcrun --sdk iphoneos --show-sdk-version)"
   printf 'LIBRARIES:\n'
   find "$STAGE/lib" -maxdepth 1 -name '*.a' -type f | LC_ALL=C sort | sed "s#^$STAGE/##"
 } > "$STAGE/manifest.txt"
+cp "$STAGE/manifest.txt" "$STAGE/Toolchain/manifest.txt"
 rm -rf "$PREFIX"
 mv "$STAGE" "$PREFIX"
 {
