@@ -60,7 +60,7 @@ try:
 except ProcessLookupError:
     pass
 # Keep build step/diagnostic lines, not compiler-emitted source excerpts or raw source.
-keep = re.compile(r'^(?:\[\d+/\d+|FAILED:|ninja:|PROBE_EXIT=|-- |CMake (?:Error|Warning)|.*?(?:fatal error:|error:|warning:)|[A-Za-z0-9_./+-]+\.(?:cpp|c|h|hpp):\d+:)')
+keep = re.compile(r'^(?:\[\d+/\d+|FAILED:|ninja:|PROBE_EXIT=|-- |CMake (?:Error|Warning)|ld:|Undefined symbols for architecture|\s+"[^"\n]+", referenced from:|\s+.+ in [^\s]+\.(?:a|o)(?:\[|\(|$)|.*?(?:fatal error:|error:|warning:)|[A-Za-z0-9_./+-]+\.(?:cpp|c|h|hpp):\d+:)')
 retained = [line[:8192] for line in raw.read_text(errors='replace').splitlines() if keep.match(line) and not line.lstrip().startswith(('#include', '^', '|'))]
 (logs / 'probe.log').write_text('\n'.join(retained) + '\n')
 (logs / 'resource-metadata.txt').write_text(f'EXIT_CODE={rc}\nSTOP_REASON={reason or "process exited"}\nELAPSED_SECONDS={time.monotonic()-started:.1f}\nPEAK_PROCESS_TREE_RSS_BYTES={peak_rss}\nPEAK_PROBE_DISK_BYTES={peak_disk}\nNINJA_PARALLEL=2; native tablegen parallel=3\nOVERALL_PROBE_LIMIT_SECONDS=9900\nJOB_LIMIT_MINUTES=180\nRaw logs, source excerpts, SDKs and compiled artifacts are not uploaded.\n')
