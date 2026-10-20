@@ -1,0 +1,64 @@
+name: Temporary Swift iOS minimal CMake platform probe
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/temporary-swift-ios-probe.yml']
+permissions:
+  contents: read
+concurrency:
+  group: temporary-swift-ios-probe
+  cancel-in-progress: false
+jobs:
+  probe:
+    if: github.event.head_commit.message == 'Probe one-time minimal Swift iOS CMake UUID platform fix'
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Configure with one-line UUID iOS platform fix; bounded link plan only
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p probe-logs
+          bash scripts/temporary-swift-ios-probe.sh 2>&1 | tee probe-logs/probe.log
+      - name: Inspect text-only artifact allowlist
+        id: audit
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          root = Path('probe-logs')
+          allowed = {'probe.log', 'stage.txt', 'sources.txt', 'link-metadata.txt', 'build-plan.txt', 'platform-fix.diff', 'configure-metadata.txt'}
+          rows = []
+          for p in sorted(root.iterdir()):
+              assert p.name in allowed and p.is_file() and not p.is_symlink(), str(p)
+              data = p.read_bytes()
+              import os, re
+              text = data.decode('utf-8')
+              for key in ('GITHUB_WORKSPACE', 'RUNNER_TEMP', 'HOME'):
+                  value = os.environ.get(key)
+                  if value:
+                      text = text.replace(value, '<' + key + '>')
+              text = re.sub(r'(?i)(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)', '<REDACTED_TOKEN>', text)
+              data = text.encode('utf-8')
+              p.write_bytes(data)
+              assert b'\0' not in data, str(p)
+              data.decode('utf-8')
+              rows.append(f'{p.name}\t{len(data)}\t{hashlib.sha256(data).hexdigest()}')
+          (root / 'artifact-audit.txt').write_text('\n'.join(rows) + '\nOnly generated text logs/metadata; no binaries, headers, SDKs, archives or symlinks.\n')
+          print((root / 'artifact-audit.txt').read_text())
+          PY
+      - name: Upload audited diagnostic text only
+        if: always() && steps.audit.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: temporary-swift-ios-platform-fix-logs
+          path: probe-logs/
+          if-no-files-found: error
+          retention-days: 7
