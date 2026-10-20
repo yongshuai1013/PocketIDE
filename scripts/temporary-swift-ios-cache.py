@@ -68,7 +68,7 @@ def signature() -> str:
         "swiftc_version": run(["xcrun", "swiftc", "--version"]), "build_script_sha256": sha(script),
         "cache_helper_sha256": sha(SCRIPT),
         "configuration": {"arch": "arm64", "target": "ios15", "configuration": "Release",
-                          "optimization": "O1", "generator": "Ninja", "jobs": 2, "uuid_config": "Apple-libSystem", "SWIFT_BUILD_SWIFT_SYNTAX": True, "ASTGen": True, "SwiftSyntax_library_type": "STATIC", "HAVE_LIBRT": False},
+                          "optimization": "O1", "generator": "Ninja", "jobs": 2, "uuid_config": "Apple-libSystem", "SWIFT_BUILD_SWIFT_SYNTAX": True, "ASTGen": True, "SwiftSyntax_library_type": "STATIC", "HAVE_LIBRT": False, "SWIFT_BUILD_STDLIB_EXTRA_TOOLCHAIN_CONTENT": True, "SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT": True},
     }
     assert "Xcode 16.4" in fingerprint["xcodebuild"], "Xcode 16.4 required"
     assert fingerprint["sdk_version"] == "18.5", "iPhoneOS SDK 18.5 required"
@@ -154,7 +154,7 @@ def restore(sig: str) -> None:
     if not os.environ.get('PROBE_CACHE_MATCHED_KEY'):
         if SNAP.exists():
             raise RuntimeError('unexpected snapshot without matched cache key')
-        metadata('RESTORED=false; cache miss; fresh runner; no prior incremental state available')
+        metadata('RESTORED=false; cache miss; restored_ios_objects=0; restored_swift_modules=0; fresh runner')
         return
     manifest_path = SNAP / ".probe-cache-manifest.json"
     if not valid_signature(sig) or not manifest_path.is_file():
@@ -190,7 +190,7 @@ def restore(sig: str) -> None:
     if total + 8 * 1024**3 > shutil.disk_usage(ROOT.parent).free:
         raise RuntimeError("insufficient restore free-space floor")
     shutil.copytree(source, ROOT, dirs_exist_ok=True, copy_function=shutil.copy2, symlinks=False)
-    metadata(f"RESTORED=true; requested_signature={sig}; saved_signature={saved_signature}; files={files}; bytes={total}; restored_ios_objects={len(list((ROOT / 'ios').rglob('*.o')))}")
+    metadata(f"RESTORED=true; requested_signature={sig}; saved_signature={saved_signature}; files={files}; bytes={total}; restored_ios_objects={len(list((ROOT / 'ios').rglob('*.o')))}; restored_swift_modules={len(list((ROOT / 'ios').rglob('*.swiftmodule')))}")
 
 
 def snapshot(sig: str) -> None:

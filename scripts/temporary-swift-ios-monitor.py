@@ -62,6 +62,16 @@ except ProcessLookupError:
 # Keep build step/diagnostic lines, not compiler-emitted source excerpts or raw source.
 keep = re.compile(r'^(?:\[\d+/\d+|FAILED:|ninja:|PROBE_EXIT=|-- |CMake (?:Error|Warning)|ld:|Undefined symbols for architecture|\s+"[^"\n]+", referenced from:|\s+.+ in [^\s]+\.(?:a|o)(?:\[|\(|$)|.*?(?:fatal error:|error:|warning:)|[A-Za-z0-9_./+-]+\.(?:cpp|c|h|hpp):\d+:)')
 retained = [line[:8192] for line in raw.read_text(errors='replace').splitlines() if keep.match(line) and not line.lstrip().startswith(('#include', '^', '|'))]
+# CMake diagnostics include essential indented message and call-stack lines.
+raw_lines = raw.read_text(errors='replace').splitlines()
+for index, line in enumerate(raw_lines):
+    if line.startswith(('CMake Error', 'CMake Warning')):
+        context = []
+        for following in raw_lines[index:index+28]:
+            if context and following.startswith(('-- ', 'CMake Error', 'CMake Warning')):
+                break
+            context.append(following[:8192])
+        retained.extend(context)
 (logs / 'probe.log').write_text('\n'.join(retained) + '\n')
 (logs / 'resource-metadata.txt').write_text(f'EXIT_CODE={rc}\nSTOP_REASON={reason or "process exited"}\nELAPSED_SECONDS={time.monotonic()-started:.1f}\nPEAK_PROCESS_TREE_RSS_BYTES={peak_rss}\nPEAK_PROBE_DISK_BYTES={peak_disk}\nNINJA_PARALLEL=2; native tablegen parallel=3\nOVERALL_PROBE_LIMIT_SECONDS=9900\nJOB_LIMIT_MINUTES=180\nRaw logs, source excerpts, SDKs and compiled artifacts are not uploaded.\n')
 objects = sorted((root / 'ios').rglob('*.o')) if (root / 'ios').exists() else []

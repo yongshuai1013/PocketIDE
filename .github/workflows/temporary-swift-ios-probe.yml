@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 180
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
-      PROBE_ATTEMPT: 'astgen-1'
+      PROBE_ATTEMPT: 'astgen-2'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
