@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 180
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
-      PROBE_ATTEMPT: '3'
+      PROBE_ATTEMPT: '4'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -76,7 +76,7 @@ jobs:
           from pathlib import Path
           import hashlib
           root = Path('probe-logs')
-          allowed = {'probe.log', 'stage.txt', 'sources.txt', 'link-metadata.txt', 'build-plan.txt', 'configure-metadata.txt', 'resource-metadata.txt', 'target-metadata.txt', 'step-metadata.txt', 'cache-metadata.txt'}
+          allowed = {'probe.log', 'stage.txt', 'sources.txt', 'link-metadata.txt', 'build-plan.txt', 'configure-metadata.txt', 'resource-metadata.txt', 'target-metadata.txt', 'step-metadata.txt', 'cache-metadata.txt', 'linker-diagnostics.txt'}
           rows = []
           total = 0
           for p in sorted(root.iterdir()):

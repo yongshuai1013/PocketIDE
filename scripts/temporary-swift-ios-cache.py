@@ -72,14 +72,12 @@ def signature() -> str:
     assert fingerprint["sdk_version"] == "18.5", "iPhoneOS SDK 18.5 required"
     assert fingerprint["macos"].startswith("15."), "macOS 15 required"
     assert fingerprint["machine"] == "arm64", "arm64 runner required"
-    # This one migration changes only the probe harness include directories.
+    # This migration changes only the iOS librt system-library link setting.
     # Recompute the previous key using CURRENT toolchain details, so incompatible
     # Xcode/CMake/SDK/root changes cannot match the saved intermediate state.
-    previous_script_sha = 'e932ad47963b4bf45d99c56b4e55ad92aa47c0446da045eb27b9f08db7a51660'
-    previous_helper_sha = '6a466bc4e6659fabb35733fd2e841b52d6b253c026e3dc2ceb45503d228fc3ae'
-    normalized = script.read_bytes().replace(
-        b'"${LLVM_EXTERNAL_SWIFT_SOURCE_DIR}/include" "${CMAKE_BINARY_DIR}/tools/swift/include"',
-        b'"${SWIFT_SOURCE_DIR}/include" "${SWIFT_BINARY_DIR}/include"')
+    previous_script_sha = '37f624a364068237b248cad1663d367e12f94ae5118e88061e7307fa07c1f250'
+    previous_helper_sha = '214c17931b6126a88688da0d53771de239f6a80176650d6c25ad2af43013a07a'
+    normalized = script.read_bytes().replace(b'  -DHAVE_LIBRT:BOOL=OFF \\\n', b'')
     assert hashlib.sha256(normalized).hexdigest() == previous_script_sha, 'unreviewed build configuration change'
     legacy = dict(fingerprint)
     legacy['build_script_sha256'] = previous_script_sha
@@ -178,7 +176,7 @@ def restore(sig: str) -> None:
     if saved_signature not in {sig, compatible} or not valid_signature(saved_signature) or not matched.startswith(saved_signature + '-'):
         raise RuntimeError('snapshot signature mismatch')
     if saved_signature != sig:
-        metadata('COMPATIBLE_MIGRATION=probe harness include-only correction; current toolchain and all compiler flags verified unchanged')
+        metadata('COMPATIBLE_MIGRATION=iOS HAVE_LIBRT=OFF link-only correction; current toolchain and all object compile flags verified unchanged')
     ensure_empty_root()
     source = SNAP / "payload"
     if not source.is_dir() or not marker_ok(source):

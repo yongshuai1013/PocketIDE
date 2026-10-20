@@ -79,6 +79,12 @@ if objects:
 print((logs / 'resource-metadata.txt').read_text(), flush=True)
 # Count progress only from the actual iOS build section, not native prerequisites.
 raw_text = raw.read_text(errors='replace')
+link_start = re.search(r'^\[\d+/\d+ elapsed=[^\]]+\] Linking CXX executable bin/ios_frontend_link_probe', raw_text, re.M)
+link_text = raw_text[link_start.start():] if link_start else 'FINAL_LINK_NOT_STARTED\n'
+# Complete final link output, not the line-filtered compile log. The artifact
+# audit subsequently sanitizes paths and tokens; no SDK/binary data is copied.
+(logs / 'linker-diagnostics.txt').write_text(link_text)
+
 actual = raw_text.split('actual-ios-frontend-compile-link\n', 1)[-1] if 'actual-ios-frontend-compile-link\n' in raw_text else ''
 progress = re.findall(r'^\[(\d+)/(\d+) elapsed=[^\]]+\] (.*)$', actual, re.M)
 plan_path = logs / 'build-plan.txt'
