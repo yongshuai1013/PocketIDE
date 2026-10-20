@@ -1,6 +1,9 @@
 name: Temporary Swift 6.0.3 iOS static frontend probe
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/temporary-swift-ios-probe.yml']
 permissions:
   contents: read
 concurrency:
