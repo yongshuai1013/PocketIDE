@@ -12,10 +12,10 @@ jobs:
   probe:
     if: startsWith(github.event.head_commit.message, 'Probe cached bounded Swift iOS actual compile link ')
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
-      PROBE_ATTEMPT: '1'
+      PROBE_ATTEMPT: '2'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -32,6 +32,7 @@ jobs:
           key: ${{ steps.fingerprint.outputs.prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             ${{ steps.fingerprint.outputs.prefix }}-
+            ${{ steps.fingerprint.outputs.compatible_prefix }}-
       - name: Verify and restore preserved source and intermediate mtimes
         env:
           PROBE_CACHE_MATCHED_KEY: ${{ steps.cache_restore.outputs.cache-matched-key }}

@@ -34,8 +34,8 @@ with raw.open('w') as out:
         disk = int(subprocess.check_output(['du', '-sk', str(root)], text=True).split()[0]) * 1024 if root.exists() else 0
         peak_disk = max(peak_disk, disk)
         free = shutil.disk_usage(os.environ['RUNNER_TEMP']).free
-        if elapsed >= 6300:
-            reason = '105-minute overall probe budget reached (job hard cap 120 minutes)'
+        if elapsed >= 9900:
+            reason = '165-minute overall probe budget reached (job hard cap 180 minutes)'
         elif rss > 5 * 1024**3:
             reason = 'process-tree resident memory exceeded 5 GiB'
         elif disk > 20 * 1024**3 or free < 8 * 1024**3:
@@ -52,7 +52,7 @@ with raw.open('w') as out:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
             break
-        time.sleep(min(20, max(0.1, 6300 - elapsed)))
+        time.sleep(min(20, max(0.1, 9900 - elapsed)))
     rc = process.wait()
 # Prevent any children surviving a completed/failed parent shell.
 try:
@@ -63,7 +63,7 @@ except ProcessLookupError:
 keep = re.compile(r'^(?:\[\d+/\d+|FAILED:|ninja:|PROBE_EXIT=|-- |CMake (?:Error|Warning)|.*?(?:fatal error:|error:|warning:)|[A-Za-z0-9_./+-]+\.(?:cpp|c|h|hpp):\d+:)')
 retained = [line[:8192] for line in raw.read_text(errors='replace').splitlines() if keep.match(line) and not line.lstrip().startswith(('#include', '^', '|'))]
 (logs / 'probe.log').write_text('\n'.join(retained) + '\n')
-(logs / 'resource-metadata.txt').write_text(f'EXIT_CODE={rc}\nSTOP_REASON={reason or "process exited"}\nELAPSED_SECONDS={time.monotonic()-started:.1f}\nPEAK_PROCESS_TREE_RSS_BYTES={peak_rss}\nPEAK_PROBE_DISK_BYTES={peak_disk}\nNINJA_PARALLEL=2; native tablegen parallel=3\nOVERALL_PROBE_LIMIT_SECONDS=6300\nJOB_LIMIT_MINUTES=120\nRaw logs, source excerpts, SDKs and compiled artifacts are not uploaded.\n')
+(logs / 'resource-metadata.txt').write_text(f'EXIT_CODE={rc}\nSTOP_REASON={reason or "process exited"}\nELAPSED_SECONDS={time.monotonic()-started:.1f}\nPEAK_PROCESS_TREE_RSS_BYTES={peak_rss}\nPEAK_PROBE_DISK_BYTES={peak_disk}\nNINJA_PARALLEL=2; native tablegen parallel=3\nOVERALL_PROBE_LIMIT_SECONDS=9900\nJOB_LIMIT_MINUTES=180\nRaw logs, source excerpts, SDKs and compiled artifacts are not uploaded.\n')
 objects = sorted((root / 'ios').rglob('*.o')) if (root / 'ios').exists() else []
 swift_objects = [p for p in objects if 'swift' in str(p.relative_to(root / 'ios')).lower()]
 frontend_objects = [p for p in swift_objects if '/Frontend/' in str(p) or '/FrontendTool/' in str(p)]

@@ -88,7 +88,7 @@ if(NOT frontend_type STREQUAL "STATIC_LIBRARY")
 endif()
 add_executable(ios_frontend_link_probe probe.cpp)
 target_include_directories(ios_frontend_link_probe PRIVATE
-  "${SWIFT_SOURCE_DIR}/include" "${SWIFT_BINARY_DIR}/include" ${LLVM_INCLUDE_DIRS})
+  "${LLVM_EXTERNAL_SWIFT_SOURCE_DIR}/include" "${CMAKE_BINARY_DIR}/tools/swift/include" ${LLVM_INCLUDE_DIRS})
 target_link_libraries(ios_frontend_link_probe PRIVATE swiftFrontendTool)
 target_link_options(ios_frontend_link_probe PRIVATE -Wl,-no_adhoc_codesign)
 CMAKE

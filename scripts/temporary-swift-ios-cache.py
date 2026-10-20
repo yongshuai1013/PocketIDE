@@ -72,6 +72,24 @@ def signature() -> str:
     assert fingerprint["sdk_version"] == "18.5", "iPhoneOS SDK 18.5 required"
     assert fingerprint["macos"].startswith("15."), "macOS 15 required"
     assert fingerprint["machine"] == "arm64", "arm64 runner required"
+    # This one migration changes only the probe harness include directories.
+    # Recompute the previous key using CURRENT toolchain details, so incompatible
+    # Xcode/CMake/SDK/root changes cannot match the saved intermediate state.
+    previous_script_sha = 'e932ad47963b4bf45d99c56b4e55ad92aa47c0446da045eb27b9f08db7a51660'
+    previous_helper_sha = '6a466bc4e6659fabb35733fd2e841b52d6b253c026e3dc2ceb45503d228fc3ae'
+    normalized = script.read_bytes().replace(
+        b'"${LLVM_EXTERNAL_SWIFT_SOURCE_DIR}/include" "${CMAKE_BINARY_DIR}/tools/swift/include"',
+        b'"${SWIFT_SOURCE_DIR}/include" "${SWIFT_BINARY_DIR}/include"')
+    assert hashlib.sha256(normalized).hexdigest() == previous_script_sha, 'unreviewed build configuration change'
+    legacy = dict(fingerprint)
+    legacy['build_script_sha256'] = previous_script_sha
+    legacy['cache_helper_sha256'] = previous_helper_sha
+    compatible = PREFIX + hashlib.sha256(json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    output('compatible_prefix', compatible)
+    env = os.environ.get('GITHUB_ENV')
+    if env:
+        with open(env, 'a', encoding='utf-8') as f:
+            f.write(f'PROBE_COMPATIBLE_CACHE_SIGNATURE={compatible}\n')
     return PREFIX + hashlib.sha256(json.dumps(fingerprint, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -154,8 +172,13 @@ def restore(sig: str) -> None:
     if not valid_signature(sig) or not manifest_path.is_file():
         raise RuntimeError("missing/invalid signature or snapshot manifest")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("signature") != sig:
-        raise RuntimeError("snapshot signature mismatch")
+    saved_signature = manifest.get('signature', '')
+    compatible = os.environ.get('PROBE_COMPATIBLE_CACHE_SIGNATURE', '')
+    matched = os.environ.get('PROBE_CACHE_MATCHED_KEY', '')
+    if saved_signature not in {sig, compatible} or not valid_signature(saved_signature) or not matched.startswith(saved_signature + '-'):
+        raise RuntimeError('snapshot signature mismatch')
+    if saved_signature != sig:
+        metadata('COMPATIBLE_MIGRATION=probe harness include-only correction; current toolchain and all compiler flags verified unchanged')
     ensure_empty_root()
     source = SNAP / "payload"
     if not source.is_dir() or not marker_ok(source):
@@ -182,7 +205,7 @@ def restore(sig: str) -> None:
     if total + 8 * 1024**3 > shutil.disk_usage(ROOT.parent).free:
         raise RuntimeError("insufficient restore free-space floor")
     shutil.copytree(source, ROOT, dirs_exist_ok=True, copy_function=shutil.copy2, symlinks=False)
-    metadata(f"restored signature={sig} files={files} bytes={manifest.get('bytes', 0)}")
+    metadata(f"RESTORED=true; requested_signature={sig}; saved_signature={saved_signature}; files={files}; bytes={total}; restored_ios_objects={len(list((ROOT / 'ios').rglob('*.o')))}")
 
 
 def snapshot(sig: str) -> None:
