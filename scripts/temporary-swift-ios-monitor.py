@@ -13,6 +13,7 @@ logs = Path('probe-logs')
 logs.mkdir(exist_ok=True)
 raw = Path(os.environ['RUNNER_TEMP']) / 'swift-ios-probe-raw.log'
 started = time.monotonic()
+preexisting_objects = len(list((root / 'ios').rglob('*.o'))) if (root / 'ios').exists() else 0
 reason = ''
 peak_rss = 0
 peak_disk = 0
@@ -33,8 +34,8 @@ with raw.open('w') as out:
         disk = int(subprocess.check_output(['du', '-sk', str(root)], text=True).split()[0]) * 1024 if root.exists() else 0
         peak_disk = max(peak_disk, disk)
         free = shutil.disk_usage(os.environ['RUNNER_TEMP']).free
-        if elapsed >= 5340:
-            reason = '89-minute overall probe budget reached (job hard cap 90 minutes)'
+        if elapsed >= 6300:
+            reason = '105-minute overall probe budget reached (job hard cap 120 minutes)'
         elif rss > 5 * 1024**3:
             reason = 'process-tree resident memory exceeded 5 GiB'
         elif disk > 20 * 1024**3 or free < 8 * 1024**3:
@@ -51,7 +52,7 @@ with raw.open('w') as out:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
             break
-        time.sleep(min(20, max(0.1, 5340 - elapsed)))
+        time.sleep(min(20, max(0.1, 6300 - elapsed)))
     rc = process.wait()
 # Prevent any children surviving a completed/failed parent shell.
 try:
@@ -62,7 +63,7 @@ except ProcessLookupError:
 keep = re.compile(r'^(?:\[\d+/\d+|FAILED:|ninja:|PROBE_EXIT=|-- |CMake (?:Error|Warning)|.*?(?:fatal error:|error:|warning:)|[A-Za-z0-9_./+-]+\.(?:cpp|c|h|hpp):\d+:)')
 retained = [line[:8192] for line in raw.read_text(errors='replace').splitlines() if keep.match(line) and not line.lstrip().startswith(('#include', '^', '|'))]
 (logs / 'probe.log').write_text('\n'.join(retained) + '\n')
-(logs / 'resource-metadata.txt').write_text(f'EXIT_CODE={rc}\nSTOP_REASON={reason or "process exited"}\nELAPSED_SECONDS={time.monotonic()-started:.1f}\nPEAK_PROCESS_TREE_RSS_BYTES={peak_rss}\nPEAK_PROBE_DISK_BYTES={peak_disk}\nNINJA_PARALLEL=2; native tablegen parallel=3\nOVERALL_PROBE_LIMIT_SECONDS=5340\nJOB_LIMIT_MINUTES=90\nRaw logs, source excerpts, SDKs and compiled artifacts are not uploaded.\n')
+(logs / 'resource-metadata.txt').write_text(f'EXIT_CODE={rc}\nSTOP_REASON={reason or "process exited"}\nELAPSED_SECONDS={time.monotonic()-started:.1f}\nPEAK_PROCESS_TREE_RSS_BYTES={peak_rss}\nPEAK_PROBE_DISK_BYTES={peak_disk}\nNINJA_PARALLEL=2; native tablegen parallel=3\nOVERALL_PROBE_LIMIT_SECONDS=6300\nJOB_LIMIT_MINUTES=120\nRaw logs, source excerpts, SDKs and compiled artifacts are not uploaded.\n')
 objects = sorted((root / 'ios').rglob('*.o')) if (root / 'ios').exists() else []
 swift_objects = [p for p in objects if 'swift' in str(p.relative_to(root / 'ios')).lower()]
 frontend_objects = [p for p in swift_objects if '/Frontend/' in str(p) or '/FrontendTool/' in str(p)]
@@ -96,7 +97,7 @@ if (root / 'ios/build.ninja').is_file():
             remaining_error = f'dry-run exit {check.returncode}'
     except Exception as exc:
         remaining_error = type(exc).__name__
-step_lines = [f'INITIAL_PLANNED_STEPS={planned}', f'LAST_NINJA_FINISHED_COUNT={completed}', f'FAILED_EDGE_COUNT={failed}', f'REMAINING_DRY_RUN_STEPS={remaining}', f'REMAINING_CHECK_ERROR={remaining_error}', f'LAST_ACTUAL_PROGRESS={progress[-1] if progress else "none"}', f'FINAL_LINK_STAGE_REACHED={"final-link-succeeded-inspect-only" in raw_text}', 'CACHE_STATUS=no Actions caches available before this run; fresh hosted runner, no restored build state', 'Finished-count can include a failed edge; check FAILED_EDGE_COUNT and remaining dry-run.']
+step_lines = [f'INITIAL_PLANNED_STEPS={planned}', f'LAST_NINJA_FINISHED_COUNT={completed}', f'FAILED_EDGE_COUNT={failed}', f'REMAINING_DRY_RUN_STEPS={remaining}', f'REMAINING_CHECK_ERROR={remaining_error}', f'LAST_ACTUAL_PROGRESS={progress[-1] if progress else "none"}', f'FINAL_LINK_STAGE_REACHED={"final-link-succeeded-inspect-only" in raw_text}', f'CACHE_MATCHED_KEY={os.environ.get("PROBE_CACHE_MATCHED_KEY", "")}', f'CACHE_RESTORED={bool(os.environ.get("PROBE_CACHE_MATCHED_KEY", ""))}', f'PREEXISTING_IOS_OBJECT_COUNT={preexisting_objects}', 'Finished-count can include a failed edge; check FAILED_EDGE_COUNT and remaining dry-run.']
 (logs / 'step-metadata.txt').write_text('\n'.join(step_lines) + '\n')
 print((logs / 'step-metadata.txt').read_text(), flush=True)
 raise SystemExit(1 if reason else rc)

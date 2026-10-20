@@ -31,8 +31,15 @@ IOS=(-DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$SDK" -DCMAKE_OSX_ARCHITECTURE
 stage acquire-pinned-open-source
 while read -r name repo sha; do
   printf '%s %s %s\n' "$name" "$repo" "$sha" | tee -a "$LOG/sources.txt"
+  if test -f "$ROOT/$name/.pocketide-pinned-revision"; then
+    test "$(cat "$ROOT/$name/.pocketide-pinned-revision")" = "$sha"
+    echo "Reusing preserved pinned source: $name $sha"
+    continue
+  fi
+  test ! -d "$ROOT/$name" || test -z "$(ls -A "$ROOT/$name")"
   mkdir -p "$ROOT/$name"
   curl --fail --location --retry 3 "https://codeload.github.com/$repo/tar.gz/$sha" | tar -xz --strip-components=1 -C "$ROOT/$name"
+  printf "%s\n" "$sha" > "$ROOT/$name/.pocketide-pinned-revision"
 done <<'SOURCES'
 swift swiftlang/swift 6a862d2eb7128ff1f317b07e8ad1a6da939775f3
 llvm-project swiftlang/llvm-project 2e6139970eda445d9c6872c0ca293088b4e63dd2
@@ -45,7 +52,10 @@ import sys, difflib
 p = Path(sys.argv[1]); before = p.read_text()
 old = 'if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")'
 new = 'if(CMAKE_SYSTEM_NAME STREQUAL "Darwin" OR CMAKE_SYSTEM_NAME STREQUAL "iOS")'
-assert before.count(old) == 1
+if before.count(old) == 0 and before.count(new) == 1:
+    print('Reusing exact preserved UUID platform conditional fix.')
+    raise SystemExit(0)
+assert before.count(old) == 1 and before.count(new) == 0
 assert '# On non-Darwin require UUID.' in before
 assert 'find_package(UUID REQUIRED)' in before
 after = before.replace(old, new, 1)
@@ -65,8 +75,10 @@ cmake -S "$ROOT/cmark" -B "$ROOT/cmark-ios" -G Ninja "${IOS[@]}" \
 stage ios-cmark-build
 cmake --build "$ROOT/cmark-ios" --target libcmark-gfm --parallel 3
 mkdir -p "$ROOT/harness"
-printf 'include("%s/cmark-ios/src/cmarkTargets.cmake")\n' "$ROOT" > "$ROOT/import-cmark.cmake"
-cat > "$ROOT/harness/CMakeLists.txt" <<'CMAKE'
+TEMP_HARNESS="$RUNNER_TEMP/probe-harness-inputs"
+mkdir -p "$TEMP_HARNESS"
+printf 'include("%s/cmark-ios/src/cmarkTargets.cmake")\n' "$ROOT" > "$TEMP_HARNESS/import-cmark.cmake"
+cat > "$TEMP_HARNESS/CMakeLists.txt" <<'CMAKE'
 if(NOT TARGET swiftFrontendTool)
   message(FATAL_ERROR "Official static swiftFrontendTool unavailable")
 endif()
@@ -80,7 +92,7 @@ target_include_directories(ios_frontend_link_probe PRIVATE
 target_link_libraries(ios_frontend_link_probe PRIVATE swiftFrontendTool)
 target_link_options(ios_frontend_link_probe PRIVATE -Wl,-no_adhoc_codesign)
 CMAKE
-cat > "$ROOT/harness/probe.cpp" <<'CPP'
+cat > "$TEMP_HARNESS/probe.cpp" <<'CPP'
 #include "swift/FrontendTool/FrontendTool.h"
 #include "llvm/ADT/ArrayRef.h"
 // A real call forces the static frontend and its dependency closure into the link.
@@ -90,6 +102,11 @@ int main(int argc, const char **argv) {
       argv[0], reinterpret_cast<void *>(&main));
 }
 CPP
+for item in import-cmark.cmake CMakeLists.txt probe.cpp; do
+  destination="$ROOT/harness/$item"
+  test "$item" != import-cmark.cmake || destination="$ROOT/$item"
+  if ! cmp -s "$TEMP_HARNESS/$item" "$destination"; then cp -p "$TEMP_HARNESS/$item" "$destination"; fi
+done
 stage ios-frontend-configure
 cmake -S "$ROOT/llvm-project/llvm" -B "$ROOT/ios" "${COMMON[@]}" "${IOS[@]}" \
   -DCMAKE_CXX_FLAGS_RELEASE='-O1 -DNDEBUG' \

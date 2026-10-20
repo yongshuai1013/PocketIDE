@@ -10,21 +10,62 @@ concurrency:
   cancel-in-progress: false
 jobs:
   probe:
-    if: github.event.head_commit.message == 'Probe one-time 90-minute Swift iOS actual compile link'
+    if: startsWith(github.event.head_commit.message, 'Probe cached bounded Swift iOS actual compile link ')
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      PROBE_ATTEMPT: '1'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
+      - name: Fingerprint pinned source and exact toolchain configuration
+        id: fingerprint
+        run: python3 scripts/temporary-swift-ios-cache.py signature
+      - name: Restore compatible intermediate-only state
+        id: cache_restore
+        timeout-minutes: 5
+        uses: actions/cache/restore@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/swift-ios-probe-cache/snapshot
+          key: ${{ steps.fingerprint.outputs.prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ${{ steps.fingerprint.outputs.prefix }}-
+      - name: Verify and restore preserved source and intermediate mtimes
+        env:
+          PROBE_CACHE_MATCHED_KEY: ${{ steps.cache_restore.outputs.cache-matched-key }}
+        run: |
+          echo "PROBE_CACHE_MATCHED_KEY=$PROBE_CACHE_MATCHED_KEY" >> "$GITHUB_ENV"
+          python3 scripts/temporary-swift-ios-cache.py restore
       - name: Actual frontend compile and link with bounded resources
         shell: bash
         run: |
           set -o pipefail
           mkdir -p probe-logs
           python3 scripts/temporary-swift-ios-monitor.py
+      - name: Prepare audited intermediate-only snapshot without SDK or compiler binaries
+        id: cache_snapshot
+        if: always() && steps.fingerprint.outcome == 'success'
+        timeout-minutes: 3
+        run: python3 scripts/temporary-swift-ios-cache.py snapshot
+      - name: Save compatible progress even after a bounded build stop
+        id: cache_save
+        if: always() && steps.cache_snapshot.outputs.safe == 'true'
+        timeout-minutes: 5
+        uses: actions/cache/save@0400d5f644dc74513175e3cd8d07132dd4860809
+        with:
+          path: ${{ runner.temp }}/swift-ios-probe-cache/snapshot
+          key: ${{ steps.fingerprint.outputs.prefix }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Record cache action result
+        if: always()
+        env:
+          CACHE_RESTORE_OUTCOME: ${{ steps.cache_restore.outcome }}
+          CACHE_SAVE_OUTCOME: ${{ steps.cache_save.outcome }}
+          CACHE_MATCHED_KEY: ${{ steps.cache_restore.outputs.cache-matched-key }}
+        run: |
+          mkdir -p probe-logs
+          printf 'RESTORE_ACTION_OUTCOME=%s\nSAVE_ACTION_OUTCOME=%s\nMATCHED_KEY=%s\n' "$CACHE_RESTORE_OUTCOME" "$CACHE_SAVE_OUTCOME" "$CACHE_MATCHED_KEY" >> probe-logs/cache-metadata.txt
       - name: Inspect text-only artifact allowlist
         id: audit
         if: always()
@@ -34,7 +75,7 @@ jobs:
           from pathlib import Path
           import hashlib
           root = Path('probe-logs')
-          allowed = {'probe.log', 'stage.txt', 'sources.txt', 'link-metadata.txt', 'build-plan.txt', 'configure-metadata.txt', 'resource-metadata.txt', 'target-metadata.txt', 'step-metadata.txt'}
+          allowed = {'probe.log', 'stage.txt', 'sources.txt', 'link-metadata.txt', 'build-plan.txt', 'configure-metadata.txt', 'resource-metadata.txt', 'target-metadata.txt', 'step-metadata.txt', 'cache-metadata.txt'}
           rows = []
           total = 0
           for p in sorted(root.iterdir()):
@@ -62,7 +103,7 @@ jobs:
         if: always() && steps.audit.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: temporary-swift-ios-actual-compile-link-90min-logs
+          name: temporary-swift-ios-cached-compile-link-logs
           path: probe-logs/
           if-no-files-found: error
           retention-days: 7
