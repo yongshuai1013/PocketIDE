@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::arm::{execute_data_processing, Flags as ArmFlags};
 use crate::broker::{
     BrokerError, BrokerValue, GuestSyscall, OpenFlags, SyscallBroker, MAX_TRANSFER_BYTES,
 };
@@ -691,40 +692,32 @@ impl Cpu {
             }
             return Ok(None);
         }
-        if instruction & 0x0c00_0000 == 0x0000_0000 && instruction & (1 << 25) != 0 {
-            let opcode = (instruction >> 21) & 0xf;
-            let set_flags = instruction & (1 << 20) != 0;
-            let rn = ((instruction >> 16) & 0xf) as usize;
-            let rd = ((instruction >> 12) & 0xf) as usize;
-            let rotate = ((instruction >> 8) & 0xf) * 2;
-            let immediate = (instruction & 0xff).rotate_right(rotate);
-            let left = self.regs[rn];
-            let result = match opcode {
-                0 => left & immediate,
-                1 => left ^ immediate,
-                2 => left.wrapping_sub(immediate),
-                4 => left.wrapping_add(immediate),
-                10 => left.wrapping_sub(immediate),
-                12 => left | immediate,
-                13 => immediate,
-                14 => left & !immediate,
-                15 => !immediate,
-                _ => {
-                    return Err(ElfError::InvalidInstruction {
-                        pc: instruction_pc,
-                        instruction,
-                        thumb: false,
-                    })
-                }
+        if instruction & 0x0c00_0000 == 0 {
+            let flags = ArmFlags {
+                n: self.n,
+                z: self.z,
+                c: self.c,
+                v: self.v,
             };
-            if opcode != 10 {
-                self.regs[rd] = result;
-            }
-            if set_flags || opcode == 10 {
-                self.set_nz(result);
-                if matches!(opcode, 2 | 10) {
-                    self.c = left >= immediate;
+            let Some(result) = execute_data_processing(instruction, &self.regs, flags) else {
+                return Err(ElfError::InvalidInstruction {
+                    pc: instruction_pc,
+                    instruction,
+                    thumb: false,
+                });
+            };
+            if result.writes_destination {
+                self.regs[result.destination] = result.result;
+                if result.destination == 15 {
+                    self.pc = result.result & !3;
+                    self.regs[15] = self.pc;
                 }
+            }
+            if let Some(flags) = result.flags {
+                self.n = flags.n;
+                self.z = flags.z;
+                self.c = flags.c;
+                self.v = flags.v;
             }
             return Ok(None);
         }
@@ -1288,6 +1281,30 @@ mod tests {
         assert_eq!(report.events.len(), 1);
         assert_eq!(report.events[0].syscall.name(), "getpid");
         assert_eq!(report.events[0].result, Ok(BrokerValue::Identity(29)));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn arm_elf_executes_shifted_register_alu_and_condition_flags() {
+        let (base, mut broker) = test_broker("arm-alu");
+        let words = [
+            0xe3a0_0005u32, // mov r0, #5
+            0xe3a0_1003,    // mov r1, #3
+            0xe080_2101,    // add r2, r0, r1, lsl #2 -> 17
+            0xe352_0011,    // cmp r2, #17 -> Z=1, C=1
+            0x03a0_0007,    // moveq r0, #7
+            0x13a0_0063,    // movne r0, #99 (must be skipped)
+            0xe3a0_7001,    // mov r7, #1 (exit)
+            0xef00_0000,    // svc #0
+        ];
+        let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let image = make_elf(BASE, &code);
+        let report = run_elf(&image, &mut broker, 32).unwrap();
+
+        assert_eq!(report.instruction_set, InstructionSet::Arm);
+        assert_eq!(report.instructions_executed, words.len() as u64);
+        assert_eq!(report.exit_code, 7);
+        assert!(report.events.is_empty());
         let _ = fs::remove_dir_all(base);
     }
 

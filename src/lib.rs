@@ -4,6 +4,7 @@
 //! host-side compatibility prototypes; they are not a kernel syscall
 //! interceptor and do not boot a complete Android system image.
 
+mod arm;
 pub mod broker;
 pub mod elf;
 pub mod guest;

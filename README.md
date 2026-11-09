@@ -2,20 +2,20 @@
 
 GingerVM 是一個全新、獨立的 Android-in-Android 虛擬化研究專案；不依賴也不修改 `/workspace/PaxVM`。目標 guest 是 Android 2.3.7 Gingerbread（API 10、32 位 ARM），方向是 App 沙盒內的 userspace supervisor，而不是桌面 QEMU 前端。
 
-## 目前狀態：guest-to-broker prototype 0.4
+## 目前狀態：A32 資料處理核心 prototype 0.5
 
 本機可編譯、可測的閉環目前包含：
 
 - Gingerbread 2.3.7 guest profile，以及每個 guest 獨立的 rootfs 目錄骨架與絕對 guest path 映射。
 - Broker 支援 rootfs 範圍內的 `open`、`read`、`write`、`close`，以及虛擬 `uid`／`gid`／`pid`；guest FD table 由各 broker instance 各自持有，單次 I/O 上限 1 MiB。
-- Host 端可載入 **32 位 little-endian ARM 靜態 `ET_EXEC` ELF**，從 ARM A32 或 16-bit Thumb entry 執行一小組 ARMv7 指令；EABI `svc #0` 的檔案與身分 syscall 會逐一送進同一個 broker。未支援 syscall 由 broker 拒絕，不會直接轉成宿主 syscall。
+- Host 端可載入 **32 位 little-endian ARM 靜態 `ET_EXEC` ELF**，從 ARM A32 或 16-bit Thumb entry 執行有限指令子集。A32 資料處理指令已獨立成可測的 ALU 核心，涵蓋 16 種運算、立即數／暫存器 Operand2、barrel-shifter 與 NZCV 算術旗標；EABI `svc #0` 的檔案與身分 syscall 會逐一送進同一個 broker。未支援指令會明確停止，未支援 syscall 由 broker 拒絕，不會直接轉成宿主 syscall。
 - `GuestProgram` scripted harness 仍保留；`gingervm run-elf <rootfs> <static-arm-elf>` 可執行符合上述限制的 ELF，`gingervm probe <rootfs>` 則只驗證 scripted harness。
 
 **這不是在執行 Android 2.3.7 作業系統。** Gingerbread 2.3.7 目前是目標 guest profile；尚未載入 Android 系統映像、核心、`init`、Bionic、framework 或系統服務。本機驗證的 `probes/armv7-static-probe.S` 是以 ARMv7 GNU/Linux EABI 組譯的極小靜態程式，由 GingerVM 在 Linux host process 中解譯；它不是 Android APK，也沒有啟動 Android runtime。
 
 此探針以 Clang/LLD 產生真正的 32 位 little-endian ARM EABI5 靜態 `ET_EXEC`，目前成功跑過 86 條 A32 指令與 12 次 broker syscall，檢查 rootfs 檔案寫入、重開讀取、複製，以及虛擬 `uid=1000`／`gid=1000`／`pid=1`；host 端再比對兩個檔案。這只驗證該 probe 用到的窄指令／syscall 子集，不代表 Gingerbread binary、APK 或 Android 核心相容。
 
-**執行器目前是窄範圍相容性原型，不是通用 ARM 模擬器，也不是可開機的 Android VM。** 指令集只涵蓋測試所需的有限 A32／Thumb 指令；dynamic/PIE ELF、Thumb-2、共享函式庫、VFP/NEON、signal/thread、Binder、ashmem、Android framework 和完整 system image 尚未支援。自動測試仍使用程式建立的 ARM ELF fixture；額外的工具鏈 probe 也不是 Android NDK 所產生或驗證的 Android binary。它也不是核心 syscall interceptor 或安全邊界：rootfs 的 canonicalize 路徑檢查仍有 symlink race 風險，正式 supervisor 需要 descriptor-relative 操作及 Android 裝置上的核心相容性驗證。
+**執行器目前是窄範圍相容性原型，不是通用 ARM 模擬器，也不是可開機的 Android VM。** A32 資料處理是其中一個已有獨立 decoder/ALU 和單元測試的指令族；A32 load/store 與控制流程、以及 Thumb 仍只有有限子集。dynamic/PIE ELF、Thumb-2、共享函式庫、VFP/NEON、signal/thread、Binder、ashmem、Android framework 和完整 system image 尚未支援。自動測試仍使用程式建立的 ARM ELF fixture；額外的工具鏈 probe 也不是 Android NDK 所產生或驗證的 Android binary。它也不是核心 syscall interceptor 或安全邊界：rootfs 的 canonicalize 路徑檢查仍有 symlink race 風險，正式 supervisor 需要 descriptor-relative 操作及 Android 裝置上的核心相容性驗證。
 
 ## 設計分層
 
