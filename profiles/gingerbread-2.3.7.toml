@@ -1,0 +1,16 @@
+[guest]
+name = "gingerbread-2.3.7"
+android_release = "2.3.7 Gingerbread"
+api_level = 10
+abi = "armeabi-v7a"
+word_size = 32
+init = "/init"
+
+[virtualization]
+model = "userspace-supervisor"
+rootfs_per_instance = true
+unknown_syscall = "deny"
+
+[stages]
+# These are planned broker interfaces, not implemented device nodes.
+planned_brokers = ["binder", "ashmem", "logger", "framebuffer"]

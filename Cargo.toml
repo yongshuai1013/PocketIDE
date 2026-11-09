@@ -1,0 +1,20 @@
+[package]
+name = "gingervm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Independent Android-in-Android virtualization research foundation"
+
+[lib]
+name = "gingervm_core"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "gingervm"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
