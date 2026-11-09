@@ -27,7 +27,7 @@ impl GuestProgram {
             let result = broker.dispatch(syscall).map_err(|source| GuestRunError {
                 program: self.name.clone(),
                 step,
-                syscall: syscall.clone(),
+                syscall: Box::new(syscall.clone()),
                 source,
             })?;
             events.push(GuestEvent {
@@ -61,7 +61,7 @@ pub struct GuestExecutionReport {
 pub struct GuestRunError {
     pub program: String,
     pub step: usize,
-    pub syscall: GuestSyscall,
+    pub syscall: Box<GuestSyscall>,
     pub source: BrokerError,
 }
 
@@ -156,11 +156,11 @@ mod tests {
         let (base, root) = test_root();
         let mut broker = SyscallBroker::new(root, VirtualIdentity::default());
         let program = GuestProgram::new(
-            "denied-mount",
+            "denied-pivot-root",
             vec![
                 GuestSyscall::GetUid,
                 GuestSyscall::Control {
-                    name: "mount".to_owned(),
+                    name: "pivot_root".to_owned(),
                 },
                 GuestSyscall::GetGid,
             ],
@@ -168,7 +168,7 @@ mod tests {
 
         let error = program.run(&mut broker).unwrap_err();
         assert_eq!(error.step, 1);
-        assert_eq!(error.syscall.name(), "mount");
+        assert_eq!(error.syscall.name(), "pivot_root");
         assert!(error.to_string().contains("denied by broker policy"));
         let _ = fs::remove_dir_all(base);
     }

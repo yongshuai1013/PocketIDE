@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   validate:
-    name: Host build, Android core check, and ARM guest probe
+    name: Host build, Android core check, and ARM guest probes
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -38,15 +38,19 @@ jobs:
       - name: Run local build and tests
         run: ./build-local.sh
 
-      - name: Run static ARM guest probe
+      - name: Run ARM, Thumb, and guest memory probes
         run: ./probes/run-static-arm-probe.sh
 
       - name: Upload build and probe outputs
         uses: actions/upload-artifact@v4
         with:
-          name: gingervm-build-and-arm-probe
+          name: gingervm-build-and-arm-thumb-memory-probes
           path: |
             target/release/gingervm
             build/arm-static-probe/armv7-static-probe.elf
             build/arm-static-probe/run.log
+            build/arm-static-probe/thumbv1-static-probe.elf
+            build/arm-static-probe/thumb-run.log
+            build/arm-static-probe/armv7-memory-probe.elf
+            build/arm-static-probe/memory-run.log
           if-no-files-found: error

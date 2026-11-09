@@ -6,6 +6,48 @@
 .global _start
 .type _start,%function
 _start:
+    @ Validate the A32 short and long multiply families before broker I/O.
+    mov r0, #0                    @ exit status unless a check fails
+    mov r4, #7
+    mov r5, #9
+    mul r6, r4, r5                @ 63
+    cmp r6, #63
+    bne fail
+    mov r3, #5
+    mla r7, r4, r5, r3            @ 68
+    cmp r7, #68
+    bne fail
+    umull r8, r9, r4, r5          @ 0:63
+    cmp r8, #63
+    bne fail
+    cmp r9, #0
+    bne fail
+
+    mvn r4, #1                    @ -2
+    mov r5, #3
+    smull r8, r9, r4, r5          @ -6
+    mvn r6, #5
+    cmp r8, r6
+    bne fail
+    mvn r6, #0                    @ -1
+    cmp r9, r6
+    bne fail
+
+    mov r8, #6
+    mov r9, #0
+    umlal r8, r9, r4, r5          @ unsigned (-2) * 3 + 6 = 3:0
+    cmp r8, #0
+    bne fail
+    cmp r9, #3
+    bne fail
+    mov r8, #6
+    mov r9, #0
+    smlal r8, r9, r4, r5          @ signed (-2) * 3 + 6 = 0
+    cmp r8, #0
+    bne fail
+    cmp r9, #0
+    bne fail
+
     @ Create and write the source file through ARM EABI open/write/close.
     ldr r0, =source_path
     mov r1, #1                    @ O_WRONLY
