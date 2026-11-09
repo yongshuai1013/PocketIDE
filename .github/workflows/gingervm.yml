@@ -1,0 +1,52 @@
+name: GingerVM build
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'build-local.sh'
+      - 'probes/**'
+      - 'profiles/**'
+      - 'src/**'
+      - '.github/workflows/gingervm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Host build, Android core check, and ARM guest probe
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up stable Rust and Android ARM64 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install ARM probe tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang lld binutils file
+
+      - name: Run local build and tests
+        run: ./build-local.sh
+
+      - name: Run static ARM guest probe
+        run: ./probes/run-static-arm-probe.sh
+
+      - name: Upload build and probe outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: gingervm-build-and-arm-probe
+          path: |
+            target/release/gingervm
+            build/arm-static-probe/armv7-static-probe.elf
+            build/arm-static-probe/run.log
+          if-no-files-found: error
