@@ -19,6 +19,7 @@
 #include "init_broker.h"
 #include "guest_exec_elf.h"
 #include "broker_sigsys_state.h"
+#include "ptrace_tracee_cleanup.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -229,6 +230,8 @@ static int virtual_property_bound;
 static int virtual_property_listening;
 static int saw_exec;
 static int trace_timed_out;
+static volatile sig_atomic_t user_cancel_requested;
+static int trace_cancelled;
 static int guest_root_readonly;
 static int guest_system_readonly;
 static struct tracee_state tracees[MAX_TRACEES];
@@ -241,7 +244,18 @@ static int dynamic_exec_blocked;
 static int process_limit_hit;
 static char dynamic_exec_guest_path[PATH_MAX];
 static char dynamic_exec_interpreter[PATH_MAX];
-
+static void cancel_signal_handler(int signo) {
+    if (signo == SIGTERM || signo == SIGINT) user_cancel_requested = 1;
+}
+static int install_cancel_signal_handlers(void) {
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = cancel_signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    return sigaction(SIGTERM, &action, NULL) == 0 &&
+           sigaction(SIGINT, &action, NULL) == 0 ? 0 : -1;
+}
 static int get_regs(pid_t pid, struct compat_pt_regs *regs) {
     struct iovec iov = { .iov_base = regs, .iov_len = sizeof(*regs) };
     return ptrace(PTRACE_GETREGSET, pid, (void *)(uintptr_t)NT_PRSTATUS, &iov) == 0 &&
@@ -937,29 +951,19 @@ static void kill_tracee(pid_t pid) {
     int status;
     (void)waitpid(pid, &status, __WALL);
 }
-
-static void kill_all_tracees(void) {
+static int kill_all_tracees(void) {
     pid_t pids[MAX_TRACEES];
     size_t count = 0;
     for (size_t i = 0; i < tracee_count; ++i)
         if (tracees[i].alive) pids[count++] = tracees[i].pid;
-    for (size_t i = 0; i < count; ++i) {
-        (void)ptrace(PTRACE_KILL, pids[i], NULL, NULL);
-        (void)kill(pids[i], SIGKILL);
-    }
-    for (size_t i = 0; i < count; ++i) {
-        int status;
-        pid_t waited;
-        do { waited = waitpid(pids[i], &status, __WALL); } while (waited < 0 && errno == EINTR);
-        if (waited == pids[i] && WIFSTOPPED(status)) {
-            (void)ptrace(PTRACE_CONT, pids[i], NULL, (void *)(uintptr_t)SIGKILL);
-            do { waited = waitpid(pids[i], &status, __WALL); } while (waited < 0 && errno == EINTR);
-        }
-    }
+    struct ptrace_cleanup_result cleanup = ptrace_terminate_and_reap(pids, count);
+    printf("TRACE CLEANUP: tracked=%zu reaped=%zu already-gone=%zu unresolved=%zu\n",
+           cleanup.requested, cleanup.reaped, cleanup.already_gone, cleanup.unresolved);
     tracee_count = 0;
     active_tracee_count = 0;
     active_tracee = NULL;
     traced_pid = -1;
+    return cleanup.unresolved == 0 ? 0 : -1;
 }
 
 static void kill_untracked_tracee(pid_t pid) {
@@ -1257,6 +1261,10 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
     struct timespec start, now, pause = { .tv_sec = 0, .tv_nsec = 1000000 };
     clock_gettime(CLOCK_MONOTONIC, &start);
     for (;;) {
+        if (user_cancel_requested) {
+            trace_cancelled = 1;
+            break;
+        }
         if (active_tracee_count == 0) {
             return 0;
         }
@@ -1469,14 +1477,28 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
         fprintf(stderr, "stopping guest pid=%d on unsupported signal %d\n", waited, sig);
         kill_all_tracees(); return -1;
     }
-    kill_all_tracees();
+    if (user_cancel_requested) {
+        trace_cancelled = 1;
+        int cleanup_rc = kill_all_tracees();
+        printf("USER CANCEL REQUESTED: SIGTERM/SIGINT received; tracked process tree cleanup %s\n",
+               cleanup_rc == 0 ? "completed" : "FAILED");
+        *exit_code = cleanup_rc == 0 ? 130 : -1;
+        *exit_signal = 0;
+        return cleanup_rc;
+    }
+    (void)kill_all_tracees();
     *exit_code = -1; *exit_signal = 0;
     return 0;
 }
 
 int main(int argc, char **argv) {
+    (void)setvbuf(stdout, NULL, _IOLBF, 0);
     if (argc != 6 || strcmp(argv[5], "/init") != 0) {
         fprintf(stderr, "usage: gingervm-init-supervisor <original-init-in-native-libs> <app-private-guest-root> <allowed-guest-native-lib-dir> <trace-ms> /init\n");
+        return 2;
+    }
+    if (install_cancel_signal_handlers() != 0) {
+        fprintf(stderr, "cannot install user-cancel signal handlers: errno=%d\n", errno);
         return 2;
     }
     if (!realpath(argv[2], guest_root)) {
@@ -1510,6 +1532,12 @@ int main(int argc, char **argv) {
     if (strcmp(guest_program, "/init") != 0 && prepare_standalone_guest() != 0) {
         fprintf(stderr, "could not prepare software-only standalone guest mounts: errno=%d\n", errno); return 2;
     }
+    if (user_cancel_requested) {
+        trace_cancelled = 1;
+        puts("USER CANCEL REQUESTED: received before guest /init was started; no tracees were created");
+        puts("STOP: user-requested cancellation before guest exec; no supervisor timeout occurred");
+        return 130;
+    }
     puts("MODE: one continuous native ARM64-supervised ARM32 guest process tree; no host root requested");
     puts("ROOT PROCESS: original official static ARM32 /init");
     puts("EXECUTION: supervisor and executable payloads are loaded from APK-extracted ABI library directories; guest data remains app-private");
@@ -1530,12 +1558,13 @@ int main(int argc, char **argv) {
            syscall_stops, path_rewrites, virtual_mount_count, virtual_device_count,
            virtual_identity_count, virtual_socket_calls, virtual_poll_waits,
            brokered_sigsys_suppressed, blocked_process_count, denied_count);
-    if (strcmp(guest_program, "/init") == 0 && trace_timed_out && virtual_poll_waits > 0)
+    if (strcmp(guest_program, "/init") == 0 && (trace_timed_out || trace_cancelled) && virtual_poll_waits > 0)
         printf("INIT STATE: initial actions reached a software-emulated event wait; no virtual event source has delivered an event\n");
     if (dynamic_exec_blocked)
         printf("UNSUPPORTED DYNAMIC EXEC: guest exec %s requires PT_INTERP %s; denied before host linker substitution\n",
                dynamic_exec_guest_path, dynamic_exec_interpreter);
-    if (trace_timed_out) printf("STOP: bounded continuous process-tree trace ended; all tracees stopped by supervisor\n");
+    if (trace_cancelled) printf("STOP: user requested cancellation; supervisor terminated and reaped the traced process tree\n");
+    else if (trace_timed_out) printf("STOP: bounded continuous process-tree trace ended by supervisor timeout; all tracees stopped by supervisor\n");
     else if (process_limit_hit) printf("STOP: process tree reached the safe cap; all tracees stopped by supervisor\n");
     else if (exit_signal) printf("STOP: root /init terminated by signal %d\n", exit_signal);
     else if (exit_code >= 0) printf("STOP: root /init exited with code %d\n", exit_code);
@@ -1544,6 +1573,7 @@ int main(int argc, char **argv) {
     printf("HOST PRIVILEGED MOUNTS: 0 (host mount/umount were never invoked)\n");
     if (rc != 0) return 1;
     if (!saw_exec) return 1;
+    if (trace_cancelled) return exit_code == 130 ? 130 : 1;
     if (dynamic_exec_blocked) return 3;
     if (process_limit_hit) return 4;
     if (exit_signal) return 128 + exit_signal;

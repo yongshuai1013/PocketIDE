@@ -33,6 +33,8 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -53,12 +55,22 @@ public final class MainActivity extends Activity {
     private static final String INIT_SHA256 = "2d9cbb198d8367f434c5fd7bada245c9e7618dc910253190f5d4dd3d0f6d1a00";
     private static final String MANIFEST_SHA_ASSET = "api10-system-manifest.sha256";
     private static final long STORAGE_MARGIN_BYTES = 12L * 1024L * 1024L;
+    private static final int MAX_REPORT_CHARS = 48 * 1024;
+    private static final int MAX_LOG_VIEW_BYTES = 256 * 1024;
 
     private final Set<String> knownSystemAssetDirectories = new HashSet<>();
     private TextView report;
     private Button guestButton;
     private Button exportButton;
+    private Button viewLogButton;
+    private Button stopButton;
     private File latestLogFile;
+    private volatile boolean stopRequested;
+    private volatile boolean runActive;
+    private volatile boolean runCancellable;
+    private volatile Thread activeRunThread;
+    private volatile java.lang.Process activeSupervisorProcess;
+    private final StringBuilder runProgressLog = new StringBuilder();
 
     @Override
     public void onCreate(Bundle state) {
@@ -66,13 +78,16 @@ public final class MainActivity extends Activity {
         buildUi();
         latestLogFile = new File(getCacheDir(), LOG_FILE_NAME);
         exportButton.setEnabled(hasExportableLog());
+        viewLogButton.setEnabled(hasExportableLog());
         report.setText("GingerVM Android guest: continuous init process-tree trace\n\n"
                 + "Stages the original Google SDK API 10 / Android 2.3.7 ARMv7 ramdisk and complete matching /system tree. Starts the original static /init once and follows its fork/clone/exec descendants in the same bounded ptrace session. Dynamic ELF copies change only PT_INTERP to the original guest linker inherited as fd 198; the host Android linker is not substituted.\n"
                 + "This is not a claim of a complete boot or desktop. Guest mount/device/identity operations are software-only; no host root or host mount is used.\n\n"
                 + "Host ABI: " + Arrays.toString(Build.SUPPORTED_ABIS) + "\n"
                 + "64-bit app process: " + Process.is64Bit() + "\n"
                 + "Android API: " + Build.VERSION.SDK_INT + "\n"
-                + "No guest smoke trace has been recorded yet.");
+                + "Latest confirmed Android 12 device stage from the supplied v0.6.1 log: 1323 syscall entries; path rewrites=58; virtual mounts=4; device/mode ops=5; ID ops=6; poll waits=1122; brokered SIGSYS suppressed=1138; denied=4; one process event and one /sbin/ueventd exec; no dynamic exec or linker entry. /init reached a software-emulated event wait with no event source. Its STOP was the supervisor time limit, not a user cancellation.\n\n"
+                + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer shows a bounded tail; share/save exports the full latest file.\n"
+                + "No trace from this v0.6.2 installation has been recorded yet; the v0.6.1 device trace above is historical context.");
     }
 
     private void buildUi() {
@@ -84,6 +99,21 @@ public final class MainActivity extends Activity {
         guestButton = new Button(this);
         guestButton.setText("Stage guest + trace continuous Android startup");
         root.addView(guestButton, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout runControls = new LinearLayout(this);
+        runControls.setOrientation(LinearLayout.HORIZONTAL);
+        viewLogButton = new Button(this);
+        viewLogButton.setText("查看日誌");
+        stopButton = new Button(this);
+        stopButton.setText("停止");
+        stopButton.setEnabled(false);
+        runControls.addView(viewLogButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        runControls.addView(stopButton, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        root.addView(runControls, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
@@ -110,42 +140,167 @@ public final class MainActivity extends Activity {
         exportButton.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View view) { showLogExportOptions(); }
         });
+        viewLogButton.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) { showLogViewer(); }
+        });
+        stopButton.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) { requestStop(); }
+        });
     }
 
     private void startRun() {
+        if (runActive) return;
+        stopRequested = false;
+        runActive = true;
+        runCancellable = true;
+        activeSupervisorProcess = null;
+        synchronized (runProgressLog) { runProgressLog.setLength(0); }
         guestButton.setEnabled(false);
         exportButton.setEnabled(false);
-        report.setText("Preparing the complete Google API10 guest image; about 106 MiB of userland and linker aliases are staged across app-private storage and extracted ARM32 libraries…\n");
-        new Thread(new Runnable() {
+        viewLogButton.setEnabled(true);
+        stopButton.setEnabled(true);
+        setReportText("Preparing the complete Google API10 guest image; about 106 MiB of userland and linker aliases are staged across app-private storage and extracted ARM32 libraries…\n"
+                + "Previous confirmed device stop was supervisor timeout; this run's Stop button requests a separate user cancellation.\n");
+        postProgress("RUN STARTED: one continuous original /init process-tree session; this app-private latest-log file will be replaced when the run ends.\n");
+        Thread worker = new Thread(new Runnable() {
             @Override public void run() {
                 String result;
                 try {
                     result = executeGuestEnvironmentTest();
+                } catch (RunCancelledException e) {
+                    result = "USER CANCELLED: " + e.getMessage() + "\nNo guest program was executed. Partial staging will be safely rechecked or removed on the next run.\n";
                 } catch (Exception e) {
                     result = "TRACE FAILED: " + e + "\n";
                 }
+                runCancellable = false;
+                final String completeLog;
+                synchronized (runProgressLog) { completeLog = runProgressLog.toString() + result; }
                 IOException writeFailure = null;
                 try {
-                    writeLatestLog(result);
+                    writeLatestLog(completeLog);
                 } catch (IOException e) {
                     writeFailure = e;
                 }
+                runActive = false;
+                activeSupervisorProcess = null;
+                activeRunThread = null;
                 final IOException finalWriteFailure = writeFailure;
-                final String finalResult = writeFailure == null ? result : result
+                final String finalResult = writeFailure == null ? completeLog : completeLog
                         + "\nLOG EXPORT PREPARATION FAILED: " + writeFailure + "\n";
                 runOnUiThread(new Runnable() {
                     @Override public void run() {
-                        report.setText(finalResult);
+                        setReportText(finalResult);
                         guestButton.setEnabled(true);
                         exportButton.setEnabled(finalWriteFailure == null && hasExportableLog());
+                        viewLogButton.setEnabled(hasExportableLog());
+                        stopButton.setEnabled(false);
                     }
                 });
             }
-        }, "guest-init-process-tree").start();
+        }, "guest-init-process-tree");
+        activeRunThread = worker;
+        worker.start();
     }
 
     private boolean hasExportableLog() {
         return latestLogFile != null && latestLogFile.isFile() && latestLogFile.length() > 0;
+    }
+
+    private void requestStop() {
+        if (!runActive || !runCancellable) return;
+        stopRequested = true;
+        stopButton.setEnabled(false);
+        postProgress("\nUSER STOP REQUESTED: stopping the current staging/trace run; this is distinct from the supervisor time limit.\n");
+        java.lang.Process supervisor = activeSupervisorProcess;
+        if (supervisor != null) {
+            try {
+                supervisor.destroy();
+                postProgress("Sent SIGTERM to the supervisor; waiting for traced children to be terminated and reaped.\n");
+            } catch (Exception e) {
+                postProgress("Could not send graceful stop to supervisor: " + e + "\n");
+            }
+        } else {
+            postProgress("No supervisor is running yet; staging will stop at its next safe cancellation checkpoint.\n");
+        }
+    }
+
+    private void showLogViewer() {
+        String text;
+        String title;
+        if (runActive) {
+            text = report.getText().toString();
+            title = "即時日誌（畫面最近內容）";
+        } else if (hasExportableLog()) {
+            try {
+                text = readLatestLogTail();
+                title = "完整追蹤日誌（最近 256 KiB）";
+            } catch (IOException e) {
+                Toast.makeText(this, "讀取日誌失敗：" + e, Toast.LENGTH_LONG).show();
+                return;
+            }
+        } else {
+            Toast.makeText(this, "目前沒有可查看的追蹤日誌", Toast.LENGTH_LONG).show();
+            return;
+        }
+        TextView body = new TextView(this);
+        body.setTextSize(13);
+        body.setTextIsSelectable(true);
+        body.setPadding(24, 20, 24, 20);
+        body.setText(text);
+        ScrollView viewer = new ScrollView(this);
+        viewer.addView(body);
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setView(viewer)
+                .setPositiveButton("關閉", null)
+                .show();
+    }
+
+    private String readLatestLogTail() throws IOException {
+        try (RandomAccessFile in = new RandomAccessFile(latestLogFile, "r")) {
+            long length = in.length();
+            boolean truncated = length > MAX_LOG_VIEW_BYTES;
+            long start = Math.max(0, length - MAX_LOG_VIEW_BYTES);
+            in.seek(start);
+            if (truncated) {
+                while (in.getFilePointer() < length && in.read() != '\n') { }
+            }
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            int n;
+            while ((n = in.read(buffer)) >= 0) bytes.write(buffer, 0, n);
+            String tail = new String(bytes.toByteArray(), StandardCharsets.UTF_8);
+            if (truncated) return "［畫面僅顯示日誌尾端；完整單次執行記錄仍可分享／儲存］\n" + tail;
+            return tail;
+        }
+    }
+
+    private String boundedReport(String text) {
+        if (text.length() <= MAX_REPORT_CHARS) return text;
+        int start = Math.max(0, text.length() - (MAX_REPORT_CHARS - 64));
+        int newline = text.indexOf('\n', start);
+        if (newline >= 0 && newline + 1 < text.length()) start = newline + 1;
+        return "［畫面只保留最近約 48 Ki 字元；完整日誌可分享／儲存］\n" + text.substring(start);
+    }
+
+    private void setReportText(String text) {
+        report.setText(boundedReport(text));
+    }
+
+    private void appendReportText(final String text) {
+        runOnUiThread(new Runnable() {
+            @Override public void run() {
+                setReportText(report.getText().toString() + text);
+            }
+        });
+    }
+
+    private void throwIfStopRequested() throws RunCancelledException {
+        if (stopRequested) throw new RunCancelledException("user requested Stop; cancellation checkpoint reached");
+    }
+
+    private static final class RunCancelledException extends IOException {
+        RunCancelledException(String message) { super(message); }
     }
 
     private void writeLatestLog(String text) throws IOException {
@@ -230,9 +385,11 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private String executeGuestEnvironmentTest() {
+    private String executeGuestEnvironmentTest() throws RunCancelledException {
+        throwIfStopRequested();
         StringBuilder out = new StringBuilder();
         out.append("GingerVM continuous Android 2.3.7/API 10 init process-tree trace\n");
+        out.append("HISTORICAL DEVICE BASELINE (user-provided v0.6.1 Android 12 log; not this run): syscalls=1323, path-rewrites=58, virtual-mounts=4, device/mode-ops=5, ID-ops=6, poll-waits=1122, brokered-SIGSYS-suppressed=1138, denied=4; fork/clone/vfork events=1; /sbin/ueventd exec events=1; dynamic execs=0; linker entries=0. /init reached the software-emulated event wait with no virtual event source. Previous STOP was supervisor timeout, not user cancellation.\n\n");
         out.append("Host ABI: ").append(Arrays.toString(Build.SUPPORTED_ABIS)).append('\n');
         out.append("64-bit app process: ").append(Process.is64Bit()).append('\n');
         out.append("Android API: ").append(Build.VERSION.SDK_INT).append('\n');
@@ -276,6 +433,7 @@ public final class MainActivity extends Activity {
         String readyMarker = "GINGERVM-API10-CONTINUOUS-v0.4.0\n" + manifestHash + "\n"
                 + guestLibraryDir.getAbsolutePath() + "\n" + INIT_SHA256 + "\n";
         boolean reuse = isDeploymentReady(guestRoot, systemRoot, readyMarker, manifest, guestLibraryDir);
+        throwIfStopRequested();
         long available = new StatFs(getFilesDir().getAbsolutePath()).getAvailableBytes();
         if (!reuse && available < requiredBytes + STORAGE_MARGIN_BYTES) {
             return out.append("NOT ENOUGH PRIVATE STORAGE: need at least ")
@@ -320,6 +478,9 @@ public final class MainActivity extends Activity {
                         .append(" PT_INTERP-only linker aliases in APK-extracted armeabi-v7a\n");
                 postProgress("Full API10 system tree staged. Starting one /init process-tree trace…\n");
             }
+        } catch (RunCancelledException e) {
+            return out.append("USER CANCELLED DURING STAGING: ").append(e.getMessage()).append('\n')
+                    .append("No guest program was executed. Partial app-private staging is incomplete and will be safely rechecked or removed on the next run.\n").toString();
         } catch (Exception e) {
             return out.append("STAGING FAILED: ").append(e).append('\n')
                     .append("No guest program was executed. You can retry; partial app-private guest data will be safely removed first.\n").toString();
@@ -334,6 +495,7 @@ public final class MainActivity extends Activity {
 
         out.append("Continuous trace: one original /init with its traced child tree; maximum 32 tracees, bounded by the supervisor timeout.\n");
         out.append("Dynamic ELF policy: preserve each original executable and create a separate copy changing only PT_INTERP to /proc/self/fd/198; fd 198 is the original Google API10 linker inherited by the guest tree. Host Android linker substitution is not accepted.\n\n");
+        throwIfStopRequested();
         appendProgress(out, "Start original /init and follow its child processes in the same session");
         out.append(runNative("continuous /init process tree", supervisor, guestInit, guestRoot, 120,
                 guestLibraryDir, "/init"));
@@ -361,18 +523,24 @@ public final class MainActivity extends Activity {
             System.arraycopy(guestArgv, 0, command, 5, guestArgv.length);
             process = new ProcessBuilder(command).redirectErrorStream(true).start();
         } catch (Exception e) {
+            if (stopRequested) return header.append("USER CANCELLED BEFORE SUPERVISOR START: ").append(e).append('\n').toString();
             return header.append("START FAILED: ").append(e).append('\n').toString();
         }
         final java.lang.Process child = process;
+        activeSupervisorProcess = process;
+        if (stopRequested) process.destroy();
         final ByteArrayOutputStream captured = new ByteArrayOutputStream();
         final AtomicReference<String> readerFailure = new AtomicReference<>();
         Thread reader = new Thread(new Runnable() {
             @Override public void run() {
-                try (InputStream in = child.getInputStream()) {
-                    byte[] buffer = new byte[4096];
+                try (InputStreamReader in = new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8)) {
+                    char[] buffer = new char[4096];
                     int n;
                     while ((n = in.read(buffer)) >= 0) {
-                        captured.write(buffer, 0, n);
+                        String chunk = new String(buffer, 0, n);
+                        byte[] encoded = chunk.getBytes(StandardCharsets.UTF_8);
+                        captured.write(encoded, 0, encoded.length);
+                        appendReportText(chunk);
                     }
                 } catch (Exception e) { readerFailure.set(e.toString()); }
             }
@@ -380,6 +548,7 @@ public final class MainActivity extends Activity {
         reader.start();
         int exit = -1;
         boolean timedOut = false;
+        boolean interrupted = false;
         try {
             if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
                 timedOut = true;
@@ -389,17 +558,39 @@ public final class MainActivity extends Activity {
             if (!timedOut) exit = process.exitValue();
             reader.join();
         } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            process.destroyForcibly();
-            return header.append("RUN INTERRUPTED: ").append(e).append('\n').toString();
+            interrupted = true;
+            stopRequested = true;
+            process.destroy();
+            try {
+                if (!process.waitFor(5, TimeUnit.SECONDS)) process.destroyForcibly();
+                process.waitFor();
+                exit = process.exitValue();
+                reader.join();
+            } catch (InterruptedException cleanupInterrupted) {
+                process.destroyForcibly();
+            }
         }
+        activeSupervisorProcess = null;
         String trace = new String(captured.toByteArray(), StandardCharsets.UTF_8);
         if (readerFailure.get() != null)
             trace += "\nOUTPUT CAPTURE ERROR: " + readerFailure.get() + "; exported log may be incomplete.\n";
         boolean guestLinkerEntered = trace.contains("GUEST DYNAMIC EXEC EVENT:");
         header.append(trace);
+        if (interrupted) header.append("\nRUN INTERRUPTED: the app thread was interrupted; a graceful stop was requested before fallback cleanup.\n");
+        if (stopRequested) {
+            header.append("\nUSER CANCEL REQUESTED: this was an explicit app Stop action, not a supervisor timeout.\n");
+            if (trace.contains("STOP: user requested cancellation; supervisor terminated and reaped the traced process tree"))
+                header.append("USER CANCEL RESULT: supervisor reported traced-tree termination and reap complete.\n");
+            else if (trace.contains("STOP: user-requested cancellation before guest exec; no supervisor timeout occurred")
+                    || trace.contains("USER CANCELLED BEFORE SUPERVISOR START"))
+                header.append("USER CANCEL RESULT: cancellation happened before guest execution; no tracees existed to reap.\n");
+            else if (trace.contains("STOP: root /init exited") || trace.contains("STOP: root /init terminated"))
+                header.append("USER CANCEL RESULT: the guest had already reached a root-process stop; see the native STOP line for its outcome.\n");
+            else
+                header.append("USER CANCEL RESULT: native cleanup confirmation is absent; inspect the supervisor STOP/CLEANUP lines above.\n");
+        }
         if (timedOut) {
-            header.append("\nAPP TIMEOUT: supervisor was stopped after ").append(timeoutSeconds).append(" seconds.\n");
+            header.append("\nAPP TIMEOUT: the Java wall-time guard expired after ").append(timeoutSeconds).append(" seconds; this is not the normal supervisor event-wait timeout.\n");
             if (guestLinkerEntered) header.append("RESULT: the continuous tree entered the original API10 linker, but the dynamic target main/zygote/framework entry remains unproven.\n");
         } else {
             header.append("\nSupervisor exit code: ").append(exit).append('\n');
@@ -422,13 +613,12 @@ public final class MainActivity extends Activity {
 
     private void appendProgress(StringBuilder output, String message) {
         output.append("\n=== ").append(message).append(" ===\n");
-        postProgress(message + "…\n");
+        appendReportText(message + "…\n");
     }
 
     private void postProgress(final String message) {
-        runOnUiThread(new Runnable() {
-            @Override public void run() { report.append(message); }
-        });
+        synchronized (runProgressLog) { runProgressLog.append(message); }
+        appendReportText(message);
     }
 
     private void loadSystemAssetDirectories(JSONObject manifest) throws IOException, JSONException {
@@ -466,6 +656,7 @@ public final class MainActivity extends Activity {
         Set<String> expectedLinks = new HashSet<>();
         JSONArray directories = manifest.getJSONArray("directories");
         for (int i = 0; i < directories.length(); ++i) {
+            throwIfStopRequested();
             String relative = directories.getString(i);
             validateRelativePath(relative);
             expectedDirectories.add(relative);
@@ -478,6 +669,7 @@ public final class MainActivity extends Activity {
         long sourceBytes = 0;
         int sourceFileCount = 0;
         for (int i = 0; i < files.length(); ++i) {
+            throwIfStopRequested();
             JSONObject item = files.getJSONObject(i);
             String relative = item.getString("path");
             String kind = item.getString("kind");
@@ -519,6 +711,7 @@ public final class MainActivity extends Activity {
         if (symlinks.length() != manifest.getInt("symlink_count"))
             throw new IOException("guest symlink count does not match manifest");
         for (int i = 0; i < symlinks.length(); ++i) {
+            throwIfStopRequested();
             JSONArray item = symlinks.getJSONArray(i);
             String relative = item.getString(0);
             validateRelativePath(relative);
@@ -536,9 +729,10 @@ public final class MainActivity extends Activity {
             throw new IOException("guest /system tree paths differ from the verified source manifest");
     }
 
-    private long sumAssetBytes(JSONArray files) throws JSONException {
+    private long sumAssetBytes(JSONArray files) throws IOException, JSONException {
         long total = 0;
         for (int i = 0; i < files.length(); ++i) {
+            throwIfStopRequested();
             JSONObject item = files.getJSONObject(i);
             if ("asset".equals(item.getString("kind"))) total += item.getLong("size");
         }
@@ -548,10 +742,12 @@ public final class MainActivity extends Activity {
     private void collectGuestSystemTree(File root, File directory, Set<String> directories,
                                         Set<String> files, Set<String> links)
             throws IOException {
+        throwIfStopRequested();
         File[] children = directory.listFiles();
         if (children == null) throw new IOException("cannot list staged system directory " + directory);
         String prefix = root.getAbsolutePath() + File.separator;
         for (File child : children) {
+            throwIfStopRequested();
             String absolute = child.getAbsolutePath();
             if (!absolute.startsWith(prefix)) throw new IOException("system path escaped staged root");
             String relative = absolute.substring(prefix.length()).replace(File.separatorChar, '/');
@@ -603,7 +799,10 @@ public final class MainActivity extends Activity {
             try (InputStream in = new FileInputStream(file)) {
                 byte[] buffer = new byte[32768];
                 int n;
-                while ((n = in.read(buffer)) >= 0) digest.update(buffer, 0, n);
+                while ((n = in.read(buffer)) >= 0) {
+                    throwIfStopRequested();
+                    digest.update(buffer, 0, n);
+                }
             }
             return toHex(digest.digest());
         } catch (NoSuchAlgorithmException e) {
@@ -628,6 +827,7 @@ public final class MainActivity extends Activity {
     private void restoreSystemSymlinks(File systemRoot) throws IOException, JSONException {
         JSONArray links = new JSONArray(readAssetText("api10-system-symlinks.json"));
         for (int i = 0; i < links.length(); ++i) {
+            throwIfStopRequested();
             JSONArray item = links.getJSONArray(i);
             String relative = item.getString(0);
             String target = item.getString(1);
@@ -647,6 +847,7 @@ public final class MainActivity extends Activity {
     private void restoreSystemAssetNames(File systemRoot, JSONObject manifest) throws IOException, JSONException {
         JSONArray files = manifest.getJSONArray("files");
         for (int i = 0; i < files.length(); ++i) {
+            throwIfStopRequested();
             JSONObject item = files.getJSONObject(i);
             if (!"asset".equals(item.getString("kind"))) continue;
             String original = item.getString("path");
@@ -671,6 +872,7 @@ public final class MainActivity extends Activity {
 
         JSONArray libraries = new JSONArray(readAssetText("api10-system-native-libraries.json"));
         for (int i = 0; i < libraries.length(); ++i) {
+            throwIfStopRequested();
             JSONObject item = libraries.getJSONObject(i);
             replaceWithNativeSymlink(systemRoot, item.getString("path"),
                     new File(guestLibraryDir, item.getString("native")));
@@ -678,6 +880,7 @@ public final class MainActivity extends Activity {
 
         JSONArray executables = new JSONArray(readAssetText("api10-system-native-executables.json"));
         for (int i = 0; i < executables.length(); ++i) {
+            throwIfStopRequested();
             JSONObject item = executables.getJSONObject(i);
             replaceWithNativeSymlink(systemRoot, item.getString("path"),
                     new File(guestLibraryDir, item.getString("native")));
@@ -813,6 +1016,7 @@ public final class MainActivity extends Activity {
     }
 
     private void copyAssetTree(String assetPath, File destination) throws IOException {
+        throwIfStopRequested();
         String[] children = getAssets().list(assetPath);
         if (children == null) children = new String[0];
         boolean directory = "api10-system".equals(assetPath) || knownSystemAssetDirectories.contains(assetPath)
@@ -820,6 +1024,7 @@ public final class MainActivity extends Activity {
         if (directory) {
             ensureDirectory(destination);
             for (String child : children) {
+                throwIfStopRequested();
                 if (assetPath.equals("api10-init-root")
                         && (child.equals("STAGING-NOTE.txt") || child.equals("ASSET-FILES.txt"))) continue;
                 copyAssetTree(assetPath + "/" + child, new File(destination, child));
@@ -832,7 +1037,10 @@ public final class MainActivity extends Activity {
             try (FileOutputStream stream = new FileOutputStream(destination)) {
                 byte[] buffer = new byte[16384];
                 int n;
-                while ((n = in.read(buffer)) >= 0) stream.write(buffer, 0, n);
+                while ((n = in.read(buffer)) >= 0) {
+                    throwIfStopRequested();
+                    stream.write(buffer, 0, n);
+                }
             }
         }
     }
@@ -843,7 +1051,10 @@ public final class MainActivity extends Activity {
         try (InputStream in = getAssets().open(assetPath); FileOutputStream stream = new FileOutputStream(destination)) {
             byte[] buffer = new byte[16384];
             int n;
-            while ((n = in.read(buffer)) >= 0) stream.write(buffer, 0, n);
+            while ((n = in.read(buffer)) >= 0) {
+                throwIfStopRequested();
+                stream.write(buffer, 0, n);
+            }
         }
     }
 
@@ -876,7 +1087,10 @@ public final class MainActivity extends Activity {
         if (OsConstants.S_ISDIR(stat.st_mode)) {
             File[] children = file.listFiles();
             if (children == null) throw new IOException("cannot list app-private directory " + file);
-            for (File child : children) deleteRecursively(child);
+            for (File child : children) {
+                throwIfStopRequested();
+                deleteRecursively(child);
+            }
             try {
                 Os.remove(file.getAbsolutePath());
             } catch (ErrnoException e) {

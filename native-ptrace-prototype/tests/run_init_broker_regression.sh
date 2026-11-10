@@ -15,8 +15,11 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
   cc -std=c11 -O2 -Wall -Wextra -Werror \
     "$ROOT/tests/ptrace_seccomp_sigsys_regression.c" -o "$TMP/ptrace_seccomp_sigsys_regression"
   "$TMP/ptrace_seccomp_sigsys_regression"
+  cc -std=c11 -O2 -Wall -Wextra -Werror \
+    "$ROOT/tests/ptrace_cancel_cleanup_regression.c" -o "$TMP/ptrace_cancel_cleanup_regression"
+  "$TMP/ptrace_cancel_cleanup_regression"
 else
-  echo 'ptrace seccomp SIGSYS regression: SKIP (host test is x86_64 Linux only)'
+  echo 'ptrace seccomp/cancellation kernel regressions: SKIP (host tests are x86_64 Linux only)'
 fi
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_exec_elf_test.c" -o "$TMP/guest_exec_elf_test"
@@ -62,6 +65,14 @@ assert 'dynamic_exec_blocked' in src and 'denied before host linker substitution
 assert 'prepare_guest_linker_fd' in src and 'GUEST_LINKER_FD, F_SETFD, 0' in src
 assert 'command == F_SETFD' in src and 'GUEST_LINKER_FD' in src
 assert 'GUEST SIGNAL FORWARDED' in src
+assert 'static volatile sig_atomic_t user_cancel_requested' in src
+assert 'sigaction(SIGTERM' in src and 'sigaction(SIGINT' in src
+assert 'ptrace_terminate_and_reap(pids, count)' in src
+assert 'TRACE CLEANUP: tracked=%zu reaped=%zu already-gone=%zu unresolved=%zu' in src
+assert 'STOP: user requested cancellation; supervisor terminated and reaped the traced process tree' in src
+assert 'bounded continuous process-tree trace ended by supervisor timeout' in src
+cleanup = Path(sys.argv[1]).with_name('ptrace_tracee_cleanup.h').read_text()
+assert 'ptrace_terminate_and_reap' in cleanup and 'waitpid(pid, &status, __WALL)' in cleanup
 broker = Path(sys.argv[1]).with_name('init_broker.h').read_text()
 assert '#define ARM_NR_GETTID 224' in src and 'case 215: case 216: case 224:' in broker
 fake = src.split('static int fake_syscall(', 1)[1].split('static int resume_trace(', 1)[0]
@@ -109,6 +120,7 @@ assert 'google-api10-full-root' in activity and 'app_private_asset_bytes' in act
 assert 'Os.lstat' in activity and 'Os.remove' in activity
 copy = activity[activity.index('private void copyAssetTree'):activity.index('private void copyAssetFile')]
 assert 'getAssets().open(assetPath)' in copy and 'catch (IOException openError)' not in copy
+assert 'throwIfStopRequested();' in copy
 assert 'collectGuestSystemTree' in activity
 assert 'deleteRecursively(guestRoot)' in activity
 assert 'complete matching /system tree' in activity
@@ -125,12 +137,21 @@ assert 'target main entry remains unproven' in src
 assert 'dynamic-linker entry event is not proof' in activity
 assert 'dynamic_executable_count' in activity and 'dynamic_sha256' in activity
 assert 'captured.size() > 192 * 1024' not in activity and 'reader.join();' in activity
-assert 'writeLatestLog(result)' in activity and 'out.getFD().sync()' in activity
+assert 'writeLatestLog(completeLog)' in activity and 'out.getFD().sync()' in activity
 assert '分享／儲存完整追蹤日誌' in activity and '匯出完整追蹤日誌' in activity
 assert 'Intent.ACTION_SEND' in activity and 'Intent.EXTRA_STREAM' in activity
 assert 'Intent.FLAG_GRANT_READ_URI_PERMISSION' in activity and 'ClipData.newUri' in activity
 assert 'Intent.ACTION_CREATE_DOCUMENT' in activity and 'getContentResolver().openOutputStream' in activity
 assert 'OUTPUT CAPTURE ERROR:' in activity
+assert 'setText("查看日誌")' in activity and 'setText("停止")' in activity
+assert 'private void showLogViewer()' in activity and 'readLatestLogTail()' in activity
+assert 'MAX_LOG_VIEW_BYTES = 256 * 1024' in activity and 'MAX_REPORT_CHARS = 48 * 1024' in activity
+assert 'supervisor.destroy()' in activity and 'USER STOP REQUESTED' in activity
+assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
+assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
+assert 'appendReportText(chunk)' in activity and 'InputStreamReader' in activity
+assert 'HISTORICAL DEVICE BASELINE (user-provided v0.6.1 Android 12 log; not this run)' in activity
+assert 'Previous STOP was supervisor timeout, not user cancellation' in activity
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
 assert 'android:grantUriPermissions="true"' in manifest and '${applicationId}.trace-logs' in manifest
@@ -138,9 +159,9 @@ assert 'android:grantUriPermissions="true"' in manifest and '${applicationId}.tr
 # ABI-extracted payloads and candidate label identify the continuous version.
 assert "abiFilters 'arm64-v8a', 'armeabi-v7a'" in gradle
 assert "keepDebugSymbols += ['**/*.so']" in gradle
-assert "versionCode 10" in gradle and "versionName '0.6.1'" in gradle
+assert "versionCode 11" in gradle and "versionName '0.6.2'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM Continuous Trace v0.6.1' in manifest
+assert 'GingerVM Continuous Trace v0.6.2' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - validation/gingervm-apk-v0.6.1
+      - validation/gingervm-apk-v0.6.2
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -58,7 +59,7 @@ jobs:
           if-no-files-found: error
 
   android-apk:
-    name: Build GingerVM v0.6.1 Android APK
+    name: Build GingerVM v0.6.2 Android APK
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -94,15 +95,15 @@ jobs:
           bash native-ptrace-prototype/build-native.sh | tee "$RUNNER_TEMP/gingervm-apk-build.log"
           APK=native-ptrace-prototype/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
-          sha256sum "$APK" | tee "$RUNNER_TEMP/gingervm-v0.6.1-apk.sha256"
+          sha256sum "$APK" | tee "$RUNNER_TEMP/gingervm-v0.6.2-apk.sha256"
 
       - name: Upload APK, checksum and build log
         uses: actions/upload-artifact@v4
         with:
-          name: gingervm-continuous-trace-v0.6.1-apk
+          name: gingervm-continuous-trace-v0.6.2-apk
           path: |
             native-ptrace-prototype/app/build/outputs/apk/debug/app-debug.apk
-            ${{ runner.temp }}/gingervm-v0.6.1-apk.sha256
+            ${{ runner.temp }}/gingervm-v0.6.2-apk.sha256
             ${{ runner.temp }}/gingervm-apk-build.log
           if-no-files-found: error
           retention-days: 14
