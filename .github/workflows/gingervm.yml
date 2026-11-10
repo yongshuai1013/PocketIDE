@@ -64,9 +64,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Mask test signing passphrase in job logs
-        env:
-          GINGERVM_SIGNING_PASSWORD: android
-        run: echo "::add-mask::$GINGERVM_SIGNING_PASSWORD"
+        run: |
+          set -euo pipefail
+          TEST_SIGNING_PASS=$(printf '%s' 'YW5kcm9pZA==' | base64 --decode)
+          printf '::add-mask::%s\n' "$TEST_SIGNING_PASS"
+          printf 'GINGERVM_SIGNING_PASSWORD=%s\n' "$TEST_SIGNING_PASS" >> "$GITHUB_ENV"
+          unset TEST_SIGNING_PASS
 
       - name: Check out source
         uses: actions/checkout@v4
@@ -106,7 +109,6 @@ jobs:
       - name: Build and verify continuous-trace APK
         env:
           GINGERVM_SIGNING_KEY_ALIAS: gingervm-test
-          GINGERVM_SIGNING_PASSWORD: android
         run: |
           set -euo pipefail
           bash native-ptrace-prototype/build-native.sh

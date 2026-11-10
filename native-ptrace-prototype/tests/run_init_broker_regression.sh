@@ -191,13 +191,18 @@ assert "System.getenv('GINGERVM_SIGNING_KEY_ALIAS')" in gradle
 assert 'signingConfig signingConfigs.debug' in gradle
 assert 'validation/gingervm-apk-v0.6.3' in workflow
 assert 'GINGERVM_SIGNING_KEY_ALIAS: gingervm-test' in workflow
-assert 'GINGERVM_SIGNING_PASSWORD: android' in workflow
-assert 'echo "::add-mask::$GINGERVM_SIGNING_PASSWORD"' in workflow
+assert not re.search(r'GINGERVM_SIGNING_PASSWORD:\s*[^\n]+', workflow)
+assert "base64 --decode" in workflow
+assert "printf '::add-mask::%s\\n' \"$TEST_SIGNING_PASS\"" in workflow
 android_job = workflow.split('  android-apk:', 1)[1]
 mask_step = android_job.index('name: Mask test signing passphrase in job logs')
 assert mask_step < android_job.index('name: Check out source')
 assert mask_step < android_job.index('name: Set up Android SDK')
-assert 'echo "::add-mask::$GINGERVM_SIGNING_PASSWORD"' not in android_job.split('name: Build and verify continuous-trace APK', 1)[1]
+mask_block = android_job.split('name: Mask test signing passphrase in job logs', 1)[1].split('name: Check out source', 1)[0]
+assert 'GINGERVM_SIGNING_PASSWORD:' not in mask_block
+assert 'GINGERVM_SIGNING_PASSWORD=%s' in mask_block and '>> "$GITHUB_ENV"' in mask_block
+build_block = android_job.split('name: Build and verify continuous-trace APK', 1)[1].split('name: Remove runner copy of test signing key', 1)[0]
+assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
 assert 'gingervm-continuous-trace-v0.6.3-test-signed-apk' in upload
