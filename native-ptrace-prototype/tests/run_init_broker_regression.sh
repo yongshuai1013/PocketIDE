@@ -11,6 +11,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/broker_sigsys_state_test.c" -o "$TMP/broker_sigsys_state_test"
 "$TMP/broker_sigsys_state_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_uevent_virtual_test.c" -o "$TMP/guest_uevent_virtual_test"
+"$TMP/guest_uevent_virtual_test"
 if [[ "$(uname -m)" == "x86_64" ]]; then
   cc -std=c11 -O2 -Wall -Wextra -Werror \
     "$ROOT/tests/ptrace_seccomp_sigsys_regression.c" -o "$TMP/ptrace_seccomp_sigsys_regression"
@@ -37,18 +40,41 @@ from pathlib import Path
 import re, sys
 src = Path(sys.argv[1]).read_text()
 trace = src.split("static int run_trace(", 1)[1].split("int main(", 1)[0]
+uevent = Path(sys.argv[1]).with_name('guest_uevent_virtual.h').read_text()
 activity = Path(sys.argv[2]).read_text()
 provider = Path(sys.argv[2]).with_name('TraceLogProvider.java').read_text()
 gradle = Path(sys.argv[3]).read_text()
 manifest = Path(sys.argv[4]).read_text()
 stager = Path(sys.argv[5]).read_text()
-build = Path(sys.argv[6]).read_text()
+build_path = Path(sys.argv[6]).resolve()
+build = build_path.read_text()
+workflow = (build_path.parents[1] / '.github/workflows/gingervm.yml').read_text()
 
 # No privileged host mounts or host sockets; guest behavior stays app-private/software-only.
 assert not re.search(r'(?<![A-Za-z0-9_])mount\s*\(', src)
 assert not re.search(r'(?<![A-Za-z0-9_])umount2?\s*\(', src)
 for name in ("socket", "socketpair", "bind", "listen"):
     assert not re.search(r'(?<![A-Za-z0-9_])' + name + r'\s*\(', src), name
+assert '#define ARM_NR_SOCKET 281' in src and '#define ARM_NR_BIND 282' in src
+assert '#define ARM_NR_SETSOCKOPT 294' in src
+assert 'guest_uevent_socket_args_valid(domain, type, protocol)' in src
+assert 'guest_uevent_bind_args_valid(&addr, address_length' in src
+assert 'guest_uevent_setsockopt_args_valid(level, option, value, value_length)' in src
+assert 'strcmp(active_tracee->exec_target, "/sbin/ueventd") == 0' in src
+assert 'VIRTUAL UEVENT SOCKET:' in src and 'GUEST SOCKET ARGS:' in src
+assert 'VIRTUAL UEVENT BIND:' in src and 'VIRTUAL UEVENT SETSOCKOPT:' in src
+assert 'host socket API not called' in src and 'host bind API not called' in src
+assert 'host setsockopt API not called' in src
+assert 'GUEST POLL DIAGNOSTIC:' in src and 'virtual_fd_source(fds[i].fd)' in src
+assert 'timeout-ms=%d' in src and 'revents-in=0x%04x revents-out=0' in src
+assert 'event-queue=empty/no synthetic device events' in src
+assert 'GUEST COLD-BOOT MARKER OPEN:' in src
+assert 'INIT COLD-BOOT WAIT RELEASED:' in src
+assert 'unlink(marker_path)' in src and 'INIT STATE: initial actions reached' not in src
+assert 'GUEST_UEVENT_NETLINK_KOBJECT_UEVENT 15u' in uevent
+assert 'GUEST_UEVENT_RCVBUFFORCE_BYTES 65536' in uevent
+assert 'guest_uevent_socket_args_valid' in uevent and 'guest_uevent_bind_args_valid' in uevent
+assert 'guest_uevent_setsockopt_args_valid' in uevent
 assert 'PTRACE_TRACEME' in src and 'execve(binary, guest_argv, envp)' in src
 assert 'guest_path_to_host' in src and 'GUEST_SYSCALL_DENY' in src
 for event in ('PTRACE_O_TRACEFORK', 'PTRACE_O_TRACEVFORK', 'PTRACE_O_TRACECLONE', 'PTRACE_O_TRACEEXEC'):
@@ -159,9 +185,21 @@ assert 'android:grantUriPermissions="true"' in manifest and '${applicationId}.tr
 # ABI-extracted payloads and candidate label identify the continuous version.
 assert "abiFilters 'arm64-v8a', 'armeabi-v7a'" in gradle
 assert "keepDebugSymbols += ['**/*.so']" in gradle
-assert "versionCode 11" in gradle and "versionName '0.6.2'" in gradle
+assert "System.getenv('GINGERVM_SIGNING_KEYSTORE')" in gradle
+assert "System.getenv('GINGERVM_SIGNING_PASSWORD')" in gradle
+assert "System.getenv('GINGERVM_SIGNING_KEY_ALIAS')" in gradle
+assert 'signingConfig signingConfigs.debug' in gradle
+assert 'validation/gingervm-apk-v0.6.3' in workflow
+assert 'GINGERVM_SIGNING_KEY_ALIAS: gingervm-test' in workflow
+assert 'GINGERVM_SIGNING_PASSWORD: android' in workflow
+assert 'echo "::add-mask::$GINGERVM_SIGNING_PASSWORD"' in workflow
+assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
+upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
+assert 'gingervm-continuous-trace-v0.6.3-test-signed-apk' in upload
+assert 'gingervm-v0.6.3-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 12" in gradle and "versionName '0.6.3'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM Continuous Trace v0.6.2' in manifest
+assert 'GingerVM Continuous Trace v0.6.3' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
@@ -177,5 +215,5 @@ assert 'api10-system-manifest.json' in stager
 assert 'libgingervm_guest_linker.so' in stager
 assert 'patch_guest_interpreter' in stager and 'PATCHED_GUEST_INTERPRETER' in stager
 assert 'dynamic_interpreter_original' in stager and 'dynamic_interpreter_patched' in stager
-print('continuous API10 guest contract: PASS (one /init tree, bounded descendants, software PID/mount mediation, original API10 linker inherited via fd 198, exact PT_INTERP-only copies, full verified Google /system, no host root/mount/socket APIs)')
+print('continuous API10 guest contract: PASS (one /init tree, bounded descendants, software PID/mount and uevent control plane, poll/fd provenance, coldboot marker diagnostics, original API10 linker via fd 198, full verified Google /system, no host root/mount/socket APIs)')
 PY

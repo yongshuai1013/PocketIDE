@@ -228,11 +228,16 @@ with zipfile.ZipFile(apk) as zf:
     print(f"System image SHA-256: {expected_system_img}; manifest SHA-256: {manifest_hash}")
 PY
 
+if unzip -Z1 "$APK" | grep -Eiq '(^|/)[^/]+\.(keystore|jks|p12|pem|pk8|key)$'; then
+  echo 'Signing material must not be packaged in the APK.' >&2
+  exit 1
+fi
+
 AAPT="${AAPT:-/home/ubuntu/android-sdk/build-tools/35.0.0/aapt}"
 if [[ -x "$AAPT" ]]; then
   "$AAPT" dump badging "$APK" > "$TMP/badging"
   grep -Fq "native-code: 'arm64-v8a'" "$TMP/badging"
   grep -Fq "alt-native-code: 'armeabi-v7a'" "$TMP/badging"
-  grep -Fq "versionName='0.6.2'" "$TMP/badging"
+  grep -Fq "versionName='0.6.3'" "$TMP/badging"
 fi
 printf '%s\n' 'Native ABI metadata regression: PASS (arm64-v8a supervisor + armeabi-v7a original userland; extracted libraries required).'

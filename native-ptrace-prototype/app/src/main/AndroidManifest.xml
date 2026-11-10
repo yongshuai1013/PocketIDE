@@ -2,7 +2,7 @@
     <application
         android:allowBackup="false"
         android:debuggable="true"
-        android:label="GingerVM Continuous Trace v0.6.2"
+        android:label="GingerVM Continuous Trace v0.6.3"
         android:multiArch="true"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">

@@ -2,6 +2,15 @@ plugins {
     id 'com.android.application'
 }
 
+def testSigningStore = System.getenv('GINGERVM_SIGNING_KEYSTORE')
+def testSigningPassword = System.getenv('GINGERVM_SIGNING_PASSWORD')
+def testSigningAlias = System.getenv('GINGERVM_SIGNING_KEY_ALIAS')
+def testSigningValues = [testSigningStore, testSigningPassword, testSigningAlias]
+def useTestSigning = testSigningValues.any { it != null && !it.isEmpty() }
+if (useTestSigning && testSigningValues.any { it == null || it.isEmpty() }) {
+    throw new GradleException('Incomplete GingerVM test-signing configuration.')
+}
+
 android {
     namespace 'dev.gingervm.nativeprobe'
     compileSdk 35
@@ -10,10 +19,27 @@ android {
         applicationId 'dev.gingervm.nativeprobe'
         minSdk 23
         targetSdk 35
-        versionCode 11
-        versionName '0.6.2'
+        versionCode 12
+        versionName '0.6.3'
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+    }
+
+    signingConfigs {
+        debug {
+            if (useTestSigning) {
+                storeFile file(testSigningStore)
+                storePassword testSigningPassword
+                keyAlias testSigningAlias
+                keyPassword testSigningPassword
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
         }
     }
 

@@ -20,6 +20,7 @@
 #include "guest_exec_elf.h"
 #include "broker_sigsys_state.h"
 #include "ptrace_tracee_cleanup.h"
+#include "guest_uevent_virtual.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -101,6 +102,9 @@
 #define ARM_NR_FCHOWN 95
 #define ARM_NR_SOCKETCALL 102
 #define ARM_NR_POLL 168
+#define ARM_NR_SOCKET 281
+#define ARM_NR_BIND 282
+#define ARM_NR_SETSOCKOPT 294
 #define ARM_NR_WAIT4 114
 #define ARM_NR_CLONE 120
 #define ARM_NR_MPROTECT 125
@@ -197,9 +201,13 @@ struct tracee_state {
     int exec_was_dynamic;
     int32_t pending_return;
     struct broker_sigsys_candidate broker_sigsys;
+    unsigned int poll_diagnostic_count;
+    uint32_t last_syscall_args[6];
+    char last_guest_path[PATH_MAX];
     char exec_target[PATH_MAX];
 };
 enum pending_kind { PENDING_NONE, PENDING_RESULT };
+enum virtual_fd_kind { VIRTUAL_FD_GENERIC, VIRTUAL_FD_PROPERTY, VIRTUAL_FD_UEVENT };
 
 static pid_t traced_pid = -1;
 static char guest_root[PATH_MAX];
@@ -224,10 +232,18 @@ static unsigned long dynamic_exec_allowed_count;
 static unsigned long dynamic_exec_started_count;
 static unsigned long brokered_sigsys_suppressed;
 static int virtual_fds[MAX_VIRTUAL_FDS];
+static enum virtual_fd_kind virtual_fd_kinds[MAX_VIRTUAL_FDS];
 static size_t virtual_fd_count;
 static int virtual_property_fd = -1;
 static int virtual_property_bound;
 static int virtual_property_listening;
+static int virtual_uevent_fd = -1;
+static int virtual_uevent_bound;
+static unsigned long virtual_uevent_socket_count;
+static unsigned long virtual_uevent_bind_count;
+static unsigned long virtual_uevent_setsockopt_count;
+static int guest_coldboot_marker_opened;
+static int init_coldboot_wait_released;
 static int saw_exec;
 static int trace_timed_out;
 static volatile sig_atomic_t user_cancel_requested;
@@ -614,6 +630,12 @@ static int virtual_mount(pid_t pid, const struct compat_pt_regs *regs) {
     rc = mkdir_p(backing);
     if (rc != 0) return rc;
     if (strcmp(target, "/dev") == 0) {
+        char marker_path[PATH_MAX];
+        int marker_len = snprintf(marker_path, sizeof(marker_path), "%s/.coldboot_done", backing);
+        if (marker_len <= 0 || (size_t)marker_len >= sizeof(marker_path)) return -ENAMETOOLONG;
+        if (unlink(marker_path) != 0 && errno != ENOENT) return -errno;
+        guest_coldboot_marker_opened = 0;
+        init_coldboot_wait_released = 0;
         static const char *const devices[] = {"null", "zero", "random", "urandom", "kmsg",
             "__properties__", "binder", "ashmem", NULL};
         for (size_t i = 0; devices[i]; ++i) {
@@ -662,10 +684,25 @@ static int is_virtual_fd(int fd) {
     return 0;
 }
 
-static int alloc_virtual_fd(void) {
+static const char *virtual_fd_source(int fd) {
+    if (fd < 0) return "negative descriptor (ignored by poll)";
+    for (size_t i = 0; i < virtual_fd_count; ++i) {
+        if (virtual_fds[i] != fd) continue;
+        if (virtual_fd_kinds[i] == VIRTUAL_FD_UEVENT)
+            return "software AF_NETLINK/NETLINK_KOBJECT_UEVENT; no host fd";
+        if (virtual_fd_kinds[i] == VIRTUAL_FD_PROPERTY)
+            return "software AF_UNIX property-service fd; no host socket";
+        return "other software virtual fd; no host fd";
+    }
+    return "untracked guest fd (path-backed/inherited provenance unavailable)";
+}
+
+static int alloc_virtual_fd(enum virtual_fd_kind kind) {
     if (virtual_fd_count >= MAX_VIRTUAL_FDS) return -EMFILE;
     int fd = VIRTUAL_FD_BASE + (int)virtual_fd_count;
-    virtual_fds[virtual_fd_count++] = fd;
+    virtual_fds[virtual_fd_count] = fd;
+    virtual_fd_kinds[virtual_fd_count] = kind;
+    virtual_fd_count++;
     return fd;
 }
 
@@ -684,13 +721,13 @@ static int virtual_socketcall(pid_t pid, const struct compat_pt_regs *regs) {
 
     if (op == SOCKETCALL_SOCKET) {
         if (args[0] != 1u || (args[1] & 0xfu) != 1u || args[2] != 0u) return -EAFNOSUPPORT;
-        return alloc_virtual_fd();
+        return alloc_virtual_fd(VIRTUAL_FD_PROPERTY);
     }
     if (op == SOCKETCALL_SOCKETPAIR) {
         if (args[0] != 1u || (args[1] & 0xfu) != 1u || args[2] != 0u) return -EAFNOSUPPORT;
-        int32_t pair[2] = { alloc_virtual_fd(), -1 };
+        int32_t pair[2] = { alloc_virtual_fd(VIRTUAL_FD_GENERIC), -1 };
         if (pair[0] < 0) return pair[0];
-        pair[1] = alloc_virtual_fd();
+        pair[1] = alloc_virtual_fd(VIRTUAL_FD_GENERIC);
         if (pair[1] < 0 || write_remote(pid, args[3], pair, sizeof(pair)) != 0) return -EFAULT;
         return 0;
     }
@@ -719,6 +756,66 @@ static int virtual_socketcall(pid_t pid, const struct compat_pt_regs *regs) {
     return -EAFNOSUPPORT;
 }
 
+static int is_guest_ueventd(pid_t pid) {
+    return active_tracee && active_tracee->pid == pid &&
+           strcmp(active_tracee->exec_target, "/sbin/ueventd") == 0;
+}
+
+static int virtual_uevent_socket(pid_t pid, const struct compat_pt_regs *regs) {
+    uint32_t domain = regs->uregs[0], type = regs->uregs[1], protocol = regs->uregs[2];
+    printf("GUEST SOCKET ARGS: host-pid=%d guest-pid=%d target=%s syscall=%d domain=%u type=%u protocol=%u\n",
+           pid, active_tracee ? active_tracee->guest_pid : -1,
+           active_tracee && active_tracee->exec_target[0] ? active_tracee->exec_target : "unknown",
+           ARM_NR_SOCKET, domain, type, protocol);
+    if (!is_guest_ueventd(pid) || !guest_uevent_socket_args_valid(domain, type, protocol))
+        return -EAFNOSUPPORT;
+    if (virtual_uevent_fd >= 0) return -EMFILE;
+    int fd = alloc_virtual_fd(VIRTUAL_FD_UEVENT);
+    if (fd < 0) return fd;
+    virtual_uevent_fd = fd;
+    virtual_uevent_bound = 0;
+    virtual_uevent_socket_count++;
+    virtual_socket_calls++;
+    printf("VIRTUAL UEVENT SOCKET: fd=%d family=AF_NETLINK type=SOCK_DGRAM protocol=NETLINK_KOBJECT_UEVENT; app-private software descriptor; host socket API not called\n",
+           fd);
+    return fd;
+}
+
+static int virtual_uevent_bind(pid_t pid, const struct compat_pt_regs *regs) {
+    int32_t fd = (int32_t)regs->uregs[0];
+    uint32_t address = regs->uregs[1], address_length = regs->uregs[2];
+    struct guest_uevent_sockaddr_nl addr;
+    if (fd != virtual_uevent_fd || !is_virtual_fd(fd)) return -EBADF;
+    if (!is_guest_ueventd(pid) || address_length < sizeof(addr)) return -EINVAL;
+    if (read_remote(pid, address, &addr, sizeof(addr)) != 0) return -EFAULT;
+    if (!guest_uevent_bind_args_valid(&addr, address_length,
+                                      (uint32_t)active_tracee->guest_pid)) return -EINVAL;
+    virtual_uevent_bound = 1;
+    virtual_uevent_bind_count++;
+    virtual_socket_calls++;
+    printf("VIRTUAL UEVENT BIND: fd=%d nl_family=%u nl_pid=%u guest-pid=%d nl_groups=0x%08x; host bind API not called\n",
+           fd, (unsigned)addr.family, addr.pid, active_tracee->guest_pid, addr.groups);
+    return 0;
+}
+
+static int virtual_uevent_setsockopt(pid_t pid, const struct compat_pt_regs *regs) {
+    int32_t fd = (int32_t)regs->uregs[0];
+    uint32_t level = regs->uregs[1], option = regs->uregs[2];
+    uint32_t value_address = regs->uregs[3], value_length = regs->uregs[4];
+    int32_t value = 0;
+    if (fd != virtual_uevent_fd || !is_virtual_fd(fd)) return -EBADF;
+    if (!is_guest_ueventd(pid)) return -EPERM;
+    if (value_length < sizeof(value) || read_remote(pid, value_address, &value, sizeof(value)) != 0)
+        return -EFAULT;
+    if (!guest_uevent_setsockopt_args_valid(level, option, value, value_length))
+        return -ENOPROTOOPT;
+    virtual_uevent_setsockopt_count++;
+    virtual_socket_calls++;
+    printf("VIRTUAL UEVENT SETSOCKOPT: fd=%d level=%u option=%u value=%d length=%u accepted in software; host setsockopt API not called\n",
+           fd, level, option, value, value_length);
+    return 0;
+}
+
 static int virtual_poll(pid_t pid, const struct compat_pt_regs *regs) {
     struct guest_pollfd { int32_t fd; int16_t events; int16_t revents; };
     uint32_t count = regs->uregs[1];
@@ -726,17 +823,31 @@ static int virtual_poll(pid_t pid, const struct compat_pt_regs *regs) {
     struct guest_pollfd fds[128];
     if (count && (regs->uregs[0] == 0 ||
         read_remote(pid, regs->uregs[0], fds, count * sizeof(fds[0])) != 0)) return -EFAULT;
-    for (uint32_t i = 0; i < count; ++i) fds[i].revents = 0;
-    if (count && write_remote(pid, regs->uregs[0], fds, count * sizeof(fds[0])) != 0) return -EFAULT;
+    struct tracee_state *state = active_tracee && active_tracee->pid == pid ? active_tracee : NULL;
+    unsigned int call = state ? ++state->poll_diagnostic_count : 0;
     int32_t timeout_ms = (int32_t)regs->uregs[2];
     int32_t sleep_ms = timeout_ms < 0 || timeout_ms > 100 ? 100 : timeout_ms;
+    if (state && call <= 4) {
+        printf("GUEST POLL DIAGNOSTIC: host-pid=%d guest-pid=%d target=%s call=%u nfds=%u timeout-ms=%d",
+               pid, state->guest_pid,
+               state->exec_target[0] ? state->exec_target : "unknown",
+               call, count, timeout_ms);
+        for (uint32_t i = 0; i < count; ++i)
+            printf(" fd[%u]={fd=%d events=0x%04x revents-in=0x%04x revents-out=0 source=%s}",
+                   i, fds[i].fd, (unsigned)(uint16_t)fds[i].events,
+                   (unsigned)(uint16_t)fds[i].revents, virtual_fd_source(fds[i].fd));
+        printf(" result=0 scheduler-slice-ms=%d event-queue=empty/no synthetic device events; host poll API not called\n",
+               sleep_ms);
+    }
+    for (uint32_t i = 0; i < count; ++i) fds[i].revents = 0;
+    if (count && write_remote(pid, regs->uregs[0], fds, count * sizeof(fds[0])) != 0) return -EFAULT;
     if (sleep_ms > 0) {
         struct timespec delay = { .tv_sec = sleep_ms / 1000,
             .tv_nsec = (long)(sleep_ms % 1000) * 1000000L };
         nanosleep(&delay, NULL);
     }
     virtual_poll_waits++;
-    return 0; /* No virtual guest events are currently available. */
+    return 0; /* No guest device-event payloads are fabricated; the supervisor yields in bounded slices. */
 }
 
 static int prepare_init_dirs(void) {
@@ -1050,6 +1161,8 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
     }
     int rc = rewrite_path_arg(pid, regs, arg, guest, sizeof(guest));
     if (rc != 0) return rc;
+    if (active_tracee && active_tracee->pid == pid)
+        snprintf(active_tracee->last_guest_path, sizeof(active_tracee->last_guest_path), "%s", guest);
     if (guest_path_readonly(guest) && path_operation_writes(regs, nr)) return -EROFS;
 
     /* Ownership, mode and device-node effects exist only in the software model. */
@@ -1134,6 +1247,15 @@ static int dispatch_entry(pid_t pid, struct compat_pt_regs *regs, int nr,
     }
     if (nr == ARM_NR_UMOUNT2) {
         *pending_return = virtual_umount(pid, regs); *fake = 1; return 0;
+    }
+    if (nr == ARM_NR_SOCKET) {
+        *pending_return = virtual_uevent_socket(pid, regs); *fake = 1; return 0;
+    }
+    if (nr == ARM_NR_BIND) {
+        *pending_return = virtual_uevent_bind(pid, regs); *fake = 1; return 0;
+    }
+    if (nr == ARM_NR_SETSOCKOPT) {
+        *pending_return = virtual_uevent_setsockopt(pid, regs); *fake = 1; return 0;
     }
     if (nr == ARM_NR_SOCKETCALL) {
         *pending_return = virtual_socketcall(pid, regs); *fake = 1; return 0;
@@ -1378,6 +1500,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     printf("BROKERED SIGSYS CANDIDATE EXPIRED: pid=%d next-syscall-entry=%u wait-status=0x%x\n",
                            waited, regs.uregs[7], status);
                 state->last_syscall = (int32_t)regs.uregs[7];
+                memcpy(state->last_syscall_args, regs.uregs, sizeof(state->last_syscall_args));
+                state->last_guest_path[0] = '\0';
                 if (state->last_syscall == ARM_NR_CLONE) state->clone_flags = regs.uregs[0];
                 syscall_stops++;
                 int fake = 0;
@@ -1389,7 +1513,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     state->pending = 1;
                     broker_sigsys_arm(&state->broker_sigsys, state->last_syscall, result);
                     enum guest_syscall_class cls = guest_syscall_policy(state->last_syscall);
-                    if (cls == GUEST_SYSCALL_DENY || cls == GUEST_SYSCALL_BLOCK_PROCESS) denied_count++;
+                    if ((cls == GUEST_SYSCALL_DENY && result < 0) ||
+                        cls == GUEST_SYSCALL_BLOCK_PROCESS) denied_count++;
                     if (syscall_stops <= MAX_TRACE_LINES)
                         printf("TRACE pid=%d entry #%lu: ARM syscall=%d class=%d brokered result=%d\n",
                                waited, syscall_stops, state->last_syscall, (int)cls, result);
@@ -1406,6 +1531,25 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     return 0;
                 }
             } else {
+                int32_t syscall_result = state->pending ? state->pending_return :
+                    (int32_t)regs.uregs[0];
+                if (state->last_syscall == ARM_NR_OPEN &&
+                    strcmp(state->exec_target, "/sbin/ueventd") == 0 &&
+                    strcmp(state->last_guest_path, "/dev/.coldboot_done") == 0 &&
+                    syscall_result >= 0) {
+                    guest_coldboot_marker_opened = 1;
+                    printf("GUEST COLD-BOOT MARKER OPEN: host-pid=%d guest-pid=%d path=/dev/.coldboot_done fd=%d flags=0x%x create=%d backing=app-private virtual /dev\n",
+                           waited, state->guest_pid, syscall_result,
+                           state->last_syscall_args[1],
+                           (state->last_syscall_args[1] & O_CREAT) != 0);
+                }
+                if (!init_coldboot_wait_released && guest_coldboot_marker_opened &&
+                    state->guest_pid == 1 && state->last_syscall == ARM_NR_STAT64 &&
+                    strcmp(state->last_guest_path, "/dev/.coldboot_done") == 0 &&
+                    syscall_result == 0) {
+                    init_coldboot_wait_released = 1;
+                    puts("INIT COLD-BOOT WAIT RELEASED: PID 1 stat64(/dev/.coldboot_done)=0 after ueventd opened it in guest-only storage");
+                }
                 if (state->pending) regs.uregs[0] = (uint32_t)state->pending_return;
                 if (state->pending && set_regs(waited, &regs) != 0) { fprintf(stderr, "cannot set virtual return value pid=%d: errno=%d\n", waited, errno); kill_all_tracees(); return -1; }
                 if (state->pending) {
@@ -1558,8 +1702,14 @@ int main(int argc, char **argv) {
            syscall_stops, path_rewrites, virtual_mount_count, virtual_device_count,
            virtual_identity_count, virtual_socket_calls, virtual_poll_waits,
            brokered_sigsys_suppressed, blocked_process_count, denied_count);
-    if (strcmp(guest_program, "/init") == 0 && (trace_timed_out || trace_cancelled) && virtual_poll_waits > 0)
-        printf("INIT STATE: initial actions reached a software-emulated event wait; no virtual event source has delivered an event\n");
+    printf("VIRTUAL UEVENT SUMMARY: sockets=%lu binds=%lu setsockopt=%lu fd=%d bound=%d; /dev/.coldboot_done opened-by-ueventd=%d; /init wait released=%d; synthetic device events delivered=0\n",
+           virtual_uevent_socket_count, virtual_uevent_bind_count,
+           virtual_uevent_setsockopt_count, virtual_uevent_fd,
+           virtual_uevent_bound, guest_coldboot_marker_opened,
+           init_coldboot_wait_released);
+    if (strcmp(guest_program, "/init") == 0 && (trace_timed_out || trace_cancelled))
+        printf("INIT COLD-BOOT OBSERVATION: marker opened-by-ueventd=%d; PID 1 wait-for-file released=%d; no hardware device event payloads were fabricated\n",
+               guest_coldboot_marker_opened, init_coldboot_wait_released);
     if (dynamic_exec_blocked)
         printf("UNSUPPORTED DYNAMIC EXEC: guest exec %s requires PT_INTERP %s; denied before host linker substitution\n",
                dynamic_exec_guest_path, dynamic_exec_interpreter);
