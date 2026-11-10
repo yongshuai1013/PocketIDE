@@ -63,6 +63,11 @@ jobs:
     name: Build GingerVM v0.6.3 test-signed Android APK
     runs-on: ubuntu-latest
     steps:
+      - name: Mask test signing passphrase in job logs
+        env:
+          GINGERVM_SIGNING_PASSWORD: android
+        run: echo "::add-mask::$GINGERVM_SIGNING_PASSWORD"
+
       - name: Check out source
         uses: actions/checkout@v4
 
@@ -104,7 +109,6 @@ jobs:
           GINGERVM_SIGNING_PASSWORD: android
         run: |
           set -euo pipefail
-          echo "::add-mask::$GINGERVM_SIGNING_PASSWORD"
           bash native-ptrace-prototype/build-native.sh
           APK=native-ptrace-prototype/app/build/outputs/apk/debug/app-debug.apk
           "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK" > "$RUNNER_TEMP/apksigner-verify.log"

@@ -193,6 +193,11 @@ assert 'validation/gingervm-apk-v0.6.3' in workflow
 assert 'GINGERVM_SIGNING_KEY_ALIAS: gingervm-test' in workflow
 assert 'GINGERVM_SIGNING_PASSWORD: android' in workflow
 assert 'echo "::add-mask::$GINGERVM_SIGNING_PASSWORD"' in workflow
+android_job = workflow.split('  android-apk:', 1)[1]
+mask_step = android_job.index('name: Mask test signing passphrase in job logs')
+assert mask_step < android_job.index('name: Check out source')
+assert mask_step < android_job.index('name: Set up Android SDK')
+assert 'echo "::add-mask::$GINGERVM_SIGNING_PASSWORD"' not in android_job.split('name: Build and verify continuous-trace APK', 1)[1]
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
 assert 'gingervm-continuous-trace-v0.6.3-test-signed-apk' in upload
