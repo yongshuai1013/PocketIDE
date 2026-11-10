@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <stddef.h>
@@ -106,6 +107,11 @@ int main(void) {
                 fprintf(stderr, "unexpected SIGSYS wait/siginfo: status=0x%x si_code=%d\n", status, info.si_code);
                 (void)kill(child, SIGKILL); (void)waitpid(child, NULL, __WALL); return 1;
             }
+            if (info.si_syscall != -1 || info.si_arch != AUDIT_ARCH_X86_64 || !info.si_call_addr) {
+                fprintf(stderr, "unexpected seccomp SIGSYS metadata: syscall=%d arch=0x%x call_addr=%p\n",
+                        info.si_syscall, (unsigned)info.si_arch, info.si_call_addr);
+                (void)kill(child, SIGKILL); (void)waitpid(child, NULL, __WALL); return 1;
+            }
             if (!response_committed) {
                 broker_sigsys_mark_response_committed(&candidate);
                 response_committed = 1;
@@ -115,8 +121,9 @@ int main(void) {
                 (void)kill(child, SIGKILL); (void)waitpid(child, NULL, __WALL); return 1;
             }
             got_sigsys = 1;
-            printf("HOST PTRACE SIGSYS: wait-status=0x%x stop=%d si-code=%d committed-before-signal=%d\n",
-                   status, stop_signal, info.si_code, response_committed);
+            printf("HOST PTRACE SIGSYS: wait-status=0x%x stop=%d si-code=%d si-syscall=%d si-arch=0x%x si-call-addr=%p committed-before-signal=%d\n",
+                   status, stop_signal, info.si_code, info.si_syscall,
+                   (unsigned)info.si_arch, info.si_call_addr, response_committed);
             break;
         }
         fprintf(stderr, "unexpected ptrace stop: status=0x%x stop=%d\n", status, stop_signal);

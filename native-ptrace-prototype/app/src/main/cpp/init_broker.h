@@ -19,6 +19,7 @@ enum guest_syscall_class {
     GUEST_SYSCALL_VIRTUAL_DEVICE = 5,
     GUEST_SYSCALL_BLOCK_PROCESS = 6,
     GUEST_SYSCALL_TRACE_PROCESS = 7,
+    GUEST_SYSCALL_FILE_OPERATION = 8,
 };
 
 /* Narrow ARM EABI syscall policy for the original static Gingerbread init.
@@ -27,7 +28,7 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
     switch (nr) {
         /* Guest-local ordinary file operations on already-brokered descriptors. */
         case 1: case 3: case 4: case 6: case 19: case 41: case 42: case 63:
-        case 45: case 55: case 91: case 93: case 108: case 114: case 118:
+        case 45: case 55: case 91: case 108: case 114: case 118:
         case 119: case 125: case 126: case 140: case 141: case 145: case 146:
         case 148: case 162: case 163:
         case 173: case 174: case 175: case 176: case 177: case 179:
@@ -55,6 +56,10 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
         case 207: case 208: case 209: case 210: case 211: case 213: case 214:
         case 215: case 216: case 224:
             return GUEST_SYSCALL_VIRTUALIZE;
+
+        /* ftruncate is brokered against validated app-private guest file descriptors. */
+        case 93:
+            return GUEST_SYSCALL_FILE_OPERATION;
 
         /* Guest mount table only: no host mount(2), umount(2), or pivot_root(2). */
         case 21: case 52:

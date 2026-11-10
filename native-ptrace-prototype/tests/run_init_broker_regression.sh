@@ -14,10 +14,18 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_uevent_virtual_test.c" -o "$TMP/guest_uevent_virtual_test"
 "$TMP/guest_uevent_virtual_test"
+mkdir -p "$TMP/java"
+javac -d "$TMP/java" \
+  "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/TraceOutputCapture.java" \
+  "$ROOT/tests/TraceOutputCaptureTest.java"
+java -cp "$TMP/java" dev.gingervm.nativeprobe.TraceOutputCaptureTest
 if [[ "$(uname -m)" == "x86_64" ]]; then
   cc -std=c11 -O2 -Wall -Wextra -Werror \
     "$ROOT/tests/ptrace_seccomp_sigsys_regression.c" -o "$TMP/ptrace_seccomp_sigsys_regression"
   "$TMP/ptrace_seccomp_sigsys_regression"
+  cc -std=c11 -O2 -Wall -Wextra -Werror \
+    "$ROOT/tests/guest_file_ops_test.c" -o "$TMP/guest_file_ops_test"
+  "$TMP/guest_file_ops_test"
   cc -std=c11 -O2 -Wall -Wextra -Werror \
     "$ROOT/tests/ptrace_cancel_cleanup_regression.c" -o "$TMP/ptrace_cancel_cleanup_regression"
   "$TMP/ptrace_cancel_cleanup_regression"
@@ -42,6 +50,7 @@ src = Path(sys.argv[1]).read_text()
 trace = src.split("static int run_trace(", 1)[1].split("int main(", 1)[0]
 uevent = Path(sys.argv[1]).with_name('guest_uevent_virtual.h').read_text()
 activity = Path(sys.argv[2]).read_text()
+capture = Path(sys.argv[2]).with_name('TraceOutputCapture.java').read_text()
 provider = Path(sys.argv[2]).with_name('TraceLogProvider.java').read_text()
 gradle = Path(sys.argv[3]).read_text()
 manifest = Path(sys.argv[4]).read_text()
@@ -60,6 +69,8 @@ assert '#define ARM_NR_SETSOCKOPT 294' in src
 assert 'guest_uevent_socket_args_valid(domain, type, protocol)' in src
 assert 'guest_uevent_bind_args_valid(&addr, address_length' in src
 assert 'guest_uevent_setsockopt_args_valid(level, option, value, value_length)' in src
+assert '#define ARM_NR_FTRUNCATE 93' in src and 'guest_ftruncate_app_private' in src
+assert 'GUEST FILE FTRUNCATE:' in src and 'VIRTUAL FILE OPS:' in src
 assert 'strcmp(active_tracee->exec_target, "/sbin/ueventd") == 0' in src
 assert 'VIRTUAL UEVENT SOCKET:' in src and 'GUEST SOCKET ARGS:' in src
 assert 'VIRTUAL UEVENT BIND:' in src and 'VIRTUAL UEVENT SETSOCKOPT:' in src
@@ -95,11 +106,16 @@ assert 'static volatile sig_atomic_t user_cancel_requested' in src
 assert 'sigaction(SIGTERM' in src and 'sigaction(SIGINT' in src
 assert 'ptrace_terminate_and_reap(pids, count)' in src
 assert 'TRACE CLEANUP: tracked=%zu reaped=%zu already-gone=%zu unresolved=%zu' in src
-assert 'STOP: user requested cancellation; supervisor terminated and reaped the traced process tree' in src
+assert 'STOP: user cancellation cleanup confirmed; supervisor terminated and reaped the tracked process tree' in src
+assert 'STOP: user cancellation cleanup incomplete; unresolved tracees=%zu' in src
 assert 'bounded continuous process-tree trace ended by supervisor timeout' in src
 cleanup = Path(sys.argv[1]).with_name('ptrace_tracee_cleanup.h').read_text()
 assert 'ptrace_terminate_and_reap' in cleanup and 'waitpid(pid, &status, __WALL)' in cleanup
 broker = Path(sys.argv[1]).with_name('init_broker.h').read_text()
+file_operation_policy = broker.split('/* ftruncate is brokered', 1)[1].split('/* Guest mount table', 1)[0]
+safe_file_policy = broker.split('/* Guest-local ordinary file operations', 1)[1].split('/* Absolute guest paths', 1)[0]
+assert 'case 93:' in file_operation_policy and 'GUEST_SYSCALL_FILE_OPERATION' in file_operation_policy
+assert 'case 93' not in safe_file_policy
 assert '#define ARM_NR_GETTID 224' in src and 'case 215: case 216: case 224:' in broker
 fake = src.split('static int fake_syscall(', 1)[1].split('static int resume_trace(', 1)[0]
 assert 'regs->uregs[7] = UINT32_MAX' in fake and 'set_kernel_syscall(pid, -1)' in fake
@@ -107,6 +123,8 @@ sigsys = trace.split('if (sig == SIGSYS', 1)[1].split('if (sig == SIGSTOP)', 1)[
 assert 'broker_sigsys_take(&state->broker_sigsys, sig, siginfo_code)' in sigsys
 assert 'siginfo.si_code' in src and 'PTRACE_GETSIGINFO' in sigsys
 assert 'PTRACE SIGSYS WAIT STATUS' in sigsys and 'raw=0x%x' in sigsys
+assert 'si-syscall=%d si-arch=0x%x si-call-addr=%p' in sigsys
+assert 'last-args=%u,%u,%u,%u,%u,%u' in sigsys and 'live-r7=%u live-r0=%u' in sigsys
 assert 'brokered_sigsys_suppressed++' in sigsys and 'resume_trace(waited, 0)' in sigsys
 assert 'BROKERED SYSCALL SIGSYS SUPPRESSED' in sigsys
 assert 'broker_sigsys_arm(&state->broker_sigsys' in trace
@@ -162,22 +180,26 @@ assert 'changing only PT_INTERP' in continuous_run and '/proc/self/fd/198' in co
 assert 'target main entry remains unproven' in src
 assert 'dynamic-linker entry event is not proof' in activity
 assert 'dynamic_executable_count' in activity and 'dynamic_sha256' in activity
-assert 'captured.size() > 192 * 1024' not in activity and 'reader.join();' in activity
+assert 'captured.size() > 192 * 1024' not in activity and 'reader.join(100L)' in activity
 assert 'writeLatestLog(completeLog)' in activity and 'out.getFD().sync()' in activity
 assert '分享／儲存完整追蹤日誌' in activity and '匯出完整追蹤日誌' in activity
 assert 'Intent.ACTION_SEND' in activity and 'Intent.EXTRA_STREAM' in activity
 assert 'Intent.FLAG_GRANT_READ_URI_PERMISSION' in activity and 'ClipData.newUri' in activity
 assert 'Intent.ACTION_CREATE_DOCUMENT' in activity and 'getContentResolver().openOutputStream' in activity
-assert 'OUTPUT CAPTURE ERROR:' in activity
+assert 'captureSession.readToEof' in activity and 'captureSession.snapshot()' in activity
+assert 'OUTPUT CAPTURE RECOVERED:' in activity and 'OUTPUT CAPTURE ERROR:' in activity
+assert 'MAX_CONSECUTIVE_INTERRUPTED_READS = 32' in capture
+assert 'e.bytesTransferred' in capture and 'too many consecutive interrupted pipe reads' in capture
 assert 'setText("查看日誌")' in activity and 'setText("停止")' in activity
 assert 'private void showLogViewer()' in activity and 'readLatestLogTail()' in activity
 assert 'MAX_LOG_VIEW_BYTES = 256 * 1024' in activity and 'MAX_REPORT_CHARS = 48 * 1024' in activity
 assert 'supervisor.destroy()' in activity and 'USER STOP REQUESTED' in activity
+assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activity
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
-assert 'appendReportText(chunk)' in activity and 'InputStreamReader' in activity
-assert 'HISTORICAL DEVICE BASELINE (user-provided v0.6.1 Android 12 log; not this run)' in activity
-assert 'Previous STOP was supervisor timeout, not user cancellation' in activity
+assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
+assert 'HISTORICAL DEVICE BASELINE (user-provided v0.6.3 Android 12 log; not this run)' in activity
+assert 'ftruncate' in activity and 'passed the coldboot wait' in activity
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
 assert 'android:grantUriPermissions="true"' in manifest and '${applicationId}.trace-logs' in manifest
@@ -189,7 +211,8 @@ assert "System.getenv('GINGERVM_SIGNING_KEYSTORE')" in gradle
 assert "System.getenv('GINGERVM_SIGNING_PASSWORD')" in gradle
 assert "System.getenv('GINGERVM_SIGNING_KEY_ALIAS')" in gradle
 assert 'signingConfig signingConfigs.debug' in gradle
-assert 'validation/gingervm-apk-v0.6.3' in workflow
+push_branches = workflow.split('branches:', 1)[1].split('paths:', 1)[0]
+assert '- main' in push_branches and 'validation/gingervm-apk' not in push_branches
 assert 'GINGERVM_SIGNING_KEY_ALIAS: gingervm-test' in workflow
 assert not re.search(r'GINGERVM_SIGNING_PASSWORD:\s*[^\n]+', workflow)
 assert "base64 --decode" in workflow
@@ -205,11 +228,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.3-test-signed-apk' in upload
-assert 'gingervm-v0.6.3-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 12" in gradle and "versionName '0.6.3'" in gradle
+assert 'gingervm-continuous-trace-v0.6.4-test-signed-apk' in upload
+assert 'gingervm-v0.6.4-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 13" in gradle and "versionName '0.6.4'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM Continuous Trace v0.6.3' in manifest
+assert 'GingerVM Continuous Trace v0.6.4' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

@@ -21,6 +21,7 @@
 #include "broker_sigsys_state.h"
 #include "ptrace_tracee_cleanup.h"
 #include "guest_uevent_virtual.h"
+#include "guest_file_ops.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -123,6 +124,7 @@
 #define ARM_NR_SIGALTSTACK 186
 #define ARM_NR_VFORK 190
 #define ARM_NR_MMAP2 192
+#define ARM_NR_FTRUNCATE 93
 #define ARM_NR_FTRUNCATE64 194
 #define ARM_NR_STAT64 195
 #define ARM_NR_LSTAT64 196
@@ -223,6 +225,7 @@ static unsigned long guest_target_path_opens;
 static unsigned long virtual_mount_count;
 static unsigned long virtual_device_count;
 static unsigned long virtual_identity_count;
+static unsigned long virtual_file_ops;
 static unsigned long virtual_socket_calls;
 static unsigned long virtual_poll_waits;
 static unsigned long blocked_process_count;
@@ -248,6 +251,8 @@ static int saw_exec;
 static int trace_timed_out;
 static volatile sig_atomic_t user_cancel_requested;
 static int trace_cancelled;
+static int trace_cleanup_confirmed;
+static size_t trace_cleanup_unresolved;
 static int guest_root_readonly;
 static int guest_system_readonly;
 static struct tracee_state tracees[MAX_TRACEES];
@@ -1070,6 +1075,8 @@ static int kill_all_tracees(void) {
     struct ptrace_cleanup_result cleanup = ptrace_terminate_and_reap(pids, count);
     printf("TRACE CLEANUP: tracked=%zu reaped=%zu already-gone=%zu unresolved=%zu\n",
            cleanup.requested, cleanup.reaped, cleanup.already_gone, cleanup.unresolved);
+    trace_cleanup_confirmed = cleanup.unresolved == 0;
+    trace_cleanup_unresolved = cleanup.unresolved;
     tracee_count = 0;
     active_tracee_count = 0;
     active_tracee = NULL;
@@ -1256,6 +1263,19 @@ static int dispatch_entry(pid_t pid, struct compat_pt_regs *regs, int nr,
     }
     if (nr == ARM_NR_SETSOCKOPT) {
         *pending_return = virtual_uevent_setsockopt(pid, regs); *fake = 1; return 0;
+    }
+    if (nr == ARM_NR_FTRUNCATE) {
+        char guest_relative[PATH_MAX] = "";
+        int guest_fd = (int32_t)regs->uregs[0];
+        int32_t length = (int32_t)regs->uregs[1];
+        *pending_return = guest_ftruncate_app_private(pid, guest_fd, length, guest_root,
+                                                       guest_relative, sizeof(guest_relative));
+        *fake = 1;
+        virtual_file_ops++;
+        printf("GUEST FILE FTRUNCATE: host-pid=%d guest-pid=%d fd=%d length=%d result=%d backing=%s\n",
+               pid, active_tracee ? active_tracee->guest_pid : 1, guest_fd, length,
+               *pending_return, guest_relative[0] ? guest_relative : "<not-guest-root-regular-file>");
+        return 0;
     }
     if (nr == ARM_NR_SOCKETCALL) {
         *pending_return = virtual_socketcall(pid, regs); *fake = 1; return 0;
@@ -1578,11 +1598,25 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             int siginfo_rc = ptrace(PTRACE_GETSIGINFO, waited, NULL, &siginfo);
             int siginfo_errno = siginfo_rc == 0 ? 0 : errno;
             int siginfo_code = siginfo_rc == 0 ? siginfo.si_code : 0;
-            printf("PTRACE SIGSYS WAIT STATUS: pid=%d raw=0x%x stop=%d event=%u expect-exit=%d pending=%d candidate=%d response-committed=%d candidate-syscall=%d candidate-result=%d siginfo-rc=%d siginfo-errno=%d si-code=%d\n",
+            int seccomp_details = siginfo_rc == 0 && siginfo_code == SYS_SECCOMP;
+            int sigsys_syscall = seccomp_details ? siginfo.si_syscall : -1;
+            unsigned int sigsys_arch = seccomp_details ? (unsigned int)siginfo.si_arch : 0;
+            void *sigsys_call_addr = seccomp_details ? siginfo.si_call_addr : NULL;
+            struct compat_pt_regs signal_regs;
+            int signal_regs_rc = get_regs(waited, &signal_regs);
+            uint32_t live_r7 = signal_regs_rc == 0 ? signal_regs.uregs[7] : UINT32_MAX;
+            uint32_t live_r0 = signal_regs_rc == 0 ? signal_regs.uregs[0] : UINT32_MAX;
+            uint32_t live_pc = signal_regs_rc == 0 ? signal_regs.uregs[15] : UINT32_MAX;
+            printf("PTRACE SIGSYS WAIT STATUS: pid=%d raw=0x%x stop=%d event=%u expect-exit=%d pending=%d candidate=%d response-committed=%d candidate-syscall=%d candidate-result=%d siginfo-rc=%d siginfo-errno=%d si-code=%d si-syscall=%d si-arch=0x%x si-call-addr=%p last-syscall=%d last-args=%u,%u,%u,%u,%u,%u live-r7=%u live-r0=%u live-pc=0x%08x regs-rc=%d\n",
                    waited, status, sig, event, state->expect_exit, state->pending,
                    state->broker_sigsys.armed, state->broker_sigsys.response_committed,
                    state->broker_sigsys.syscall_number, state->broker_sigsys.virtual_result,
-                   siginfo_rc, siginfo_errno, siginfo_code);
+                   siginfo_rc, siginfo_errno, siginfo_code, sigsys_syscall, sigsys_arch,
+                   sigsys_call_addr, state->last_syscall,
+                   state->last_syscall_args[0], state->last_syscall_args[1],
+                   state->last_syscall_args[2], state->last_syscall_args[3],
+                   state->last_syscall_args[4], state->last_syscall_args[5],
+                   live_r7, live_r0, live_pc, signal_regs_rc);
             if (siginfo_rc == 0 && broker_sigsys_take(&state->broker_sigsys, sig, siginfo_code)) {
                 brokered_sigsys_suppressed++;
                 printf("BROKERED SYSCALL SIGSYS SUPPRESSED: pid=%d signal=%d ARM syscall=%d virtual result=%d response-committed=%d wait-status=0x%x si-code=%d\n",
@@ -1698,9 +1732,9 @@ int main(int argc, char **argv) {
     printf("CONTINUOUS PROCESS TREE: fork/clone/vfork events=%lu; guest exec events=%lu; dynamic execs redirected=%lu; kernel entries into original guest linker=%lu; dynamic target main remains unproven; maximum tracees=%d\n",
            process_events, successful_guest_execs, dynamic_exec_allowed_count,
            dynamic_exec_started_count, MAX_TRACEES);
-    printf("SYSCALL ENTRIES: %lu; PATH REWRITES: %lu; VIRTUAL MOUNTS: %lu; VIRTUAL DEVICE/MODE OPS: %lu; VIRTUAL ID OPS: %lu; VIRTUAL SOCKET CALLS: %lu; VIRTUAL POLL WAITS: %lu; BROKERED SIGSYS SUPPRESSED: %lu; BLOCKED PROCESS STARTS: %lu; DENIED: %lu\n",
+    printf("SYSCALL ENTRIES: %lu; PATH REWRITES: %lu; VIRTUAL MOUNTS: %lu; VIRTUAL DEVICE/MODE OPS: %lu; VIRTUAL ID OPS: %lu; VIRTUAL FILE OPS: %lu; VIRTUAL SOCKET CALLS: %lu; VIRTUAL POLL WAITS: %lu; BROKERED SIGSYS SUPPRESSED: %lu; BLOCKED PROCESS STARTS: %lu; DENIED: %lu\n",
            syscall_stops, path_rewrites, virtual_mount_count, virtual_device_count,
-           virtual_identity_count, virtual_socket_calls, virtual_poll_waits,
+           virtual_identity_count, virtual_file_ops, virtual_socket_calls, virtual_poll_waits,
            brokered_sigsys_suppressed, blocked_process_count, denied_count);
     printf("VIRTUAL UEVENT SUMMARY: sockets=%lu binds=%lu setsockopt=%lu fd=%d bound=%d; /dev/.coldboot_done opened-by-ueventd=%d; /init wait released=%d; synthetic device events delivered=0\n",
            virtual_uevent_socket_count, virtual_uevent_bind_count,
@@ -1713,9 +1747,27 @@ int main(int argc, char **argv) {
     if (dynamic_exec_blocked)
         printf("UNSUPPORTED DYNAMIC EXEC: guest exec %s requires PT_INTERP %s; denied before host linker substitution\n",
                dynamic_exec_guest_path, dynamic_exec_interpreter);
-    if (trace_cancelled) printf("STOP: user requested cancellation; supervisor terminated and reaped the traced process tree\n");
-    else if (trace_timed_out) printf("STOP: bounded continuous process-tree trace ended by supervisor timeout; all tracees stopped by supervisor\n");
-    else if (process_limit_hit) printf("STOP: process tree reached the safe cap; all tracees stopped by supervisor\n");
+    if (trace_cancelled || trace_timed_out || process_limit_hit)
+        printf("TRACE CLEANUP STATUS: confirmed=%d unresolved=%zu\n",
+               trace_cleanup_confirmed, trace_cleanup_unresolved);
+    if (trace_cancelled) {
+        if (trace_cleanup_confirmed)
+            puts("STOP: user cancellation cleanup confirmed; supervisor terminated and reaped the tracked process tree");
+        else
+            printf("STOP: user cancellation cleanup incomplete; unresolved tracees=%zu\n", trace_cleanup_unresolved);
+    }
+    else if (trace_timed_out) {
+        if (trace_cleanup_confirmed)
+            puts("STOP: bounded continuous process-tree trace ended by supervisor timeout; all tracees stopped and reaped");
+        else
+            printf("STOP: supervisor timeout cleanup incomplete; unresolved tracees=%zu\n", trace_cleanup_unresolved);
+    }
+    else if (process_limit_hit) {
+        if (trace_cleanup_confirmed)
+            puts("STOP: process tree reached the safe cap; all tracees stopped and reaped");
+        else
+            printf("STOP: process cap cleanup incomplete; unresolved tracees=%zu\n", trace_cleanup_unresolved);
+    }
     else if (exit_signal) printf("STOP: root /init terminated by signal %d\n", exit_signal);
     else if (exit_code >= 0) printf("STOP: root /init exited with code %d\n", exit_code);
     else if (dynamic_exec_blocked) printf("STOP: unsupported dynamic guest exec; process tree stopped fail-closed\n");

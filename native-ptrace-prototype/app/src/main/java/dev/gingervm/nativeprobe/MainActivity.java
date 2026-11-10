@@ -33,7 +33,6 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -57,6 +56,7 @@ public final class MainActivity extends Activity {
     private static final long STORAGE_MARGIN_BYTES = 12L * 1024L * 1024L;
     private static final int MAX_REPORT_CHARS = 48 * 1024;
     private static final int MAX_LOG_VIEW_BYTES = 256 * 1024;
+    private static final int STOP_CLEANUP_GRACE_SECONDS = 15;
 
     private final Set<String> knownSystemAssetDirectories = new HashSet<>();
     private TextView report;
@@ -66,6 +66,7 @@ public final class MainActivity extends Activity {
     private Button stopButton;
     private File latestLogFile;
     private volatile boolean stopRequested;
+    private volatile boolean explicitStopRequested;
     private volatile boolean runActive;
     private volatile boolean runCancellable;
     private volatile Thread activeRunThread;
@@ -85,9 +86,9 @@ public final class MainActivity extends Activity {
                 + "Host ABI: " + Arrays.toString(Build.SUPPORTED_ABIS) + "\n"
                 + "64-bit app process: " + Process.is64Bit() + "\n"
                 + "Android API: " + Build.VERSION.SDK_INT + "\n"
-                + "Latest confirmed Android 12 device stage from the supplied v0.6.1 log: 1323 syscall entries; path rewrites=58; virtual mounts=4; device/mode ops=5; ID ops=6; poll waits=1122; brokered SIGSYS suppressed=1138; denied=4; one process event and one /sbin/ueventd exec; no dynamic exec or linker entry. /init reached a software-emulated event wait with no event source. Its STOP was the supervisor time limit, not a user cancellation.\n\n"
+                + "Latest confirmed Android 12 device evidence (supplied v0.6.3 trace): the guest-only uevent socket and /dev/.coldboot_done marker worked, and PID 1 passed the coldboot wait. PID 1 then entered ARM syscall 93 immediately before a SYS_SECCOMP SIGSYS; the official API10 property_service uses ftruncate(fd, size) at this point on /dev/__properties__. v0.6.3 did not log kernel si_syscall/si_arch, so v0.6.4 adds those fields and confines the ftruncate model to app-private guest files. No linker, Zygote, framework, or desktop boot was reached. The previous Stop run exited 130, but its Java pipe reader lost the final trace lines; this build retries interrupted reads and only claims native cleanup when unresolved tracees are zero.\n\n"
                 + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer shows a bounded tail; share/save exports the full latest file.\n"
-                + "No trace from this v0.6.2 installation has been recorded yet; the v0.6.1 device trace above is historical context.");
+                + "No trace from this v0.6.4 installation has been recorded yet; the supplied v0.6.3 trace above is historical context.");
     }
 
     private void buildUi() {
@@ -151,6 +152,7 @@ public final class MainActivity extends Activity {
     private void startRun() {
         if (runActive) return;
         stopRequested = false;
+        explicitStopRequested = false;
         runActive = true;
         runCancellable = true;
         activeSupervisorProcess = null;
@@ -160,7 +162,7 @@ public final class MainActivity extends Activity {
         viewLogButton.setEnabled(true);
         stopButton.setEnabled(true);
         setReportText("Preparing the complete Google API10 guest image; about 106 MiB of userland and linker aliases are staged across app-private storage and extracted ARM32 libraries…\n"
-                + "Previous confirmed device stop was supervisor timeout; this run's Stop button requests a separate user cancellation.\n");
+                + "Historical v0.6.3 device trace: coldboot wait passed; ARM syscall 93 preceded SYS_SECCOMP SIGSYS in property-service setup; no linker/Zygote. This run's Stop button requests a separate user cancellation.\n");
         postProgress("RUN STARTED: one continuous original /init process-tree session; this app-private latest-log file will be replaced when the run ends.\n");
         Thread worker = new Thread(new Runnable() {
             @Override public void run() {
@@ -209,6 +211,7 @@ public final class MainActivity extends Activity {
     private void requestStop() {
         if (!runActive || !runCancellable) return;
         stopRequested = true;
+        explicitStopRequested = true;
         stopButton.setEnabled(false);
         postProgress("\nUSER STOP REQUESTED: stopping the current staging/trace run; this is distinct from the supervisor time limit.\n");
         java.lang.Process supervisor = activeSupervisorProcess;
@@ -389,7 +392,7 @@ public final class MainActivity extends Activity {
         throwIfStopRequested();
         StringBuilder out = new StringBuilder();
         out.append("GingerVM continuous Android 2.3.7/API 10 init process-tree trace\n");
-        out.append("HISTORICAL DEVICE BASELINE (user-provided v0.6.1 Android 12 log; not this run): syscalls=1323, path-rewrites=58, virtual-mounts=4, device/mode-ops=5, ID-ops=6, poll-waits=1122, brokered-SIGSYS-suppressed=1138, denied=4; fork/clone/vfork events=1; /sbin/ueventd exec events=1; dynamic execs=0; linker entries=0. /init reached the software-emulated event wait with no virtual event source. Previous STOP was supervisor timeout, not user cancellation.\n\n");
+        out.append("HISTORICAL DEVICE BASELINE (user-provided v0.6.3 Android 12 log; not this run): guest-only uevent socket/bind succeeded; ueventd created /dev/.coldboot_done; PID 1 passed the coldboot wait. PID 1 logged ARM syscall 93 immediately before a SYS_SECCOMP SIGSYS (candidate=0), which was forwarded; official API10 property_service uses ftruncate on /dev/__properties__ here. Kernel si_syscall/si_arch were not recorded in that run, so the exact trapped syscall remains to be confirmed by this build. No linker/Zygote/framework was reached. After the user tapped Stop, Java reported InterruptedIOException and omitted the final native cleanup lines; exit 130 alone is not treated as delivered cleanup evidence.\n\n");
         out.append("Host ABI: ").append(Arrays.toString(Build.SUPPORTED_ABIS)).append('\n');
         out.append("64-bit app process: ").append(Process.is64Bit()).append('\n');
         out.append("Android API: ").append(Build.VERSION.SDK_INT).append('\n');
@@ -529,58 +532,114 @@ public final class MainActivity extends Activity {
         final java.lang.Process child = process;
         activeSupervisorProcess = process;
         if (stopRequested) process.destroy();
-        final ByteArrayOutputStream captured = new ByteArrayOutputStream();
-        final AtomicReference<String> readerFailure = new AtomicReference<>();
+        final InputStream outputStream = child.getInputStream();
+        final TraceOutputCapture.CaptureSession captureSession = new TraceOutputCapture.CaptureSession();
+        final AtomicReference<TraceOutputCapture.Result> captureResult = new AtomicReference<>();
         Thread reader = new Thread(new Runnable() {
             @Override public void run() {
-                try (InputStreamReader in = new InputStreamReader(child.getInputStream(), StandardCharsets.UTF_8)) {
-                    char[] buffer = new char[4096];
-                    int n;
-                    while ((n = in.read(buffer)) >= 0) {
-                        String chunk = new String(buffer, 0, n);
-                        byte[] encoded = chunk.getBytes(StandardCharsets.UTF_8);
-                        captured.write(encoded, 0, encoded.length);
-                        appendReportText(chunk);
-                    }
-                } catch (Exception e) { readerFailure.set(e.toString()); }
+                TraceOutputCapture.Result result;
+                try {
+                    result = captureSession.readToEof(outputStream, new TraceOutputCapture.ChunkListener() {
+                        @Override public void onText(String chunk) { appendReportText(chunk); }
+                    });
+                } catch (RuntimeException e) {
+                    result = captureSession.failAndSeal("output reader failed: " + e);
+                }
+                try {
+                    outputStream.close();
+                } catch (IOException e) {
+                    result = result.withFailure("output stream close failed: " + e);
+                }
+                captureResult.set(result);
             }
         }, "guest-output-reader");
+        reader.setDaemon(true);
         reader.start();
         int exit = -1;
         boolean timedOut = false;
         boolean interrupted = false;
-        try {
-            if (!process.waitFor(timeoutSeconds, TimeUnit.SECONDS)) {
+        boolean forcedAfterGrace = false;
+        long processDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        while (process.isAlive()) {
+            if (!stopRequested && !timedOut && System.nanoTime() >= processDeadline) {
                 timedOut = true;
-                process.destroyForcibly();
-                process.waitFor();
+                process.destroy();
             }
-            if (!timedOut) exit = process.exitValue();
-            reader.join();
-        } catch (InterruptedException e) {
-            interrupted = true;
-            stopRequested = true;
-            process.destroy();
+            if (stopRequested || timedOut) {
+                process.destroy();
+                long graceDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(STOP_CLEANUP_GRACE_SECONDS);
+                while (process.isAlive() && System.nanoTime() < graceDeadline) {
+                    long remaining = graceDeadline - System.nanoTime();
+                    long waitNanos = Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(100));
+                    try {
+                        process.waitFor(Math.max(1L, waitNanos), TimeUnit.NANOSECONDS);
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                        stopRequested = true;
+                        process.destroy();
+                    }
+                }
+                if (process.isAlive()) {
+                    forcedAfterGrace = true;
+                    process.destroyForcibly();
+                    interrupted |= waitForProcessUninterruptibly(process);
+                }
+                break;
+            }
+            long remaining = processDeadline - System.nanoTime();
+            long waitNanos = Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(200));
             try {
-                if (!process.waitFor(5, TimeUnit.SECONDS)) process.destroyForcibly();
-                process.waitFor();
-                exit = process.exitValue();
-                reader.join();
-            } catch (InterruptedException cleanupInterrupted) {
-                process.destroyForcibly();
+                process.waitFor(Math.max(1L, waitNanos), TimeUnit.NANOSECONDS);
+            } catch (InterruptedException e) {
+                interrupted = true;
+                stopRequested = true;
+                process.destroy();
             }
         }
+        if (!process.isAlive()) exit = process.exitValue();
+
+        long drainDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(STOP_CLEANUP_GRACE_SECONDS);
+        while (reader.isAlive() && System.nanoTime() < drainDeadline) {
+            try { reader.join(100L); }
+            catch (InterruptedException e) { interrupted = true; }
+        }
+        boolean outputDrainTimedOut = reader.isAlive();
+        if (outputDrainTimedOut) {
+            captureSession.failAndSeal("output pipe did not reach EOF within the post-stop drain grace");
+            try { outputStream.close(); } catch (IOException ignored) {}
+            long closeDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+            while (reader.isAlive() && System.nanoTime() < closeDeadline) {
+                try { reader.join(100L); }
+                catch (InterruptedException e) { interrupted = true; }
+            }
+            if (reader.isAlive()) captureSession.failAndSeal("output reader remained blocked after stream close");
+        }
         activeSupervisorProcess = null;
-        String trace = new String(captured.toByteArray(), StandardCharsets.UTF_8);
-        if (readerFailure.get() != null)
-            trace += "\nOUTPUT CAPTURE ERROR: " + readerFailure.get() + "; exported log may be incomplete.\n";
+        TraceOutputCapture.Result captured = captureResult.get();
+        if (captured == null) captured = captureSession.snapshot();
+        String trace = captured.text();
+        if (captured.recoveredInterruptedReads > 0)
+            trace += "\nOUTPUT CAPTURE RECOVERED: InterruptedIOException reads="
+                    + captured.recoveredInterruptedReads + "; resumed draining the supervisor pipe.\n";
+        if (captured.failure != null)
+            trace += "\nOUTPUT CAPTURE ERROR: " + captured.failure + "; exported log may be incomplete.\n";
+        else if (outputDrainTimedOut)
+            trace += "\nOUTPUT CAPTURE ERROR: the reader did not finish draining and closing the supervisor pipe; exported log may be incomplete.\n";
+        if (forcedAfterGrace)
+            trace += "\nAPP STOP FALLBACK: supervisor did not exit during the graceful cleanup window and was force-terminated; native tracee cleanup is unconfirmed.\n";
         boolean guestLinkerEntered = trace.contains("GUEST DYNAMIC EXEC EVENT:");
         header.append(trace);
         if (interrupted) header.append("\nRUN INTERRUPTED: the app thread was interrupted; a graceful stop was requested before fallback cleanup.\n");
         if (stopRequested) {
-            header.append("\nUSER CANCEL REQUESTED: this was an explicit app Stop action, not a supervisor timeout.\n");
-            if (trace.contains("STOP: user requested cancellation; supervisor terminated and reaped the traced process tree"))
-                header.append("USER CANCEL RESULT: supervisor reported traced-tree termination and reap complete.\n");
+            header.append(explicitStopRequested
+                    ? "\nUSER CANCEL REQUESTED: explicit app Stop action; not a supervisor timeout.\n"
+                    : "\nRUN CANCEL REQUESTED: app worker interruption requested graceful supervisor shutdown.\n");
+            boolean cleanupConfirmed = trace.contains("STOP: user cancellation cleanup confirmed;")
+                    && trace.matches("(?s).*TRACE CLEANUP: tracked=[0-9]+ reaped=[0-9]+ already-gone=[0-9]+ unresolved=0.*");
+            if (cleanupConfirmed && !forcedAfterGrace)
+                header.append("USER CANCEL RESULT: supervisor confirmed all tracked tracees reaped (unresolved=0).\n");
+            else if (forcedAfterGrace)
+                header.append("USER CANCEL RESULT: Java force-stop fallback ran; tracee cleanup cannot be confirmed from this capture.\n");
             else if (trace.contains("STOP: user-requested cancellation before guest exec; no supervisor timeout occurred")
                     || trace.contains("USER CANCELLED BEFORE SUPERVISOR START"))
                 header.append("USER CANCEL RESULT: cancellation happened before guest execution; no tracees existed to reap.\n");
@@ -591,6 +650,7 @@ public final class MainActivity extends Activity {
         }
         if (timedOut) {
             header.append("\nAPP TIMEOUT: the Java wall-time guard expired after ").append(timeoutSeconds).append(" seconds; this is not the normal supervisor event-wait timeout.\n");
+            header.append("Supervisor exit code after graceful wait: ").append(exit).append('\n');
             if (guestLinkerEntered) header.append("RESULT: the continuous tree entered the original API10 linker, but the dynamic target main/zygote/framework entry remains unproven.\n");
         } else {
             header.append("\nSupervisor exit code: ").append(exit).append('\n');
@@ -608,7 +668,17 @@ public final class MainActivity extends Activity {
                         : "RESULT: the continuous /init process-tree trace failed before a conclusive stage; inspect the first failure above.\n");
             }
         }
+        if (interrupted) Thread.currentThread().interrupt();
         return header.toString();
+    }
+
+    private static boolean waitForProcessUninterruptibly(java.lang.Process process) {
+        boolean interrupted = false;
+        while (process.isAlive()) {
+            try { process.waitFor(); }
+            catch (InterruptedException e) { interrupted = true; }
+        }
+        return interrupted;
     }
 
     private void appendProgress(StringBuilder output, String message) {
