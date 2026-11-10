@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - validation/gingervm-apk-v0.6.1
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -11,6 +12,7 @@ on:
       - 'probes/**'
       - 'profiles/**'
       - 'src/**'
+      - 'native-ptrace-prototype/**'
       - '.github/workflows/gingervm.yml'
   workflow_dispatch:
 
@@ -54,3 +56,51 @@ jobs:
             build/arm-static-probe/armv7-memory-probe.elf
             build/arm-static-probe/memory-run.log
           if-no-files-found: error
+
+  android-apk:
+    name: Build GingerVM v0.6.1 Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK, NDK and rootless image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential curl e2fsprogs
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "READELF=$ANDROID_HOME/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" >> "$GITHUB_ENV"
+          echo "AAPT=$ANDROID_HOME/build-tools/35.0.0/aapt" >> "$GITHUB_ENV"
+
+      - name: Download and verify official Google API10 images; extract without mount/root
+        run: bash native-ptrace-prototype/tests/prepare_google_api10_ci.sh
+
+      - name: Build and verify continuous-trace APK
+        run: |
+          set -o pipefail
+          bash native-ptrace-prototype/build-native.sh | tee "$RUNNER_TEMP/gingervm-apk-build.log"
+          APK=native-ptrace-prototype/app/build/outputs/apk/debug/app-debug.apk
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "$APK"
+          sha256sum "$APK" | tee "$RUNNER_TEMP/gingervm-v0.6.1-apk.sha256"
+
+      - name: Upload APK, checksum and build log
+        uses: actions/upload-artifact@v4
+        with:
+          name: gingervm-continuous-trace-v0.6.1-apk
+          path: |
+            native-ptrace-prototype/app/build/outputs/apk/debug/app-debug.apk
+            ${{ runner.temp }}/gingervm-v0.6.1-apk.sha256
+            ${{ runner.temp }}/gingervm-apk-build.log
+          if-no-files-found: error
+          retention-days: 14

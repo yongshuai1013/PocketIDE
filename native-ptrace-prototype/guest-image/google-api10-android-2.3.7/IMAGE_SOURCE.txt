@@ -1,0 +1,38 @@
+Source: Google Android SDK system-image package
+Package path: sys-img/android/armeabi-v7a-10_r05.zip
+URL: https://dl.google.com/android/repository/sys-img/android/armeabi-v7a-10_r05.zip
+Local archive size: 67927049 bytes
+Local archive SHA-256: b3c6188ca95bea7299b8325bd3bbd4f504fc85545befec979728f2ed169878df
+Package source.properties:
+Pkg.Desc=Android SDK Platform 2.3.3._r1
+Pkg.UserSrc=false
+Platform.Version=2.3.3
+Pkg.Revision=5
+AndroidVersion.ApiLevel=10
+#AndroidVersion.CodeName=
+
+Original ramdisk.img size: 144213 bytes
+Original ramdisk.img SHA-256: 94db377c1ee8d79dbd8bf9570d12b18fb7c14bb8829f6fe793d77c5e7f05619d
+Matching system.img size: 576716800 bytes
+Matching system.img SHA-256: e41e8698c4d138a425c1ac3324209a7a2180db324360dc64dc7937ff6e3263fd
+Archive system.img SHA-256: e41e8698c4d138a425c1ac3324209a7a2180db324360dc64dc7937ff6e3263fd
+system.img is a symlink to the existing extracted package member; no shared file was changed.
+ramdisk.img is original package content; ramdisk-files contains selected reference copies, while ramdisk-root contains the complete original CPIO tree and guest-root-staging pairs it with the matching /system tree.
+Additional package and init verification:
+
+The complete ZIP member list is exactly: `armeabi-v7a/`, `armeabi-v7a/build.prop` (1,452), `kernel-qemu` (2,407,928), `kernel-ranchu` (2,746,040), `ramdisk.img` (144,213), `source.properties` (149), `system.img` (576,716,800), and `userdata.img` (2,147,483,648) bytes uncompressed. The package metadata labels the platform 2.3.3/API 10/revision 5, while the included `build.prop` reports `ro.build.version.release=2.3.7`, `ro.build.version.sdk=10`, `ro.build.id=GINGERBREAD`, and generic device.
+
+`ramdisk.img` begins with gzip magic and decompresses to newc CPIO magic `070701`. The original ramdisk CPIO has 18 entries, including nested `/sbin/adbd` (regular file) and `/sbin/ueventd -> ../init` (symlink); the full hierarchy is extracted at `ramdisk-root/`, while `ramdisk-files/` keeps selected reference copies. No image was mounted.
+
+Original `/init`: 90,084 bytes; SHA-256 `2d9cbb198d8367f434c5fd7bada245c9e7618dc910253190f5d4dd3d0f6d1a00`; ELF32 ARM, entry `0x80C0`, no `PT_INTERP`, no `DT_NEEDED` (static). Original `/init.rc`: 13,673 bytes; SHA-256 `cf12953bf1bc2e8974b4ea6eca31295efb06a2039a6da2d99c829c0a6c352095`.
+
+The isolated native ARM32 + ptrace plan uses this original ramdisk/init and the byte-matched `system.img` under the phone's host kernel. It does not boot `kernel-qemu` or `kernel-ranchu`; guest root-required operations remain software-simulated in the app-private broker. This is a guest-launch input pair, not proof of a complete Android boot, and the probe APK still contains no system image.
+
+
+## Rootless extracted guest staging
+
+The original `system.img` is raw ext4 (superblock magic `53 ef`, 4 KiB blocks). It was read with userspace `debugfs` only; no mount and no host root were used. The extracted `system-tree/` contains 35 directories, 413 regular files and 53 symlinks (about 104 MiB). `debugfs rdump` emitted 448 `Operation not permitted while changing ownership` warnings because extraction intentionally ran unprivileged. File contents and symlink targets were extracted; host uid/gid are not the original image metadata. The original `system.img` remains untouched and authoritative for guest metadata.
+
+`ramdisk-root/` is the complete userspace extraction of the original gzip/newc CPIO. `guest-root-staging/` combines that ramdisk root with the extracted matching `/system` tree using a relative `/system -> ../system-tree` link; this is staging only, not a host mount or guest boot. `tests/verify_google_api10_guest.sh` validates archive/image hashes, original init identity, CPIO symlinks, guest-root layout, and the dynamic `/system/bin/app_process` interpreter requirement.
+
+The original ramdisk `/init` is static ELF32/ARM. `/system/bin/app_process` is ELF32/ARM dynamic, requests `/system/bin/linker`, and is launched from `init.rc` as Zygote with `--start-system-server`. The original init has not been executed. The current isolated supervisor is a strict single-process probe, with `/mnt`-only path mapping and no fork/vfork/clone tracing; unknown calls are canceled. It lacks safe guest-root path/symlink mediation, Android property/device semantics, uid/gid virtualization and dynamic child execution. No new APK was built; the earlier v0.1.1 probe APK is unchanged and still awaits on-device retest.
