@@ -223,7 +223,7 @@ assert 'return;' in tree_cleanup and 'operations.remove(path)' in tree_cleanup
 cleanup_test = Path(sys.argv[1]).parents[4] / 'tests/AppPrivateTreeCleanupTest.java'
 assert 'setNoPermissions(sdcard)' in cleanup_test.read_text()
 assert 'outside must survive' in cleanup_test.read_text()
-init_rc = Path(sys.argv[2]).parents[6] / 'src/main/assets/api10-init-root/init.rc'
+init_rc = Path(sys.argv[1]).parents[4] / 'guest-image/google-api10-android-2.3.7/guest-root-staging/init.rc'
 assert 'mkdir /mnt/sdcard 0000 system system' in init_rc.read_text()
 copy = activity[activity.index('private void copyAssetTree'):activity.index('private void copyAssetFile')]
 assert 'getAssets().open(assetPath)' in copy and 'catch (IOException openError)' not in copy
