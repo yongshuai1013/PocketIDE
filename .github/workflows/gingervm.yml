@@ -31,10 +31,12 @@ jobs:
         with:
           targets: aarch64-linux-android
 
-      - name: Install ARM probe tools
+      - name: Verify ARM probe toolchain on hosted runner
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes clang lld binutils file
+          set -euo pipefail
+          for tool in clang-18 ld.lld-18 readelf file; do
+            command -v "$tool"
+          done
 
       - name: Run local build and tests
         run: ./build-local.sh
@@ -82,10 +84,12 @@ jobs:
         with:
           packages: 'platform-tools'
 
-      - name: Install Android SDK, NDK and rootless image tools
+      - name: Verify Android build host tools on hosted runner
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes build-essential curl e2fsprogs
+          set -euo pipefail
+          for tool in cc curl debugfs file readelf sha256sum unzip python3 awk; do
+            command -v "$tool"
+          done
           sdkmanager "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"

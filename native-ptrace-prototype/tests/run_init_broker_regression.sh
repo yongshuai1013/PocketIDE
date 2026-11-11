@@ -314,6 +314,11 @@ assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
 assert 'Standalone legacy probe ELFs are excluded' in build
+assert 'name: Verify ARM probe toolchain on hosted runner' in workflow
+assert 'for tool in clang-18 ld.lld-18 readelf file; do' in workflow
+assert 'name: Verify Android build host tools on hosted runner' in workflow
+assert 'for tool in cc curl debugfs file readelf sha256sum unzip python3 awk; do' in workflow
+assert 'sudo apt-get' not in workflow
 
 # Image stager preserves official Google/API10 source and confines links.
 assert 'EXPECTED_INIT_SHA256' in stager
