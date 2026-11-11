@@ -2,12 +2,13 @@
     <application
         android:allowBackup="false"
         android:debuggable="true"
-        android:label="GingerVM Continuous Trace v0.6.5"
+        android:label="GingerVM v0.6.6"
         android:multiArch="true"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">
         <activity
             android:name=".MainActivity"
+            android:label="GingerVM"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

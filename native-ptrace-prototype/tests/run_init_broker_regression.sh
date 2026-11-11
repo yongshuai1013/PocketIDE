@@ -57,6 +57,8 @@ capture = Path(sys.argv[2]).with_name('TraceOutputCapture.java').read_text()
 provider = Path(sys.argv[2]).with_name('TraceLogProvider.java').read_text()
 gradle = Path(sys.argv[3]).read_text()
 manifest = Path(sys.argv[4]).read_text()
+theme_path = Path(sys.argv[4]).parent / 'res/values/styles.xml'
+theme = theme_path.read_text()
 stager = Path(sys.argv[5]).read_text()
 build_path = Path(sys.argv[6]).resolve()
 build = build_path.read_text()
@@ -211,13 +213,23 @@ assert 'e.bytesTransferred' in capture and 'too many consecutive interrupted pip
 assert 'setText("查看日誌")' in activity and 'setText("停止")' in activity
 assert 'private void showLogViewer()' in activity and 'readLatestLogTail()' in activity
 assert 'MAX_LOG_VIEW_BYTES = 256 * 1024' in activity and 'MAX_REPORT_CHARS = 48 * 1024' in activity
+assert 'private ScrollView reportScrollView' in activity
+assert 'private void scrollToLatest(final ScrollView scrollView)' in activity
+assert 'scrollView.fullScroll(View.FOCUS_DOWN)' in activity
+assert 'scrollToLatest(reportScrollView)' in activity
+assert 'liveLogBody.setText(displayText)' in activity and 'scrollToLatest(liveLogScroll)' in activity
+assert 'dialog.setOnDismissListener' in activity
+assert 'Theme.Holo.Light.DarkActionBar' in theme
+assert '#33B5E5' in theme and '#FF303030' in theme
+assert 'setTitle("GingerVM")' in activity
 assert 'supervisor.destroy()' in activity and 'USER STOP REQUESTED' in activity
 assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activity
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'HISTORICAL DEVICE BASELINE (user-provided v0.6.3 Android 12 log; not this run)' in activity
-assert 'ftruncate' in activity and 'passed the coldboot wait' in activity
+assert 'HISTORICAL DEVICE BASELINE (user-provided v0.6.4 Android 12 log; not this run)' in activity
+assert 'ftruncate' in activity and 'released PID 1 from coldboot wait' in activity
+assert 'syscall 83' in activity and 'symlink(/system/etc, /etc)' in activity
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
 assert 'android:grantUriPermissions="true"' in manifest and '${applicationId}.trace-logs' in manifest
@@ -246,11 +258,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.5-test-signed-apk' in upload
-assert 'gingervm-v0.6.5-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 14" in gradle and "versionName '0.6.5'" in gradle
+assert 'gingervm-continuous-trace-v0.6.6-test-signed-apk' in upload
+assert 'gingervm-v0.6.6-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 15" in gradle and "versionName '0.6.6'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM Continuous Trace v0.6.5' in manifest
+assert 'GingerVM v0.6.6' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
