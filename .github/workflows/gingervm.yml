@@ -57,7 +57,7 @@ jobs:
           if-no-files-found: error
 
   android-apk:
-    name: Build GingerVM v0.6.7 test-signed Android APK
+    name: Build GingerVM v0.6.8 test-signed Android APK
     runs-on: ubuntu-latest
     steps:
       - name: Mask test signing passphrase in job logs
@@ -119,7 +119,7 @@ jobs:
             exit 1
           fi
           echo 'APK signature matches the approved GingerVM test certificate.'
-          sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.7-apk.sha256"
+          sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.8-apk.sha256"
 
       - name: Remove runner copy of test signing key
         if: always()
@@ -128,9 +128,9 @@ jobs:
       - name: Upload signed APK and checksum only
         uses: actions/upload-artifact@v4
         with:
-          name: gingervm-continuous-trace-v0.6.7-test-signed-apk
+          name: gingervm-continuous-trace-v0.6.8-test-signed-apk
           path: |
             native-ptrace-prototype/app/build/outputs/apk/debug/app-debug.apk
-            ${{ runner.temp }}/gingervm-v0.6.7-apk.sha256
+            ${{ runner.temp }}/gingervm-v0.6.8-apk.sha256
           if-no-files-found: error
           retention-days: 14

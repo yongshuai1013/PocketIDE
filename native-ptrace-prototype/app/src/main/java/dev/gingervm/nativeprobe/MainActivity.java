@@ -29,6 +29,7 @@ import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -91,9 +92,9 @@ public final class MainActivity extends Activity {
                 + "Host ABI: " + Arrays.toString(Build.SUPPORTED_ABIS) + "\n"
                 + "64-bit app process: " + Process.is64Bit() + "\n"
                 + "Android API: " + Build.VERSION.SDK_INT + "\n"
-                + "Latest confirmed Android 12 device evidence (supplied v0.6.6 trace): PID 1 passed the coldboot wait; app-private property-area ftruncate and four guest VFS symlinks succeeded. It then called ARM socket(1,1,0) for AF_UNIX and received -97 (EAFNOSUPPORT), exiting with code 1; ueventd remained in its event poll until a bounded supervisor timeout, with tracked=1 reaped=1 unresolved=0. No guest linker, Zygote, framework, or desktop boot was reached. v0.6.7 adds a narrow in-memory AF_UNIX property-service and SIGCHLD socketpair model, plus real guest rt_sigaction forwarding; it calls no host socket API and has not yet been tested on-device.\n\n"
+                + "Latest user-provided Android 12 screen (v0.6.7): staging failed before guest execution while deleting the previous app-private tree at /mnt/sdcard. Official API10 init.rc sets `mkdir /mnt/sdcard 0000 system system`; the old cleanup then got null from File.listFiles(). v0.6.8 repairs cleanup but is not yet device-tested. Earlier v0.6.6 trace: PID 1 passed coldboot wait and property-area ftruncate, then AF_UNIX socket(1,1,0) received -97 (EAFNOSUPPORT). The v0.6.7 software socket model has not yet been exercised on-device; no guest linker, Zygote, framework, or desktop boot has been reached.\n\n"
                 + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer shows a bounded tail; share/save exports the full latest file.\n"
-                + "No trace from this v0.6.7 installation has been recorded yet; the v0.6.6 device trace above is historical context.");
+                + "No v0.6.8 trace has been recorded yet; the earlier device evidence above is historical context.");
     }
 
     private void buildUi() {
@@ -167,7 +168,7 @@ public final class MainActivity extends Activity {
         viewLogButton.setEnabled(true);
         stopButton.setEnabled(true);
         setReportText("Preparing the complete Google API10 guest image; about 106 MiB of userland and linker aliases are staged across app-private storage and extracted ARM32 libraries…\n"
-                + "Historical v0.6.6 device trace: coldboot wait, property-area ftruncate, and four VFS symlinks succeeded; PID 1 then received -97 (EAFNOSUPPORT) for AF_UNIX socket(1,1,0) and exited with code 1. v0.6.7 adds a software-only property-service/socketpair model; no linker/Zygote has yet been reached. This run's Stop button requests a separate user cancellation.\n");
+                + "HISTORICAL DEVICE BASELINE (user-provided v0.6.7 Android 12 screenshot; not this run): staging failed before guest execution while deleting the previous app-private tree at /mnt/sdcard. Official API10 init.rc requests mkdir /mnt/sdcard 0000 system system; the old cleanup lstat'ed the directory then File.listFiles() returned null. v0.6.8 restores app-owner rwx only for lstat-confirmed real directories, uses O_NOFOLLOW before listing, unlinks symlinks without traversing targets, and treats missing paths as no-op. This cleanup fix and the v0.6.7 software AF_UNIX model are not yet confirmed on-device; no guest linker/Zygote/Framework has been reached. This run's Stop button requests a separate user cancellation.\n");
         postProgress("RUN STARTED: one continuous original /init process-tree session; this app-private latest-log file will be replaced when the run ends.\n");
         Thread worker = new Thread(new Runnable() {
             @Override public void run() {
@@ -430,7 +431,7 @@ public final class MainActivity extends Activity {
         throwIfStopRequested();
         StringBuilder out = new StringBuilder();
         out.append("GingerVM continuous Android 2.3.7/API 10 init process-tree trace\n");
-        out.append("HISTORICAL DEVICE BASELINE (user-provided v0.6.6 Android 12 log; not this run): PID 1 passed coldboot wait; property-area ftruncate(fd=4, length=32768) and four guest-only VFS symlinks succeeded. It then called ARM syscall 281 socket(domain=1,type=1,protocol=0) for AF_UNIX, received -97 (EAFNOSUPPORT), and exited with code 1. ueventd continued polling until supervisor timeout; cleanup reported tracked=1 reaped=1 unresolved=0. No guest linker/Zygote/framework was reached. v0.6.7 adds the documented app-private software socket model; it has not yet been confirmed on-device.\n\n");
+        out.append("HISTORICAL DEVICE BASELINE (user-provided v0.6.7 Android 12 screenshot; not this run): staging failed before guest execution while deleting the previous app-private tree at /mnt/sdcard. Official API10 init.rc requests mkdir /mnt/sdcard 0000 system system; old cleanup lstat'ed it as a directory then File.listFiles() returned null. v0.6.8 restores app-owner rwx only on lstat-confirmed real directories, opens without following symlinks, and treats missing paths as no-op; this fix has not yet been confirmed on-device. Earlier v0.6.6 trace reached AF_UNIX socket(1,1,0), got -97 (EAFNOSUPPORT), and exited; thus the v0.6.7 software socket model remains unverified. No guest linker/Zygote/framework has been reached.\n\n");
         out.append("Host ABI: ").append(Arrays.toString(Build.SUPPORTED_ABIS)).append('\n');
         out.append("64-bit app process: ").append(Process.is64Bit()).append('\n');
         out.append("Android API: ").append(Build.VERSION.SDK_INT).append('\n');
@@ -1185,31 +1186,84 @@ public final class MainActivity extends Activity {
     }
 
     private void deleteRecursively(File file) throws IOException {
-        StructStat stat;
-        try {
-            stat = Os.lstat(file.getAbsolutePath());
-        } catch (ErrnoException e) {
-            if (e.errno == OsConstants.ENOENT) return;
-            throw new IOException("cannot lstat app-private path " + file, e);
-        }
-        if (OsConstants.S_ISDIR(stat.st_mode)) {
-            File[] children = file.listFiles();
-            if (children == null) throw new IOException("cannot list app-private directory " + file);
-            for (File child : children) {
+        AppPrivateTreeCleanup.deleteRecursively(file, new AppPrivateTreeCleanup.Operations() {
+            @Override
+            public AppPrivateTreeCleanup.Node lstat(File path) throws IOException {
+                return lstatForCleanup(path);
+            }
+
+            @Override
+            public void makeDirectoryListable(File directory, AppPrivateTreeCleanup.Node expected)
+                    throws IOException {
+                AppPrivateTreeCleanup.Node current = lstatForCleanup(directory);
+                if (current == null) return;
+                requireSameCleanupDirectory(directory, expected, current);
+                try {
+                    int ownerAccess = OsConstants.S_IRUSR | OsConstants.S_IWUSR | OsConstants.S_IXUSR;
+                    Os.chmod(directory.getAbsolutePath(), (current.mode & 07777) | ownerAccess);
+                } catch (ErrnoException e) {
+                    throw new IOException("cannot restore app access to app-private directory " + directory, e);
+                }
+            }
+
+            @Override
+            public String[] list(File directory, AppPrivateTreeCleanup.Node expected) throws IOException {
+                FileDescriptor descriptor = null;
+                try {
+                    descriptor = Os.open(directory.getAbsolutePath(), OsConstants.O_RDONLY
+                            | OsConstants.O_NOFOLLOW | OsConstants.O_CLOEXEC, 0);
+                    requireSameCleanupDirectory(directory, expected, cleanupNode(Os.fstat(descriptor)));
+                    String[] children = directory.list();
+                    requireSameCleanupDirectory(directory, expected, lstatForCleanup(directory));
+                    return children;
+                } catch (ErrnoException e) {
+                    if (e.errno == OsConstants.ENOENT) return new String[0];
+                    throw new IOException("cannot open app-private directory without following symlinks "
+                            + directory, e);
+                } finally {
+                    if (descriptor != null) {
+                        try {
+                            Os.close(descriptor);
+                        } catch (ErrnoException ignored) { }
+                    }
+                }
+            }
+
+            @Override
+            public void remove(File path) throws IOException {
+                try {
+                    Os.remove(path.getAbsolutePath());
+                } catch (ErrnoException e) {
+                    if (e.errno != OsConstants.ENOENT)
+                        throw new IOException("cannot remove app-private path " + path, e);
+                }
+            }
+        }, new AppPrivateTreeCleanup.CancellationCheck() {
+            @Override
+            public void check() throws IOException {
                 throwIfStopRequested();
-                deleteRecursively(child);
             }
-            try {
-                Os.remove(file.getAbsolutePath());
-            } catch (ErrnoException e) {
-                throw new IOException("cannot remove app-private directory " + file, e);
-            }
-        } else {
-            try {
-                Os.remove(file.getAbsolutePath());
-            } catch (ErrnoException e) {
-                throw new IOException("cannot remove app-private path " + file, e);
-            }
+        });
+    }
+
+    private AppPrivateTreeCleanup.Node lstatForCleanup(File path) throws IOException {
+        try {
+            return cleanupNode(Os.lstat(path.getAbsolutePath()));
+        } catch (ErrnoException e) {
+            if (e.errno == OsConstants.ENOENT) return null;
+            throw new IOException("cannot lstat app-private path " + path, e);
         }
+    }
+
+    private AppPrivateTreeCleanup.Node cleanupNode(StructStat stat) {
+        return new AppPrivateTreeCleanup.Node(OsConstants.S_ISDIR(stat.st_mode),
+                OsConstants.S_ISLNK(stat.st_mode), stat.st_mode,
+                stat.st_dev + ":" + stat.st_ino);
+    }
+
+    private static void requireSameCleanupDirectory(File path, AppPrivateTreeCleanup.Node expected,
+                                                     AppPrivateTreeCleanup.Node actual) throws IOException {
+        if (actual == null || actual.symbolicLink || !actual.directory || !expected.sameObject(actual))
+            throw new IOException("app-private directory changed during cleanup; refusing to follow " + path);
     }
 }

@@ -22,8 +22,11 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
 "$TMP/guest_socket_path_ops_test"
 mkdir -p "$TMP/java"
 javac -d "$TMP/java" \
+  "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/AppPrivateTreeCleanup.java" \
   "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/TraceOutputCapture.java" \
+  "$ROOT/tests/AppPrivateTreeCleanupTest.java" \
   "$ROOT/tests/TraceOutputCaptureTest.java"
+java -cp "$TMP/java" dev.gingervm.nativeprobe.AppPrivateTreeCleanupTest
 java -cp "$TMP/java" dev.gingervm.nativeprobe.TraceOutputCaptureTest
 if [[ "$(uname -m)" == "x86_64" ]]; then
   cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -62,6 +65,7 @@ socket_model = Path(sys.argv[1]).with_name('guest_socket_virtual.h').read_text()
 socket_path = Path(sys.argv[1]).with_name('guest_socket_path_ops.h').read_text()
 activity = Path(sys.argv[2]).read_text()
 capture = Path(sys.argv[2]).with_name('TraceOutputCapture.java').read_text()
+tree_cleanup = Path(sys.argv[2]).with_name('AppPrivateTreeCleanup.java').read_text()
 provider = Path(sys.argv[2]).with_name('TraceLogProvider.java').read_text()
 gradle = Path(sys.argv[3]).read_text()
 manifest = Path(sys.argv[4]).read_text()
@@ -207,6 +211,20 @@ assert 'verifyGuestSystemTree' in activity and 'MessageDigest.getInstance("SHA-2
 assert 'knownSystemAssetDirectories' in activity
 assert 'google-api10-full-root' in activity and 'app_private_asset_bytes' in activity
 assert 'Os.lstat' in activity and 'Os.remove' in activity
+cleanup_adapter = activity.split('private void deleteRecursively(File file)', 1)[1].split(
+    'private AppPrivateTreeCleanup.Node lstatForCleanup', 1)[0]
+assert 'AppPrivateTreeCleanup.deleteRecursively(file' in cleanup_adapter
+assert 'Os.chmod(directory.getAbsolutePath()' in cleanup_adapter
+assert 'OsConstants.O_NOFOLLOW' in cleanup_adapter
+assert 'Os.fstat(descriptor)' in cleanup_adapter and 'directory.list()' in cleanup_adapter
+assert 'file.listFiles()' not in cleanup_adapter
+assert 'initial.symbolicLink || !initial.directory' in tree_cleanup
+assert 'return;' in tree_cleanup and 'operations.remove(path)' in tree_cleanup
+cleanup_test = Path(sys.argv[1]).parents[4] / 'tests/AppPrivateTreeCleanupTest.java'
+assert 'setNoPermissions(sdcard)' in cleanup_test.read_text()
+assert 'outside must survive' in cleanup_test.read_text()
+init_rc = Path(sys.argv[2]).parents[6] / 'src/main/assets/api10-init-root/init.rc'
+assert 'mkdir /mnt/sdcard 0000 system system' in init_rc.read_text()
 copy = activity[activity.index('private void copyAssetTree'):activity.index('private void copyAssetFile')]
 assert 'getAssets().open(assetPath)' in copy and 'catch (IOException openError)' not in copy
 assert 'throwIfStopRequested();' in copy
@@ -254,11 +272,11 @@ assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activ
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'HISTORICAL DEVICE BASELINE (user-provided v0.6.6 Android 12 log; not this run)' in activity
-assert 'ftruncate' in activity and 'passed the coldboot wait' in activity
-assert 'socket(1,1,0)' in activity and 'EAFNOSUPPORT' in activity
-assert 'property-service and SIGCHLD socketpair model' in activity
-assert 'has not yet been tested on-device' in activity
+assert 'HISTORICAL DEVICE BASELINE (user-provided v0.6.7 Android 12 screenshot; not this run)' in activity
+assert 'mkdir /mnt/sdcard 0000 system system' in activity and 'File.listFiles() returned null' in activity
+assert 'OsConstants.O_NOFOLLOW' in activity and 'app-owner rwx' in activity
+assert 'not yet confirmed on-device' in activity and 'no guest linker/Zygote/Framework' in activity
+assert 'No v0.6.8 trace has been recorded yet' in activity
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
 assert 'android:grantUriPermissions="true"' in manifest and '${applicationId}.trace-logs' in manifest
@@ -287,11 +305,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.7-test-signed-apk' in upload
-assert 'gingervm-v0.6.7-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 16" in gradle and "versionName '0.6.7'" in gradle
+assert 'gingervm-continuous-trace-v0.6.8-test-signed-apk' in upload
+assert 'gingervm-v0.6.8-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 17" in gradle and "versionName '0.6.8'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.7' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.8' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
