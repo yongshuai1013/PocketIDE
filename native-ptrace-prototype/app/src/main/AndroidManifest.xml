@@ -2,7 +2,7 @@
     <application
         android:allowBackup="false"
         android:debuggable="true"
-        android:label="GingerVM v0.6.6"
+        android:label="GingerVM v0.6.7"
         android:multiArch="true"
         android:supportsRtl="true"
         android:theme="@style/AppTheme">

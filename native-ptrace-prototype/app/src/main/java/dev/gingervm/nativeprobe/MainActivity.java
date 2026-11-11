@@ -91,9 +91,9 @@ public final class MainActivity extends Activity {
                 + "Host ABI: " + Arrays.toString(Build.SUPPORTED_ABIS) + "\n"
                 + "64-bit app process: " + Process.is64Bit() + "\n"
                 + "Android API: " + Build.VERSION.SDK_INT + "\n"
-                + "Latest confirmed Android 12 device evidence (supplied v0.6.4 trace): the guest-only uevent socket released PID 1 from coldboot wait; ftruncate(fd=4, length=32768) for /dev/__properties__ succeeded in app-private storage. The next real kernel SIGSYS metadata identified ARM EABI syscall 83, decoded as symlink(\"/system/etc\", \"/etc\"). v0.6.5 added app-private guest-VFS mediation with path containment and real-SIGSYS forwarding. That trace ended by supervisor timeout with all tracked tracees reaped; no guest linker, Zygote, framework, or desktop boot was reached. v0.6.6 adds the KitKat-era Holo UI and live-log autoscroll; this version has not yet been run on-device.\n\n"
+                + "Latest confirmed Android 12 device evidence (supplied v0.6.6 trace): PID 1 passed the coldboot wait; app-private property-area ftruncate and four guest VFS symlinks succeeded. It then called ARM socket(1,1,0) for AF_UNIX and received -97 (EAFNOSUPPORT), exiting with code 1; ueventd remained in its event poll until a bounded supervisor timeout, with tracked=1 reaped=1 unresolved=0. No guest linker, Zygote, framework, or desktop boot was reached. v0.6.7 adds a narrow in-memory AF_UNIX property-service and SIGCHLD socketpair model, plus real guest rt_sigaction forwarding; it calls no host socket API and has not yet been tested on-device.\n\n"
                 + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer shows a bounded tail; share/save exports the full latest file.\n"
-                + "No trace from this v0.6.6 installation has been recorded yet; the v0.6.4 device trace above is historical context.");
+                + "No trace from this v0.6.7 installation has been recorded yet; the v0.6.6 device trace above is historical context.");
     }
 
     private void buildUi() {
@@ -167,7 +167,7 @@ public final class MainActivity extends Activity {
         viewLogButton.setEnabled(true);
         stopButton.setEnabled(true);
         setReportText("Preparing the complete Google API10 guest image; about 106 MiB of userland and linker aliases are staged across app-private storage and extracted ARM32 libraries…\n"
-                + "Historical v0.6.4 device trace: PID 1 passed the coldboot wait and app-private ftruncate succeeded; the next real SIGSYS identified syscall 83, symlink(/system/etc, /etc). v0.6.5 added guest-VFS mediation; no linker/Zygote has yet been reached. This run's Stop button requests a separate user cancellation.\n");
+                + "Historical v0.6.6 device trace: coldboot wait, property-area ftruncate, and four VFS symlinks succeeded; PID 1 then received -97 (EAFNOSUPPORT) for AF_UNIX socket(1,1,0) and exited with code 1. v0.6.7 adds a software-only property-service/socketpair model; no linker/Zygote has yet been reached. This run's Stop button requests a separate user cancellation.\n");
         postProgress("RUN STARTED: one continuous original /init process-tree session; this app-private latest-log file will be replaced when the run ends.\n");
         Thread worker = new Thread(new Runnable() {
             @Override public void run() {
@@ -430,7 +430,7 @@ public final class MainActivity extends Activity {
         throwIfStopRequested();
         StringBuilder out = new StringBuilder();
         out.append("GingerVM continuous Android 2.3.7/API 10 init process-tree trace\n");
-        out.append("HISTORICAL DEVICE BASELINE (user-provided v0.6.4 Android 12 log; not this run): guest-only uevent socket released PID 1 from coldboot wait; property-area ftruncate(fd=4, length=32768) succeeded in app-private storage. The next real SYS_SECCOMP SIGSYS reported ARM syscall 83 (si-arch=0x40000028), decoded from guest memory and API10 init.rc as symlink(/system/etc, /etc); the genuine signal was forwarded. The trace did not reach guest linker/Zygote/framework and ended by supervisor timeout with tracked=1 reaped=1 unresolved=0. v0.6.5 added software-only symlink mediation; this v0.6.6 UI build still needs a new device trace.\n\n");
+        out.append("HISTORICAL DEVICE BASELINE (user-provided v0.6.6 Android 12 log; not this run): PID 1 passed coldboot wait; property-area ftruncate(fd=4, length=32768) and four guest-only VFS symlinks succeeded. It then called ARM syscall 281 socket(domain=1,type=1,protocol=0) for AF_UNIX, received -97 (EAFNOSUPPORT), and exited with code 1. ueventd continued polling until supervisor timeout; cleanup reported tracked=1 reaped=1 unresolved=0. No guest linker/Zygote/framework was reached. v0.6.7 adds the documented app-private software socket model; it has not yet been confirmed on-device.\n\n");
         out.append("Host ABI: ").append(Arrays.toString(Build.SUPPORTED_ABIS)).append('\n');
         out.append("64-bit app process: ").append(Process.is64Bit()).append('\n');
         out.append("Android API: ").append(Build.VERSION.SDK_INT).append('\n');

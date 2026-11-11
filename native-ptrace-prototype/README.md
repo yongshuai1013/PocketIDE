@@ -1,29 +1,31 @@
-# GingerVM 連續 guest trace v0.6.6
+# GingerVM 連續 guest trace v0.6.7
 
-> 這仍是測試原型，不是已完成開機的 Android 虛擬機。它在非 root Android 手機上，以 native ARM64 supervisor 連續追蹤官方 Google Android 2.3.7/API 10 ARM32 `/init` 程序樹，並在 app-private guest root 模擬部分核心行為；不呼叫 host root、mount、netlink 或 Binder，也不使用逐指令 CPU 模擬。
+> 這是仍在開發中的 Android guest 啟動原型，不是已完成開機的虛擬機。它在未 root 的 Android ARM64 主機上，以 native ARM64 supervisor 追蹤官方 Google Android 2.3.7/API 10 ARM32 `/init` 與同一程序樹；不使用逐指令 CPU 模擬，也不呼叫 host root、mount、netlink 或 Binder。
 
-## v0.6.6 介面：KitKat Holo 與即時追尾
+## 真機證據：property socket 是下一個阻塞點
 
-App 改用 Android 4.4 時代的 Holo Light / Dark ActionBar 風格：淺色內容、深色頂欄與系統列、Holo 藍色 `#33B5E5` 控制強調色，避免 Material 圓角卡片與新式視覺。主畫面日誌每次收到新文字都捲到最新一行；若「查看日誌」視窗在執行中打開，它也會同步更新並跟隨最新行。這只改 UI，不改 guest syscall 模型；完整日誌分享／儲存及手動停止行為維持原樣。
+使用者提供的 v0.6.6 Android 12 trace 證明 PID 1 已越過 coldboot wait；`/dev/__properties__` 的 app-private `ftruncate(fd=4, length=32768)` 成功；四個 guest VFS symlink 與虛擬 mount 操作也成功。之後 PID 1 對 ARM syscall 281 呼叫 `socket(domain=1, type=1, protocol=0)`，即 `AF_UNIX/SOCK_STREAM`，broker 回傳 `-97 (EAFNOSUPPORT)`，PID 1 以 code 1 退出。`ueventd` 繼續等待，最後由 supervisor timeout 收束，`tracked=1 reaped=1 unresolved=0`。沒有進入 guest linker、Zygote、Framework 或桌面。
 
-## 真機證據：syscall 93 成功，下一步是 syscall 83
+這是實際 trace 確認的阻塞，不是由 `poll` 次數推測。v0.6.4 已先確認 ftruncate 與 syscall 83 symlink 問題；v0.6.6 日誌顯示這些步驟已通過，下一個明確失敗點才是 AF_UNIX socket。
 
-使用者提供的 v0.6.4 Android 12 完整 trace 證實，ueventd 建立 `/dev/.coldboot_done` 後，PID 1 越過 coldboot 等待。PID 1 接著以 ARM syscall 93 將 app-private property-area 檔案調整為 32768 bytes，日誌記錄 `result=0`。之後核心回報真正的 `SIGSYS`：`si-syscall=83`、`si-arch=0x40000028`；不是前一個已 broker 的 `ftruncate` 假 syscall。
+## API 10 原始程式的要求
 
-ptrace 保存的字串指標相差 12 bytes。將真機暫存器/參數與原始 guest ELF 記憶體、官方 API10 [`init.rc`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/rootdir/init.rc) 及 [`builtins.c`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/init/builtins.c) 的 `symlink(target, link)` 順序核對後，確認該呼叫是 `symlink("/system/etc", "/etc")`。因此 syscall 83 是下一個已被真機證據確認的 property/init 啟動阻塞；不把它猜成 linker 或 Binder 問題。
+實作依據是官方 [`android-2.3.7_r1` `init/util.c`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/init/util.c)、[`init/property_service.c`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/init/property_service.c)、[`init/init.c`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/init/init.c) 與 [`init/signal_handler.c`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/init/signal_handler.c)：
 
-## v0.6.5 修正
+- property service 使用 guest 路徑 `/dev/socket/property_service`，建立 `AF_UNIX/SOCK_STREAM` listener，設定 `FD_CLOEXEC`、`O_NONBLOCK`，並以 backlog 8 執行 listen。
+- init event loop 將 listener 加入 poll；連線到來後 accept、讀取 `SO_PEERCRED`、接收 `prop_msg` 並關閉已接受的 fd。
+- signal handler 建立另一組 `AF_UNIX/SOCK_STREAM` socketpair，設定 `FD_CLOEXEC` 和 `O_NONBLOCK`，由 `SIGCHLD` handler 寫入通知，再由 init 從另一端讀取。
 
-ARM EABI syscall 83 `symlink` 與 331 `symlinkat` 現在被分類為 app-private file operation。Supervisor 讀取 guest 的 target/link 參數、把 guest 路徑映射到 staging backing，再由 broker 建立 symlink 並將成功或 errno 以 fake syscall 結果回傳；原始 ARM syscall 不會被送到 Android 核心。`symlinkat` 只接受 `AT_FDCWD`，其他 dirfd fail-closed。
+## v0.6.7 的軟體 socket broker
 
-安全邊界是：link 的父目錄必須解析在 app-private guest root 內；target 必須解析在 guest root 或 APK 擷取的 guest-native payload root 內。對 dangling target 只允許從已存在且位於允許 root 的祖先延伸；沿途 symlink 會被解析並重新檢查 containment。建立前會開啟並固定已驗證的 link 父目錄，再以 descriptor-relative `symlinkat` 建立。`..`、相對路徑、指向外部的 target/link parent 及 root-prefix 相似但實際在外的路徑會 fail-closed。沒有對 host `/etc`、`/system` 等根目錄寫入或重新導向。
+支援的 socket/file descriptor 是 supervisor 內的固定大小記憶體表與 byte queue，不是 host socket。property pathname 只在 guest root 的 app-private backing 建立一般檔案標記，讓 guest VFS 保有路徑狀態；該標記不是 kernel socket。bind 限定 PID 1 及精確路徑 `/dev/socket/property_service`。connect、listen、accept、send/recv、`SO_PEERCRED`、close、fcntl、read/write 和 poll 都由軟體表處理；socketpair 僅為 init 的 SIGCHLD byte queue。poll 只在軟體佇列實際有資料或待處理連線時回報可讀，不合成裝置事件。
 
-SIGSYS correlation 也收緊：只有已掛起的 broker 候選、`SYS_SECCOMP` 且核心 `si_syscall == -1`（supervisor 用來取消 guest syscall 的 placeholder）才可被抑制。真實 `si_syscall=83` 不匹配候選，會清除候選並轉送原始 signal。
+只允許已實作的 ARM direct-socket syscall 和 socketcall 子操作；未實作的 sendto/recvfrom/shutdown、未知 op、其他地址、domain、type 或 option 都 fail-closed，不會落到 host socket API。fd ownership 按 guest descriptor table 管理，fork/clone 依 `CLONE_FILES` 繼承，exec 套用 `FD_CLOEXEC`，程序退出時回收不再引用的 fd。API 10 的 `rt_sigaction` 只轉交 ARM compat kernel，以便 guest SIGCHLD handler 正常運行；這不需要 host 特權。
 
-## 測試與限制
+Guest socket pathname 的 marker 操作會解析並驗證 app-private guest root，固定已驗證的父目錄，再使用 `openat(..., O_NOFOLLOW)` 建立檔案；symlink 或路徑穿越不能把操作導向 guest root 以外。沒有建立或呼叫 host AF_UNIX socket，也沒有 host mount、netlink 或 Binder。
 
-`bash tests/run_init_broker_regression.sh` 包含 syscall class、app-private symlink 成功/拒絕、native payload target、symlink 逃逸、link-parent 逃逸、`..` 路徑、已有連結、SIGSYS metadata 與 ptrace/seccomp、ftruncate、tracee cleanup、Java log capture、Holo 主題／即時自動捲動 source-contract、官方 init/linker/ELF 和其他 source-contract 回歸。`bash build-native.sh` 另外驗證官方映像、完整 `/system` staging、ABI、APK 簽章與內容。
+## 驗證狀態與下一步
 
-上述是 host/build 回歸，不代表 v0.6.6 已在 Android 真機執行。v0.6.4 的 trace 在上述 symlink 阻塞處退出並由 supervisor timeout 收束，`tracked=1 reaped=1 unresolved=0`；沒有到 guest linker、Zygote、framework 或 desktop。下一個 guest 驗證點仍是新真機日誌顯示 `GUEST VFS SYMLINK ... target=/system/etc link=/etc result=0`，再觀察 property service 後續、dynamic linker 與 Zygote；另需在手機確認 Holo 樣式和即時日誌追尾。即使達到 linker entry，也不等於 Framework 或完整桌面已開機。
+新增 host 回歸覆蓋 property listener/connect/send/accept/peer credentials/recv/close/poll、signal socketpair、socketcall 允許清單、未知 socket operation 拒絕、pathname containment，以及既有 SIGSYS、ftruncate、symlink、tracee cleanup、日誌擷取和完整 API10 payload 測試。完整回歸命令：`bash tests/run_init_broker_regression.sh`；APK 建置與封裝檢查：`bash build-native.sh`。通過 host 測試只代表這些軟體模型和封裝檢查符合預期，不代表 Android guest 已在真機啟動。
 
-Guest mount、身份、裝置、uevent/event 與受限檔案操作仍是 app-private 軟體模型；Binder、graphics、真實硬體事件及完整 service/driver graph 尚未實作。GitHub Actions APK 使用核准的測試簽章，keystore 不進入 APK artifact。
+v0.6.7 尚待 Android 12 真機 trace 驗證 property-service socket lifecycle；下一個證據應是 socket/bind/listen 成功，以及 PID 1 是否繼續到新的、可由 syscall args 和原始 API 10 程式碼確認的步驟。不得把 syscall broker 成功、linker entry 或 coldboot 放行稱為 Zygote、Framework、桌面或完整 Android boot。

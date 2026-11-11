@@ -26,8 +26,24 @@ int main(void) {
     assert(guest_syscall_policy(2) == GUEST_SYSCALL_TRACE_PROCESS);
     assert(guest_syscall_policy(190) == GUEST_SYSCALL_TRACE_PROCESS);
     assert(guest_syscall_policy(11) == GUEST_SYSCALL_DENY); /* execve uses explicit ELF mediation */
-    assert(guest_syscall_policy(102) == GUEST_SYSCALL_VIRTUALIZE); /* software socketcall */
+    assert(guest_syscall_policy(102) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* software socketcall */
+    assert(guest_syscall_policy(281) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* socket */
+    assert(guest_syscall_policy(282) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* bind */
+    assert(guest_syscall_policy(283) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* connect */
+    assert(guest_syscall_policy(284) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* listen */
+    assert(guest_syscall_policy(285) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* accept */
+    assert(guest_syscall_policy(288) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* socketpair */
+    assert(guest_syscall_policy(289) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* send */
+    assert(guest_syscall_policy(291) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* recv */
+    assert(guest_syscall_policy(294) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* setsockopt */
+    assert(guest_syscall_policy(295) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* getsockopt */
+    assert(guest_syscall_policy(286) == GUEST_SYSCALL_DENY); /* getpeername */
+    assert(guest_syscall_policy(287) == GUEST_SYSCALL_DENY); /* getsockname */
+    assert(guest_syscall_policy(290) == GUEST_SYSCALL_DENY); /* sendto not implemented */
+    assert(guest_syscall_policy(292) == GUEST_SYSCALL_DENY); /* recvfrom not implemented */
+    assert(guest_syscall_policy(293) == GUEST_SYSCALL_DENY); /* shutdown not implemented */
     assert(guest_syscall_policy(168) == GUEST_SYSCALL_VIRTUALIZE); /* software poll */
+    assert(guest_syscall_policy(174) == GUEST_SYSCALL_ALLOW_SAFE); /* install guest SIGCHLD handler */
     assert(guest_syscall_policy(83) == GUEST_SYSCALL_FILE_OPERATION); /* app-private symlink */
     assert(guest_syscall_policy(93) == GUEST_SYSCALL_FILE_OPERATION); /* app-private ftruncate */
     assert(guest_syscall_policy(331) == GUEST_SYSCALL_FILE_OPERATION); /* app-private symlinkat */

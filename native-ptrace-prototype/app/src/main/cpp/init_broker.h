@@ -20,6 +20,7 @@ enum guest_syscall_class {
     GUEST_SYSCALL_BLOCK_PROCESS = 6,
     GUEST_SYSCALL_TRACE_PROCESS = 7,
     GUEST_SYSCALL_FILE_OPERATION = 8,
+    GUEST_SYSCALL_VIRTUAL_SOCKET = 9,
 };
 
 /* Narrow ARM EABI syscall policy for the original static Gingerbread init.
@@ -31,10 +32,14 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
         case 45: case 55: case 91: case 108: case 114: case 118:
         case 119: case 125: case 126: case 140: case 141: case 145: case 146:
         case 148: case 162: case 163:
-        case 173: case 174: case 175: case 176: case 177: case 179:
+        case 173: case 175: case 176: case 177: case 179:
         case 180: case 181: case 192: case 197: case 240: case 248: case 257:
         case 217: case 220: case 221: case 263: case 264: case 265: case 266:
         case 338: case 0x0f0002: case 0x0f0005:
+            return GUEST_SYSCALL_ALLOW_SAFE;
+
+        /* Let API10 install its in-process SIGCHLD handler in the ARM compat kernel. */
+        case 174:
             return GUEST_SYSCALL_ALLOW_SAFE;
 
         /* Absolute guest paths are translated and checked before host execution. */
@@ -51,7 +56,7 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
         case 20: case 23: case 24: case 46: case 47: case 49: case 50: case 60:
         case 64: case 80: case 81: case 138: case 139: case 164: case 165:
         case 170: case 171: case 172: case 184: case 185: case 199:
-        case 102: case 168: case 200: case 201: case 202: case 203: case 204:
+        case 168: case 200: case 201: case 202: case 203: case 204:
         case 205: case 206:
         case 207: case 208: case 209: case 210: case 211: case 213: case 214:
         case 215: case 216: case 224:
@@ -60,6 +65,11 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
         /* Symlinks and ftruncate are brokered only against app-private guest VFS objects. */
         case 83: case 93: case 331:
             return GUEST_SYSCALL_FILE_OPERATION;
+
+        /* Only the API10 property service and init signal socketpair are modeled. */
+        case 102: case 281: case 282: case 283: case 284: case 285:
+        case 288: case 289: case 291: case 294: case 295:
+            return GUEST_SYSCALL_VIRTUAL_SOCKET;
 
         /* Guest mount table only: no host mount(2), umount(2), or pivot_root(2). */
         case 21: case 52:
@@ -75,8 +85,8 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
         case 2: case 120: case 190:
             return GUEST_SYSCALL_TRACE_PROCESS;
 
-        /* execve, ptrace, chroot, pivot_root, reboot, namespaces, sockets, and
-         * every unknown syscall remain denied by default. */
+        /* execve, ptrace, chroot, pivot_root, reboot, namespaces, unsupported
+         * socket operations, and every unknown syscall remain denied by default. */
         default:
             return GUEST_SYSCALL_DENY;
     }
