@@ -27,6 +27,9 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
     "$ROOT/tests/guest_file_ops_test.c" -o "$TMP/guest_file_ops_test"
   "$TMP/guest_file_ops_test"
   cc -std=c11 -O2 -Wall -Wextra -Werror \
+    "$ROOT/tests/guest_symlink_ops_test.c" -o "$TMP/guest_symlink_ops_test"
+  "$TMP/guest_symlink_ops_test"
+  cc -std=c11 -O2 -Wall -Wextra -Werror \
     "$ROOT/tests/ptrace_cancel_cleanup_regression.c" -o "$TMP/ptrace_cancel_cleanup_regression"
   "$TMP/ptrace_cancel_cleanup_regression"
 else
@@ -71,6 +74,10 @@ assert 'guest_uevent_bind_args_valid(&addr, address_length' in src
 assert 'guest_uevent_setsockopt_args_valid(level, option, value, value_length)' in src
 assert '#define ARM_NR_FTRUNCATE 93' in src and 'guest_ftruncate_app_private' in src
 assert 'GUEST FILE FTRUNCATE:' in src and 'VIRTUAL FILE OPS:' in src
+assert 'GUEST VFS SYMLINK:' in src and 'guest_symlink_create_app_private' in src
+assert 'VIRTUAL SYMLINK OPS:' in src and 'rewrite_symlink' not in src
+assert 'path_is_within(link_host, guest_root)' in src
+assert 'path_is_within(target_host, native_guest_root)' in src
 assert 'strcmp(active_tracee->exec_target, "/sbin/ueventd") == 0' in src
 assert 'VIRTUAL UEVENT SOCKET:' in src and 'GUEST SOCKET ARGS:' in src
 assert 'VIRTUAL UEVENT BIND:' in src and 'VIRTUAL UEVENT SETSOCKOPT:' in src
@@ -112,15 +119,22 @@ assert 'bounded continuous process-tree trace ended by supervisor timeout' in sr
 cleanup = Path(sys.argv[1]).with_name('ptrace_tracee_cleanup.h').read_text()
 assert 'ptrace_terminate_and_reap' in cleanup and 'waitpid(pid, &status, __WALL)' in cleanup
 broker = Path(sys.argv[1]).with_name('init_broker.h').read_text()
-file_operation_policy = broker.split('/* ftruncate is brokered', 1)[1].split('/* Guest mount table', 1)[0]
+file_operation_policy = broker.split('/* Symlinks and ftruncate are brokered', 1)[1].split('/* Guest mount table', 1)[0]
 safe_file_policy = broker.split('/* Guest-local ordinary file operations', 1)[1].split('/* Absolute guest paths', 1)[0]
-assert 'case 93:' in file_operation_policy and 'GUEST_SYSCALL_FILE_OPERATION' in file_operation_policy
+assert 'case 83: case 93: case 331:' in file_operation_policy and 'GUEST_SYSCALL_FILE_OPERATION' in file_operation_policy
 assert 'case 93' not in safe_file_policy
+symlink_ops = Path(sys.argv[1]).with_name('guest_symlink_ops.h').read_text()
+assert 'guest_symlink_create_app_private' in symlink_ops
+assert 'guest_symlink_resolve_target' in symlink_ops
+assert 'symlinkat(resolved_target, dirfd, leaf)' in symlink_ops
+assert 'realpath(fd_path, opened_parent)' in symlink_ops
+assert 'guest_symlink_path_within_root(opened_parent, canonical_guest_root)' in symlink_ops
 assert '#define ARM_NR_GETTID 224' in src and 'case 215: case 216: case 224:' in broker
 fake = src.split('static int fake_syscall(', 1)[1].split('static int resume_trace(', 1)[0]
 assert 'regs->uregs[7] = UINT32_MAX' in fake and 'set_kernel_syscall(pid, -1)' in fake
 sigsys = trace.split('if (sig == SIGSYS', 1)[1].split('if (sig == SIGSTOP)', 1)[0]
-assert 'broker_sigsys_take(&state->broker_sigsys, sig, siginfo_code)' in sigsys
+assert 'broker_sigsys_take(&state->broker_sigsys, sig,' in sigsys
+assert 'siginfo_code, sigsys_syscall' in sigsys
 assert 'siginfo.si_code' in src and 'PTRACE_GETSIGINFO' in sigsys
 assert 'PTRACE SIGSYS WAIT STATUS' in sigsys and 'raw=0x%x' in sigsys
 assert 'si-syscall=%d si-arch=0x%x si-call-addr=%p' in sigsys
@@ -131,6 +145,10 @@ assert 'broker_sigsys_arm(&state->broker_sigsys' in trace
 assert 'broker_sigsys_mark_response_committed(&state->broker_sigsys)' in trace
 assert 'broker_sigsys_expire_before_next_entry(&state->broker_sigsys)' in trace
 assert 'state->expect_exit && state->pending' not in sigsys
+sigsys_state = Path(sys.argv[1]).with_name('broker_sigsys_state.h').read_text()
+sigsys_test = Path(sys.argv[1]).parents[4] / 'tests/broker_sigsys_state_test.c'
+assert 'seccomp_syscall_number != -1' in sigsys_state
+assert 'SIGSYS, SYS_SECCOMP, 83' in sigsys_test.read_text()
 assert trace.index('if (sig == SIGSYS') < trace.index('GUEST SIGNAL FORWARDED')
 all_done = trace.split('if (active_tracee_count == 0)', 1)[1].split('waited = waitpid', 1)[0]
 assert '*exit_code = 0' not in all_done and '*exit_signal = 0' not in all_done
@@ -228,11 +246,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.4-test-signed-apk' in upload
-assert 'gingervm-v0.6.4-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 13" in gradle and "versionName '0.6.4'" in gradle
+assert 'gingervm-continuous-trace-v0.6.5-test-signed-apk' in upload
+assert 'gingervm-v0.6.5-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 14" in gradle and "versionName '0.6.5'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM Continuous Trace v0.6.4' in manifest
+assert 'GingerVM Continuous Trace v0.6.5' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
@@ -248,5 +266,5 @@ assert 'api10-system-manifest.json' in stager
 assert 'libgingervm_guest_linker.so' in stager
 assert 'patch_guest_interpreter' in stager and 'PATCHED_GUEST_INTERPRETER' in stager
 assert 'dynamic_interpreter_original' in stager and 'dynamic_interpreter_patched' in stager
-print('continuous API10 guest contract: PASS (one /init tree, bounded descendants, software PID/mount and uevent control plane, poll/fd provenance, coldboot marker diagnostics, original API10 linker via fd 198, full verified Google /system, no host root/mount/socket APIs)')
+print('continuous API10 guest contract: PASS (one /init tree, bounded descendants, software PID/mount and uevent control plane, syscall-83 app-private VFS symlinks with containment, metadata-matched SIGSYS suppression, original API10 linker via fd 198, full verified Google /system, no host root/mount/socket APIs)')
 PY

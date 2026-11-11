@@ -1,25 +1,25 @@
-# GingerVM 連續 guest trace v0.6.4
+# GingerVM 連續 guest trace v0.6.5
 
-> 這仍是 GingerVM 測試原型，不是已完成開機的 Android 虛擬機。它以一條連續程序樹執行官方 Google Android 2.3.7/API 10 ARM32 `/init`，在非 root 手機上用 app-private 軟體 broker 模擬部分 guest kernel 行為；不呼叫 host mount、不使用 host root、host netlink 或 host Binder，也不做逐指令 CPU 模擬。
+> 這仍是測試原型，不是已完成開機的 Android 虛擬機。它在非 root Android 手機上，以 native ARM64 supervisor 連續追蹤官方 Google Android 2.3.7/API 10 ARM32 `/init` 程序樹，並在 app-private guest root 模擬部分核心行為；不呼叫 host root、mount、netlink 或 Binder，也不使用逐指令 CPU 模擬。
 
-## 真機證據與目前阻塞
+## 真機證據：syscall 93 成功，下一步是 syscall 83
 
-使用者提供的 v0.6.2 trace 證實，PID 18817 是原始 `/init`，只做了一次 `poll`；PID 18818 是 `/sbin/ueventd`，它的 ARM EABI syscall 281 回傳 `-ENOSYS`，接著反覆對 `fd=-1` 做 `poll`。這與官方 API10 [`devices.c`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/init/devices.c) 的 `open_uevent_socket()`、[`ueventd.c`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/init/ueventd.c) 的 `get_device_fd()` poll loop 一致。
+使用者提供的 v0.6.4 Android 12 完整 trace 證實，ueventd 建立 `/dev/.coldboot_done` 後，PID 1 越過 coldboot 等待。PID 1 接著以 ARM syscall 93 將 app-private property-area 檔案調整為 32768 bytes，日誌記錄 `result=0`。之後核心回報真正的 `SIGSYS`：`si-syscall=83`、`si-arch=0x40000028`；不是前一個已 broker 的 `ftruncate` 假 syscall。
 
-v0.6.3 的後續真機日誌確認：guest-only uevent socket/bind 成功，原始 ueventd 建立 `/dev/.coldboot_done`，PID 1 越過 coldboot wait。接著 PID 1 的 ARM EABI syscall 93 緊鄰一個 `SYS_SECCOMP` `SIGSYS`；當時沒有 `si_syscall`/`si_arch` 欄位，因此該次被陷阱的 syscall 尚未由核心 metadata 確認。PID 1 收到 signal 後退出；未到 linker、Zygote、framework 或 desktop。使用者按 Stop 後，Java 記錄 `InterruptedIOException`，漏掉了最後的 native trace cleanup 行。
+ptrace 保存的字串指標相差 12 bytes。將真機暫存器/參數與原始 guest ELF 記憶體、官方 API10 [`init.rc`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/rootdir/init.rc) 及 [`builtins.c`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/init/builtins.c) 的 `symlink(target, link)` 順序核對後，確認該呼叫是 `symlink("/system/etc", "/etc")`。因此 syscall 83 是下一個已被真機證據確認的 property/init 啟動阻塞；不把它猜成 linker 或 Binder 問題。
 
-下一個 API10 程式碼候選是 property-area 初始化：官方 [`property_service.c`](https://android.googlesource.com/platform/system/core/+/android-2.3.7_r1/init/property_service.c) 的 `init_workspace()` 依序 `open("/dev/__properties__", O_RDWR|O_CREAT)`、`ftruncate(fd, size)`、`mmap()`，然後唯讀重開並 `unlink()`。v0.6.4 會記錄核心 SIGSYS 的 `si_syscall`、`si_arch`、call address、saved args 和 live ARM registers，才能確認是否正是 syscall 93，而不靠猜測。
+## v0.6.5 修正
 
-## v0.6.4 的軟體修正
+ARM EABI syscall 83 `symlink` 與 331 `symlinkat` 現在被分類為 app-private file operation。Supervisor 讀取 guest 的 target/link 參數、把 guest 路徑映射到 staging backing，再由 broker 建立 symlink 並將成功或 errno 以 fake syscall 結果回傳；原始 ARM syscall 不會被送到 Android 核心。`symlinkat` 只接受 `AT_FDCWD`，其他 dirfd fail-closed。
 
-新增的 ARM EABI `ftruncate` broker 僅允許非負長度、可寫的普通檔案描述符；它透過 `/proc/<tracee>/fd/N` 檢查目標位於 app-private guest root 內，再重查開啟後的檔案類型與路徑。目錄、唯讀 fd、guest root 以外的檔案及錯誤 fd 都 fail-closed。這不是 host root 操作；不改變 Android app 的 uid/gid，也不呼叫 host mount、socket、netlink 或 Binder。`ftruncate64` 尚未由此 trace 證明需要，仍維持 deny。
+安全邊界是：link 的父目錄必須解析在 app-private guest root 內；target 必須解析在 guest root 或 APK 擷取的 guest-native payload root 內。對 dangling target 只允許從已存在且位於允許 root 的祖先延伸；沿途 symlink 會被解析並重新檢查 containment。建立前會開啟並固定已驗證的 link 父目錄，再以 descriptor-relative `symlinkat` 建立。`..`、相對路徑、指向外部的 target/link parent 及 root-prefix 相似但實際在外的路徑會 fail-closed。沒有對 host `/etc`、`/system` 等根目錄寫入或重新導向。
 
-停止時，App 送出 SIGTERM，最多等待 15 秒讓 supervisor 終止並回收 trace tree；只有 native STOP 明確回報所有追蹤程序已收回且 `unresolved=0` 時，UI 才會稱 cleanup confirmed。超時才會 force-stop，並明確標為 cleanup 未確認。輸出讀取改為原始 bytes 的 capture session：遇到短暫 `InterruptedIOException` 會保留已傳輸 bytes、清除讀取執行緒的中斷狀態並重試；停止後最多等 15 秒讀到 EOF，失敗時保留已讀日誌並清楚標記不完整，不會把缺少 cleanup 記錄說成成功。
+SIGSYS correlation 也收緊：只有已掛起的 broker 候選、`SYS_SECCOMP` 且核心 `si_syscall == -1`（supervisor 用來取消 guest syscall 的 placeholder）才可被抑制。真實 `si_syscall=83` 不匹配候選，會清除候選並轉送原始 signal。
 
 ## 測試與限制
 
-`bash tests/run_init_broker_regression.sh` 通過：guest syscall policy、SIGSYS 到達順序、真實 host ptrace/seccomp `SYS_SECCOMP` metadata、app-private ftruncate 成功/拒絕案例、tracee cleanup、Java 輸出中斷恢復、官方 init/ELF/linker 檢查及 source contract。`bash build-native.sh` 另驗證官方映像雜湊、完整 `/system` staging、ARM64 supervisor、APK payload/ABI 和簽章。這些是 host/build 回歸，不代表 Android 12 真機已測試 v0.6.4。
+`bash tests/run_init_broker_regression.sh` 包含 syscall class、app-private symlink 成功/拒絕、native payload target、symlink 逃逸、link-parent 逃逸、`..` 路徑、已有連結、SIGSYS metadata 與 ptrace/seccomp、ftruncate、tracee cleanup、Java log capture、官方 init/linker/ELF 和 source-contract 回歸。`bash build-native.sh` 另外驗證官方映像、完整 `/system` staging、ABI、APK 簽章與內容。
 
-下一個可驗證里程碑是新真機 log 顯示核心 `si_syscall`/`si_arch`，且 syscall 93 的 app-private guest property-area 檔案調整成功；之後仍須觀察 property service、linker、Zygote 和更後續啟動鏈。除非有同一 trace 的直接證據，不宣稱已達這些階段。
+上述是 host/build 回歸，不代表 v0.6.5 已在 Android 真機執行。v0.6.4 的 trace 在上述 symlink 阻塞處退出並由 supervisor timeout 收束，`tracked=1 reaped=1 unresolved=0`；沒有到 guest linker、Zygote、framework 或 desktop。下一個驗證點是新真機日誌顯示 `GUEST VFS SYMLINK ... target=/system/etc link=/etc result=0`，並觀察 property service 後續、dynamic linker 與 Zygote。即使達到 linker entry，也不等於 Framework 或完整桌面已開機。
 
-Binder、graphics、真實硬體事件與完整 Android service/driver graph 尚未實作。Guest mount、身份、裝置、socket/event 及受限檔案操作只在 app-private 軟體 broker 處理。APK 的本機 debug 簽章與 GitHub Actions 測試簽章不同；Actions 使用明確核准的 throwaway 測試憑證，正式用途不可使用。Artifact 僅包含簽署 APK 和 SHA-256，不包含 keystore。
+Guest mount、身份、裝置、uevent/event 與受限檔案操作仍是 app-private 軟體模型；Binder、graphics、真實硬體事件及完整 service/driver graph 尚未實作。GitHub Actions APK 使用核准的測試簽章，keystore 不進入 APK artifact。

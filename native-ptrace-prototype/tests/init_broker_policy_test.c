@@ -28,7 +28,9 @@ int main(void) {
     assert(guest_syscall_policy(11) == GUEST_SYSCALL_DENY); /* execve uses explicit ELF mediation */
     assert(guest_syscall_policy(102) == GUEST_SYSCALL_VIRTUALIZE); /* software socketcall */
     assert(guest_syscall_policy(168) == GUEST_SYSCALL_VIRTUALIZE); /* software poll */
+    assert(guest_syscall_policy(83) == GUEST_SYSCALL_FILE_OPERATION); /* app-private symlink */
     assert(guest_syscall_policy(93) == GUEST_SYSCALL_FILE_OPERATION); /* app-private ftruncate */
+    assert(guest_syscall_policy(331) == GUEST_SYSCALL_FILE_OPERATION); /* app-private symlinkat */
     assert(guest_syscall_policy(194) == GUEST_SYSCALL_DENY); /* ftruncate64 remains fail-closed until evidenced */
     assert(guest_syscall_policy(26) == GUEST_SYSCALL_DENY);  /* ptrace */
     assert(guest_syscall_policy(218) == GUEST_SYSCALL_DENY); /* pivot_root */

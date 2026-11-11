@@ -36,12 +36,15 @@ static inline void broker_sigsys_mark_response_committed(
 /*
  * The seccomp SIGSYS can be reported either before or after the ptrace syscall
  * exit stop has caused the supervisor to commit and clear its pending result.
- * Keep the correlation latch until that SIGSYS, or until the tracee reaches a
- * subsequent syscall entry, which proves it progressed beyond that operation.
+ * Keep the correlation latch until the supervisor's invalid-syscall placeholder
+ * (si_syscall == -1) is reported, or until a subsequent entry proves progress.
+ * A real seccomp stop for a guest syscall must never be mistaken for this latch.
  */
 static inline int broker_sigsys_take(struct broker_sigsys_candidate *candidate,
-                                     int signal_number, int signal_code) {
-    if (!candidate->armed || signal_number != SIGSYS || signal_code != SYS_SECCOMP)
+                                     int signal_number, int signal_code,
+                                     int seccomp_syscall_number) {
+    if (!candidate->armed || signal_number != SIGSYS || signal_code != SYS_SECCOMP ||
+        seccomp_syscall_number != -1)
         return 0;
     candidate->armed = 0;
     return 1;

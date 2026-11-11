@@ -22,6 +22,7 @@
 #include "ptrace_tracee_cleanup.h"
 #include "guest_uevent_virtual.h"
 #include "guest_file_ops.h"
+#include "guest_symlink_ops.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -226,6 +227,7 @@ static unsigned long virtual_mount_count;
 static unsigned long virtual_device_count;
 static unsigned long virtual_identity_count;
 static unsigned long virtual_file_ops;
+static unsigned long virtual_symlink_ops;
 static unsigned long virtual_socket_calls;
 static unsigned long virtual_poll_waits;
 static unsigned long blocked_process_count;
@@ -441,29 +443,6 @@ static int rewrite_path_arg(pid_t pid, struct compat_pt_regs *regs, unsigned arg
     if (active_tracee && (active_tracee->last_syscall == 5 || active_tracee->last_syscall == 322) &&
         strcmp(guest_out, guest_program) == 0)
         guest_target_path_opens++;
-    return 0;
-}
-
-static int rewrite_symlink(pid_t pid, struct compat_pt_regs *regs, int at_variant) {
-    char target_guest[PATH_MAX], link_guest[PATH_MAX], target_host[PATH_MAX], link_host[PATH_MAX];
-    unsigned link_arg = at_variant ? 2u : 1u;
-    if (at_variant && (int32_t)regs->uregs[1] != -100) return -EACCES;
-    if (read_remote_string(pid, regs->uregs[0], target_guest, sizeof(target_guest)) != 0 ||
-        read_remote_string(pid, regs->uregs[link_arg], link_guest, sizeof(link_guest)) != 0)
-        return -EFAULT;
-    /* Keep pre-mount /system links aimed at the staged image, never the empty
-     * guest mountpoint and never a host-global path. */
-    int rc = map_guest_symlink_target(target_guest, target_host, sizeof(target_host));
-    if (rc != 0) return rc;
-    rc = map_guest_path(link_guest, link_host, sizeof(link_host));
-    if (rc != 0) return rc;
-    uint32_t target_scratch = (regs->uregs[13] - 2u * SCRATCH_BELOW_SP) & ~((uint32_t)sizeof(long) - 1u);
-    uint32_t link_scratch = (regs->uregs[13] - SCRATCH_BELOW_SP) & ~((uint32_t)sizeof(long) - 1u);
-    if (write_remote(pid, target_scratch, target_host, strlen(target_host) + 1) != 0 ||
-        write_remote(pid, link_scratch, link_host, strlen(link_host) + 1) != 0) return -EFAULT;
-    regs->uregs[0] = target_scratch;
-    regs->uregs[link_arg] = link_scratch;
-    path_rewrites += 2;
     return 0;
 }
 
@@ -1119,6 +1098,61 @@ static int guest_path_readonly(const char *path) {
     return 1;
 }
 
+static int32_t mediate_guest_symlink(pid_t pid, const struct compat_pt_regs *regs,
+                                     int at_variant) {
+    char target_guest[PATH_MAX] = "<unreadable>";
+    char link_guest[PATH_MAX] = "<unreadable>";
+    char target_host[PATH_MAX] = "";
+    char link_host[PATH_MAX] = "";
+    const char *target_backing = "<unmapped>";
+    const char *link_backing = "<unmapped>";
+    int32_t result = -EACCES;
+    unsigned link_arg = at_variant ? 2u : 1u;
+    int syscall_number = at_variant ? ARM_NR_SYMLINKAT : ARM_NR_SYMLINK;
+
+    if (at_variant && (int32_t)regs->uregs[1] != -100) goto report;
+    if (read_remote_string(pid, regs->uregs[0], target_guest, sizeof(target_guest)) != 0 ||
+        read_remote_string(pid, regs->uregs[link_arg], link_guest, sizeof(link_guest)) != 0) {
+        result = -EFAULT;
+        goto report;
+    }
+    if (guest_path_readonly(link_guest)) {
+        result = -EROFS;
+        goto report;
+    }
+
+    result = map_guest_symlink_target(target_guest, target_host, sizeof(target_host));
+    if (result != 0) goto report;
+    result = map_guest_path(link_guest, link_host, sizeof(link_host));
+    if (result != 0) goto report;
+    if (!path_is_within(link_host, guest_root)) {
+        result = -EACCES;
+        goto report;
+    }
+    if (path_is_within(target_host, guest_root)) {
+        target_backing = target_host + strlen(guest_root);
+        if (*target_backing == '\0') target_backing = "/";
+    } else if (native_guest_root[0] && path_is_within(target_host, native_guest_root)) {
+        target_backing = "<native-app-private-guest-payload>";
+    } else {
+        result = -EACCES;
+        goto report;
+    }
+    link_backing = link_host + strlen(guest_root);
+    if (*link_backing == '\0') link_backing = "/";
+    result = guest_symlink_create_app_private(target_host, link_host, guest_root,
+                                               native_guest_root);
+    if (active_tracee && active_tracee->pid == pid)
+        snprintf(active_tracee->last_guest_path, sizeof(active_tracee->last_guest_path),
+                 "%s", link_guest);
+
+report:
+    printf("GUEST VFS SYMLINK: host-pid=%d guest-pid=%d syscall=%d target=%s link=%s target-backing=%s link-backing=%s result=%d\n",
+           pid, active_tracee ? active_tracee->guest_pid : 1, syscall_number,
+           target_guest, link_guest, target_backing, link_backing, result);
+    return result;
+}
+
 static int path_operation_writes(const struct compat_pt_regs *regs, int nr) {
     if (nr == ARM_NR_OPEN || nr == ARM_NR_OPENAT) {
         unsigned arg = nr == ARM_NR_OPEN ? 1u : 2u;
@@ -1127,8 +1161,7 @@ static int path_operation_writes(const struct compat_pt_regs *regs, int nr) {
     }
     switch (nr) {
         case ARM_NR_CREAT: case ARM_NR_UNLINK: case ARM_NR_MKDIR: case ARM_NR_RMDIR:
-        case ARM_NR_MKNOD: case ARM_NR_MKNODAT: case ARM_NR_UNLINKAT:
-        case ARM_NR_SYMLINK: case ARM_NR_SYMLINKAT: case ARM_NR_RENAMEAT:
+        case ARM_NR_MKNOD: case ARM_NR_MKNODAT: case ARM_NR_UNLINKAT: case ARM_NR_RENAMEAT:
             return 1;
         default:
             return 0;
@@ -1142,10 +1175,10 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
         case ARM_NR_OPEN: case ARM_NR_CREAT: case ARM_NR_UNLINK: case ARM_NR_CHDIR:
         case ARM_NR_ACCESS: case ARM_NR_MKDIR: case ARM_NR_RMDIR: case ARM_NR_CHMOD:
         case ARM_NR_LCHOWN: case ARM_NR_CHOWN: case ARM_NR_STAT64: case ARM_NR_LSTAT64:
-        case ARM_NR_SYMLINK: case ARM_NR_READLINK: case ARM_NR_MKNOD:
+        case ARM_NR_READLINK: case ARM_NR_MKNOD:
         case ARM_NR_OPENAT: case ARM_NR_MKDIRAT: case ARM_NR_MKNODAT:
         case ARM_NR_FCHOWNAT: case ARM_NR_FSTATAT64: case ARM_NR_UNLINKAT:
-        case ARM_NR_SYMLINKAT: case ARM_NR_READLINKAT: case ARM_NR_FCHMODAT: case ARM_NR_FACCESSAT:
+        case ARM_NR_READLINKAT: case ARM_NR_FCHMODAT: case ARM_NR_FACCESSAT:
         case ARM_NR_CHOWN32: case ARM_NR_LCHOWN32:
             break;
         default:
@@ -1156,16 +1189,6 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
            nr == ARM_NR_READLINKAT || nr == ARM_NR_FCHMODAT || nr == ARM_NR_FACCESSAT)
           ? 1u : 0u;
     char guest[PATH_MAX];
-    if (nr == ARM_NR_SYMLINK || nr == ARM_NR_SYMLINKAT) {
-        char link_guest[PATH_MAX];
-        unsigned link_arg = nr == ARM_NR_SYMLINKAT ? 2u : 1u;
-        if (read_remote_string(pid, regs->uregs[link_arg], link_guest, sizeof(link_guest)) != 0)
-            return -EFAULT;
-        if (guest_path_readonly(link_guest)) return -EROFS;
-        int rc = rewrite_symlink(pid, regs, nr == ARM_NR_SYMLINKAT);
-        if (rc != 0) return rc;
-        return set_regs(pid, regs) == 0 ? 1 : -EFAULT;
-    }
     int rc = rewrite_path_arg(pid, regs, arg, guest, sizeof(guest));
     if (rc != 0) return rc;
     if (active_tracee && active_tracee->pid == pid)
@@ -1305,6 +1328,12 @@ static int dispatch_entry(pid_t pid, struct compat_pt_regs *regs, int nr,
     if (nr == ARM_NR_DUP2 && (int32_t)regs->uregs[1] == GUEST_LINKER_FD) {
         *pending_return = (int32_t)regs->uregs[0] == GUEST_LINKER_FD ? GUEST_LINKER_FD : -EBUSY;
         *fake = 1; return 0;
+    }
+    if (nr == ARM_NR_SYMLINK || nr == ARM_NR_SYMLINKAT) {
+        *pending_return = mediate_guest_symlink(pid, regs, nr == ARM_NR_SYMLINKAT);
+        *fake = 1;
+        virtual_symlink_ops++;
+        return 0;
     }
     if (policy == GUEST_SYSCALL_PATH_REWRITE) {
         int is_virtual = 0;
@@ -1617,7 +1646,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                    state->last_syscall_args[2], state->last_syscall_args[3],
                    state->last_syscall_args[4], state->last_syscall_args[5],
                    live_r7, live_r0, live_pc, signal_regs_rc);
-            if (siginfo_rc == 0 && broker_sigsys_take(&state->broker_sigsys, sig, siginfo_code)) {
+            if (siginfo_rc == 0 && broker_sigsys_take(&state->broker_sigsys, sig,
+                                                       siginfo_code, sigsys_syscall)) {
                 brokered_sigsys_suppressed++;
                 printf("BROKERED SYSCALL SIGSYS SUPPRESSED: pid=%d signal=%d ARM syscall=%d virtual result=%d response-committed=%d wait-status=0x%x si-code=%d\n",
                        waited, sig, state->broker_sigsys.syscall_number,
@@ -1630,8 +1660,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 continue;
             }
             if (state->broker_sigsys.armed) {
-                printf("BROKERED SIGSYS CANDIDATE REJECTED: pid=%d si-code=%d expected-seccomp=%d; forwarding signal\n",
-                       waited, siginfo_code, SYS_SECCOMP);
+                printf("BROKERED SIGSYS CANDIDATE REJECTED: pid=%d si-code=%d si-syscall=%d expected-placeholder-syscall=-1 expected-seccomp=%d; forwarding signal\n",
+                       waited, siginfo_code, sigsys_syscall, SYS_SECCOMP);
                 broker_sigsys_clear(&state->broker_sigsys);
             }
         }
@@ -1732,9 +1762,9 @@ int main(int argc, char **argv) {
     printf("CONTINUOUS PROCESS TREE: fork/clone/vfork events=%lu; guest exec events=%lu; dynamic execs redirected=%lu; kernel entries into original guest linker=%lu; dynamic target main remains unproven; maximum tracees=%d\n",
            process_events, successful_guest_execs, dynamic_exec_allowed_count,
            dynamic_exec_started_count, MAX_TRACEES);
-    printf("SYSCALL ENTRIES: %lu; PATH REWRITES: %lu; VIRTUAL MOUNTS: %lu; VIRTUAL DEVICE/MODE OPS: %lu; VIRTUAL ID OPS: %lu; VIRTUAL FILE OPS: %lu; VIRTUAL SOCKET CALLS: %lu; VIRTUAL POLL WAITS: %lu; BROKERED SIGSYS SUPPRESSED: %lu; BLOCKED PROCESS STARTS: %lu; DENIED: %lu\n",
+    printf("SYSCALL ENTRIES: %lu; PATH REWRITES: %lu; VIRTUAL MOUNTS: %lu; VIRTUAL DEVICE/MODE OPS: %lu; VIRTUAL ID OPS: %lu; VIRTUAL FILE OPS: %lu; VIRTUAL SYMLINK OPS: %lu; VIRTUAL SOCKET CALLS: %lu; VIRTUAL POLL WAITS: %lu; BROKERED SIGSYS SUPPRESSED: %lu; BLOCKED PROCESS STARTS: %lu; DENIED: %lu\n",
            syscall_stops, path_rewrites, virtual_mount_count, virtual_device_count,
-           virtual_identity_count, virtual_file_ops, virtual_socket_calls, virtual_poll_waits,
+           virtual_identity_count, virtual_file_ops, virtual_symlink_ops, virtual_socket_calls, virtual_poll_waits,
            brokered_sigsys_suppressed, blocked_process_count, denied_count);
     printf("VIRTUAL UEVENT SUMMARY: sockets=%lu binds=%lu setsockopt=%lu fd=%d bound=%d; /dev/.coldboot_done opened-by-ueventd=%d; /init wait released=%d; synthetic device events delivered=0\n",
            virtual_uevent_socket_count, virtual_uevent_bind_count,

@@ -116,7 +116,7 @@ int main(void) {
                 broker_sigsys_mark_response_committed(&candidate);
                 response_committed = 1;
             }
-            if (!broker_sigsys_take(&candidate, stop_signal, info.si_code)) {
+            if (!broker_sigsys_take(&candidate, stop_signal, info.si_code, info.si_syscall)) {
                 fprintf(stderr, "seccomp SIGSYS did not match armed broker candidate\n");
                 (void)kill(child, SIGKILL); (void)waitpid(child, NULL, __WALL); return 1;
             }

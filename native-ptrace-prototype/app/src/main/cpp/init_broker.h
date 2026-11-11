@@ -39,12 +39,12 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
 
         /* Absolute guest paths are translated and checked before host execution. */
         case 5: case 8: case 9: case 10: case 12: case 15: case 16: case 33:
-        case 38: case 39: case 40: case 83: case 85: case 92: case 182: case 193:
+        case 38: case 39: case 40: case 85: case 92: case 182: case 193:
         case 195: case 196: case 198: case 212: case 226: case 227: case 228:
         case 229: case 230:
         case 231: case 232: case 233: case 234: case 235: case 236: case 237:
         case 270: case 322: case 323: case 324: case 325: case 326: case 327:
-        case 328: case 329: case 330: case 331: case 332: case 333: case 334:
+        case 328: case 329: case 330: case 332: case 333: case 334:
             return GUEST_SYSCALL_PATH_REWRITE;
 
         /* Simulated IDs/permissions; never change the Android app's credentials. */
@@ -57,8 +57,8 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
         case 215: case 216: case 224:
             return GUEST_SYSCALL_VIRTUALIZE;
 
-        /* ftruncate is brokered against validated app-private guest file descriptors. */
-        case 93:
+        /* Symlinks and ftruncate are brokered only against app-private guest VFS objects. */
+        case 83: case 93: case 331:
             return GUEST_SYSCALL_FILE_OPERATION;
 
         /* Guest mount table only: no host mount(2), umount(2), or pivot_root(2). */

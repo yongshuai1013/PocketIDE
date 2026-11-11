@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <assert.h>
+#include <errno.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -12,8 +13,8 @@ int main(void) {
     /* SIGSYS at the syscall-exit boundary, while the virtual result is pending. */
     broker_sigsys_arm(&candidate, 224, 1);
     assert(candidate.armed && !candidate.response_committed);
-    assert(!broker_sigsys_take(&candidate, SIGSYS, SI_USER));
-    assert(broker_sigsys_take(&candidate, SIGSYS, SYS_SECCOMP));
+    assert(!broker_sigsys_take(&candidate, SIGSYS, SI_USER, -1));
+    assert(broker_sigsys_take(&candidate, SIGSYS, SYS_SECCOMP, -1));
     assert(!candidate.armed);
 
     /* Kernel reports the syscall-exit stop first; pending is then cleared. */
@@ -24,7 +25,7 @@ int main(void) {
     expect_exit = 0;
     broker_sigsys_mark_response_committed(&candidate);
     assert(!pending && !expect_exit && candidate.response_committed);
-    assert(broker_sigsys_take(&candidate, SIGSYS, SYS_SECCOMP));
+    assert(broker_sigsys_take(&candidate, SIGSYS, SYS_SECCOMP, -1));
     assert(!candidate.armed);
 
     /* A later, unrelated guest syscall expires a committed candidate. */
@@ -32,8 +33,16 @@ int main(void) {
     broker_sigsys_mark_response_committed(&candidate);
     assert(broker_sigsys_expire_before_next_entry(&candidate));
     assert(!candidate.armed);
-    assert(!broker_sigsys_take(&candidate, SIGSYS, SYS_SECCOMP));
+    assert(!broker_sigsys_take(&candidate, SIGSYS, SYS_SECCOMP, -1));
 
-    puts("brokered SIGSYS wait-order regression: PASS (both response orderings covered; non-seccomp signals rejected; stale candidate expires)");
+    /* A real syscall-83 seccomp stop is not the supervisor's syscall=-1 placeholder. */
+    broker_sigsys_arm(&candidate, 83, -EACCES);
+    broker_sigsys_mark_response_committed(&candidate);
+    assert(!broker_sigsys_take(&candidate, SIGSYS, SYS_SECCOMP, 83));
+    assert(candidate.armed);
+    assert(broker_sigsys_take(&candidate, SIGSYS, SYS_SECCOMP, -1));
+    assert(!candidate.armed);
+
+    puts("brokered SIGSYS wait-order regression: PASS (both response orderings covered; genuine syscall-83 SIGSYS is not consumed; non-seccomp and stale candidates are rejected)");
     return 0;
 }

@@ -86,9 +86,9 @@ public final class MainActivity extends Activity {
                 + "Host ABI: " + Arrays.toString(Build.SUPPORTED_ABIS) + "\n"
                 + "64-bit app process: " + Process.is64Bit() + "\n"
                 + "Android API: " + Build.VERSION.SDK_INT + "\n"
-                + "Latest confirmed Android 12 device evidence (supplied v0.6.3 trace): the guest-only uevent socket and /dev/.coldboot_done marker worked, and PID 1 passed the coldboot wait. PID 1 then entered ARM syscall 93 immediately before a SYS_SECCOMP SIGSYS; the official API10 property_service uses ftruncate(fd, size) at this point on /dev/__properties__. v0.6.3 did not log kernel si_syscall/si_arch, so v0.6.4 adds those fields and confines the ftruncate model to app-private guest files. No linker, Zygote, framework, or desktop boot was reached. The previous Stop run exited 130, but its Java pipe reader lost the final trace lines; this build retries interrupted reads and only claims native cleanup when unresolved tracees are zero.\n\n"
+                + "Latest confirmed Android 12 device evidence (supplied v0.6.4 trace): the guest-only uevent socket released PID 1 from coldboot wait; ftruncate(fd=4, length=32768) for /dev/__properties__ succeeded in app-private storage. The next real kernel SIGSYS metadata identified ARM EABI syscall 83. Its arguments were decoded against guest memory and the original API10 init action as symlink(\"/system/etc\", \"/etc\"). v0.6.5 brokers that operation in the app-private guest VFS with target/link containment, and only consumes a broker SIGSYS for the supervisor's si_syscall=-1 placeholder; genuine syscall SIGSYS is forwarded. The supplied trace ended by supervisor timeout with all tracked tracees reaped. No guest linker, Zygote, framework, or desktop boot was reached.\n\n"
                 + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer shows a bounded tail; share/save exports the full latest file.\n"
-                + "No trace from this v0.6.4 installation has been recorded yet; the supplied v0.6.3 trace above is historical context.");
+                + "No trace from this v0.6.5 installation has been recorded yet; the v0.6.4 device trace above is historical context.");
     }
 
     private void buildUi() {
