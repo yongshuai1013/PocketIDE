@@ -28,7 +28,7 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
 "$TMP/ptrace_child_stop_queue_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_network_virtual_test.c" -o "$TMP/guest_network_virtual_test"
-"$TMP/guest_network_virtual_test" "$ROOT/app/src/main/assets/api10-system/etc/init.goldfish.sh"
+"$TMP/guest_network_virtual_test" "$GUEST_BASE/system-tree/etc/init.goldfish.sh"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_device_boundary_test.c" -o "$TMP/guest_device_boundary_test"
 "$TMP/guest_device_boundary_test"
@@ -377,7 +377,7 @@ for ioctl in ('GUEST_NET_SIOCSIFADDR', 'GUEST_NET_SIOCSIFNETMASK',
               'guest_net_add_route'):
     assert ioctl in network_test, ioctl
 assert 'guest_network_virtual_test.c' in network_test_runner
-assert 'app/src/main/assets/api10-system/etc/init.goldfish.sh' in network_test_runner
+assert '$GUEST_BASE/system-tree/etc/init.goldfish.sh' in network_test_runner
 for node in ('/dev/null', '/dev/zero', '/dev/full', '/dev/random', '/dev/urandom', '/dev/ashmem', '/dev/binder'):
     assert node in ueventd_rc, node
 assert 'GUEST_MODE_IFCHR 0020000u' in pseudo_device
