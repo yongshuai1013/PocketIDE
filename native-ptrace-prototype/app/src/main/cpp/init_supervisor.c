@@ -28,6 +28,8 @@
 #include "guest_diagnostics.h"
 #include "guest_sigsys_context.h"
 #include "guest_script_launch.h"
+#include "guest_sigprocmask_compat.h"
+#include "guest_sigprocmask_ptrace.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -137,6 +139,7 @@
 #define ARM_NR_PRCTL 172
 #define ARM_NR_RT_SIGRETURN 173
 #define ARM_NR_RT_SIGACTION 174
+#define ARM_NR_SIGPROCMASK 126
 #define ARM_NR_RT_SIGPROCMASK 175
 #define ARM_NR_SIGALTSTACK 186
 #define ARM_NR_VFORK 190
@@ -201,6 +204,7 @@
 #define MAX_EXEC_FAILURE_DIAGNOSTICS 16u
 #define GUEST_DIAGNOSTIC_TEXT_CAPACITY 512u
 #define MAX_SIGSYS_CONTEXT_DIAGNOSTICS 16u
+#define MAX_SIGPROCMASK_DIAGNOSTICS 16u
 #define VIRTUAL_FD_BASE GUEST_VSOCKET_FD_BASE
 #define MAX_VIRTUAL_FDS GUEST_VSOCKET_MAX_FDS
 #define MAX_TRACEES 32
@@ -257,6 +261,10 @@ static unsigned long exec_failure_diagnostics_emitted;
 static unsigned long exec_failure_diagnostics_suppressed;
 static unsigned long sigsys_context_diagnostics_emitted;
 static unsigned long sigsys_context_diagnostics_suppressed;
+static unsigned long guest_sigprocmask_compat_calls;
+static unsigned long guest_sigprocmask_diagnostics_emitted;
+static unsigned long guest_sigprocmask_diagnostics_suppressed;
+static unsigned long guest_sigprocmask_ptrace_failures;
 static unsigned long path_rewrites;
 static unsigned long guest_target_path_opens;
 static unsigned long virtual_mount_count;
@@ -376,6 +384,85 @@ static int write_remote(pid_t pid, uint32_t address, const void *data, size_t le
                    (void *)(uintptr_t)(unsigned long)word) != 0) return -1;
         copied += take;
     }
+    return 0;
+}
+
+struct guest_sigmask_trace_context { pid_t pid; };
+
+static int guest_sigmask_read_u32(void *opaque, uintptr_t address, uint32_t *value) {
+    struct guest_sigmask_trace_context *context = opaque;
+    if (!context || !value || address > UINT32_MAX ||
+        (uint64_t)address + sizeof(*value) - 1u > UINT32_MAX) {
+        errno = EFAULT;
+        return -1;
+    }
+    return read_remote(context->pid, (uint32_t)address, value, sizeof(*value));
+}
+
+static int guest_sigmask_write_u32(void *opaque, uintptr_t address, uint32_t value) {
+    struct guest_sigmask_trace_context *context = opaque;
+    if (!context || address > UINT32_MAX ||
+        (uint64_t)address + sizeof(value) - 1u > UINT32_MAX) {
+        errno = EFAULT;
+        return -1;
+    }
+    return write_remote(context->pid, (uint32_t)address, &value, sizeof(value));
+}
+
+static int guest_sigmask_get(void *opaque, uint64_t *mask) {
+    struct guest_sigmask_trace_context *context = opaque;
+    if (!context) { errno = EINVAL; return -1; }
+    return guest_sigmask_ptrace_get(context->pid, mask);
+}
+
+static int guest_sigmask_set(void *opaque, uint64_t mask) {
+    struct guest_sigmask_trace_context *context = opaque;
+    if (!context) { errno = EINVAL; return -1; }
+    return guest_sigmask_ptrace_set(context->pid, mask);
+}
+
+static int mediate_guest_sigprocmask(pid_t pid, struct tracee_state *state,
+                                     const struct compat_pt_regs *regs,
+                                     int32_t *guest_result) {
+    struct guest_sigmask_trace_context context = { .pid = pid };
+    const struct guest_sigprocmask_ops ops = {
+        .context = &context,
+        .read_u32 = guest_sigmask_read_u32,
+        .write_u32 = guest_sigmask_write_u32,
+        .get_mask = guest_sigmask_get,
+        .set_mask = guest_sigmask_set,
+    };
+    struct guest_sigprocmask_report report;
+    guest_sigprocmask_compat_calls++;
+    if (guest_sigprocmask_compat_apply(&ops, (int32_t)regs->uregs[0],
+            (uintptr_t)regs->uregs[1], (uintptr_t)regs->uregs[2], &report) != 0) {
+        guest_sigprocmask_ptrace_failures++;
+        const char *request = report.internal_request == GUEST_SIGPROCMASK_PTRACE_GET
+            ? "PTRACE_GETSIGMASK" : report.internal_request == GUEST_SIGPROCMASK_PTRACE_SET
+                ? "PTRACE_SETSIGMASK" : "broker-configuration";
+        int saved_errno = report.internal_errno ? report.internal_errno : errno;
+        fprintf(stderr,
+                "GUEST SIGPROCMASK PTRACE FAILURE: host-pid=%d guest-pid=%d syscall=126 how=%d set=0x%08x oldset=0x%08x request=%s errno=%d(%s); refusing fake success\n",
+                pid, state ? state->guest_pid : 0, (int32_t)regs->uregs[0],
+                regs->uregs[1], regs->uregs[2], request, saved_errno,
+                guest_diag_errno_name(saved_errno));
+        errno = saved_errno ? saved_errno : EIO;
+        return -1;
+    }
+    *guest_result = report.result;
+    if (guest_sigprocmask_diagnostics_emitted >= MAX_SIGPROCMASK_DIAGNOSTICS) {
+        guest_sigprocmask_diagnostics_suppressed++;
+        return 0;
+    }
+    guest_sigprocmask_diagnostics_emitted++;
+    int guest_errno = report.result < 0 ? -report.result : 0;
+    printf("GUEST SIGPROCMASK COMPAT: host-pid=%d guest-pid=%d syscall=126 how=%d set=0x%08x oldset=0x%08x requested=0x%08x result=%d errno=%d(%s) mask-read=%d mask-before=0x%016llx mask-after=0x%016llx real-mask-update=%d oldset-write=%d mechanism=PTRACE_GETSIGMASK%s\n",
+           pid, state ? state->guest_pid : 0, report.how,
+           regs->uregs[1], regs->uregs[2], report.requested_set,
+           report.result, guest_errno, guest_diag_errno_name(guest_errno),
+           report.mask_read, (unsigned long long)report.mask_before,
+           (unsigned long long)report.mask_after, report.mask_written,
+           report.old_set_written, report.mask_written ? "/SETSIGMASK" : "");
     return 0;
 }
 
@@ -2043,6 +2130,11 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
                           struct compat_pt_regs *regs, int nr,
                           int32_t *pending_return, int *fake) {
     *fake = 0;
+    if (nr == ARM_NR_SIGPROCMASK) {
+        if (mediate_guest_sigprocmask(pid, state, regs, pending_return) != 0) return -1;
+        *fake = 1;
+        return 0;
+    }
     enum guest_syscall_class policy = guest_syscall_policy(nr);
     if (nr == ARM_NR_EXECVE) {
         char guest_path[PATH_MAX];
@@ -2257,6 +2349,35 @@ static int set_guest_trace_options(pid_t pid) {
                   (void *)(uintptr_t)guest_trace_options()) == 0 ? 0 : -1;
 }
 
+static int probe_tracee_sigmask_api(pid_t pid) {
+    uint64_t initial = 0, verified = 0;
+    if (guest_sigmask_ptrace_get(pid, &initial) != 0) {
+        int saved = errno;
+        fprintf(stderr, "PTRACE_GETSIGMASK probe failed for initial stopped tracee pid=%d size=%zu errno=%d(%s)\n",
+                pid, sizeof(initial), saved, guest_diag_errno_name(saved));
+        errno = saved;
+        return -1;
+    }
+    /* Apply the identical mask once to confirm SETSIGMASK is available before /init runs. */
+    if (guest_sigmask_ptrace_set(pid, initial) != 0) {
+        int saved = errno;
+        fprintf(stderr, "PTRACE_SETSIGMASK probe failed for initial stopped tracee pid=%d size=%zu errno=%d(%s)\n",
+                pid, sizeof(initial), saved, guest_diag_errno_name(saved));
+        errno = saved;
+        return -1;
+    }
+    if (guest_sigmask_ptrace_get(pid, &verified) != 0 || verified != initial) {
+        int saved = errno ? errno : EIO;
+        fprintf(stderr, "PTRACE signal-mask probe changed or could not verify the stopped tracee mask pid=%d errno=%d(%s)\n",
+                pid, saved, guest_diag_errno_name(saved));
+        errno = saved;
+        return -1;
+    }
+    printf("PTRACE SIGNAL MASK API PROBE: pid=%d GETSIGMASK/SETSIGMASK size=%zu real-mask-preserved=1\n",
+           pid, sizeof(initial));
+    return 0;
+}
+
 static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
     int status = 0;
     pid_t waited;
@@ -2265,6 +2386,11 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
         fprintf(stderr, "initial ARM32 /init did not reach successful post-exec SIGTRAP; status=0x%x errno=%d\n",
                 status, errno);
         kill_tracee(pid); return -1;
+    }
+    if (probe_tracee_sigmask_api(pid) != 0) {
+        fprintf(stderr, "legacy ARM sigprocmask compatibility is unavailable; refusing to start /init without real mask operations\n");
+        kill_tracee(pid);
+        return -1;
     }
     saw_exec = 1;
     tracee_count = 0;
@@ -2697,6 +2823,11 @@ int main(int argc, char **argv) {
     printf("SIGSYS CONTEXT DIAGNOSTICS: emitted=%lu suppressed=%lu (limit=%u); non-placeholder SYS_SECCOMP records only; signal forwarding unchanged\n",
            sigsys_context_diagnostics_emitted, sigsys_context_diagnostics_suppressed,
            MAX_SIGSYS_CONTEXT_DIAGNOSTICS);
+    printf("LEGACY SIGPROCMASK COMPAT: syscall=126 calls=%lu diagnostics=%lu suppressed=%lu (limit=%u) ptrace-failures=%lu; real-mask=%s; SIGSYS forwarding unchanged\n",
+           guest_sigprocmask_compat_calls, guest_sigprocmask_diagnostics_emitted,
+           guest_sigprocmask_diagnostics_suppressed, MAX_SIGPROCMASK_DIAGNOSTICS,
+           guest_sigprocmask_ptrace_failures,
+           guest_sigprocmask_ptrace_failures == 0 ? "PTRACE_GETSIGMASK/SETSIGMASK" : "fail-closed");
     printf("VIRTUAL UEVENT SUMMARY: sockets=%lu binds=%lu setsockopt=%lu fd=%d bound=%d; /dev/.coldboot_done opened-by-ueventd=%d; /init wait released=%d; synthetic device events delivered=0\n",
            virtual_uevent_socket_count, virtual_uevent_bind_count,
            virtual_uevent_setsockopt_count, virtual_uevent_fd,

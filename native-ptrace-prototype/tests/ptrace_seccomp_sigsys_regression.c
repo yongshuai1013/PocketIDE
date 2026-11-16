@@ -48,7 +48,7 @@ static int fail_child(pid_t child, const char *what) {
     return 1;
 }
 
-static int test_nonplaceholder_sigsys_is_forwarded(int arm_unrelated_candidate) {
+static int test_nonplaceholder_sigsys_is_forwarded(int unrelated_candidate_syscall) {
     pid_t child = fork();
     if (child < 0) { perror("fork real SIGSYS child"); return 1; }
     if (child == 0) {
@@ -81,8 +81,8 @@ static int test_nonplaceholder_sigsys_is_forwarded(int arm_unrelated_candidate) 
     }
 
     struct broker_sigsys_candidate candidate = {0};
-    if (arm_unrelated_candidate) {
-        broker_sigsys_arm(&candidate, 202, 0);
+    if (unrelated_candidate_syscall > 0) {
+        broker_sigsys_arm(&candidate, unrelated_candidate_syscall, 0);
         broker_sigsys_mark_response_committed(&candidate);
     }
     if (ptrace(PTRACE_SYSCALL, child, NULL, NULL) != 0)
@@ -129,8 +129,9 @@ static int test_nonplaceholder_sigsys_is_forwarded(int arm_unrelated_candidate) 
         fprintf(stderr, "forwarded real SIGSYS did not terminate tracee: status=0x%x\n", status);
         return 1;
     }
-    printf("HOST REAL SIGSYS FORWARDED: syscall=%d candidate-armed=%d response-committed=%d\n",
-           info.si_syscall, arm_unrelated_candidate, arm_unrelated_candidate);
+    printf("HOST REAL SIGSYS FORWARDED: syscall=%d candidate-syscall=%d response-committed=%d\n",
+           info.si_syscall, unrelated_candidate_syscall,
+           unrelated_candidate_syscall > 0);
     return 0;
 }
 
@@ -228,7 +229,8 @@ int main(void) {
     }
     puts("ptrace seccomp SIGSYS regression: PASS (raw delivery stop and SYS_SECCOMP siginfo observed; candidate accepted after pending response commit)");
     if (test_nonplaceholder_sigsys_is_forwarded(0) != 0) return 1;
-    if (test_nonplaceholder_sigsys_is_forwarded(1) != 0) return 1;
-    puts("ptrace non-placeholder SIGSYS regression: PASS (forwarded with no candidate and with an unrelated committed candidate)");
+    if (test_nonplaceholder_sigsys_is_forwarded(202) != 0) return 1;
+    if (test_nonplaceholder_sigsys_is_forwarded(126) != 0) return 1;
+    puts("ptrace non-placeholder SIGSYS regression: PASS (forwarded with no candidate, getegid32 candidate, and legacy sigprocmask candidate)");
     return 0;
 }

@@ -12,6 +12,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/broker_sigsys_state_test.c" -o "$TMP/broker_sigsys_state_test"
 "$TMP/broker_sigsys_state_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_sigprocmask_compat_test.c" -o "$TMP/guest_sigprocmask_compat_test"
+"$TMP/guest_sigprocmask_compat_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_uevent_virtual_test.c" -o "$TMP/guest_uevent_virtual_test"
 "$TMP/guest_uevent_virtual_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -38,6 +41,9 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
   cc -std=c11 -O2 -Wall -Wextra -Werror \
     "$ROOT/tests/ptrace_seccomp_sigsys_regression.c" -o "$TMP/ptrace_seccomp_sigsys_regression"
   "$TMP/ptrace_seccomp_sigsys_regression"
+  cc -std=c11 -O2 -Wall -Wextra -Werror \
+    "$ROOT/tests/ptrace_sigprocmask_seccomp_regression.c" -o "$TMP/ptrace_sigprocmask_seccomp_regression"
+  "$TMP/ptrace_sigprocmask_seccomp_regression"
   cc -std=c11 -O2 -Wall -Wextra -Werror \
     "$ROOT/tests/guest_file_ops_test.c" -o "$TMP/guest_file_ops_test"
   "$TMP/guest_file_ops_test"
@@ -75,6 +81,8 @@ socket_path = Path(sys.argv[1]).with_name('guest_socket_path_ops.h').read_text()
 diagnostics = Path(sys.argv[1]).with_name('guest_diagnostics.h').read_text()
 sigsys_context = Path(sys.argv[1]).with_name('guest_sigsys_context.h').read_text()
 script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
+sigmask_compat = Path(sys.argv[1]).with_name('guest_sigprocmask_compat.h').read_text()
+sigmask_ptrace = Path(sys.argv[1]).with_name('guest_sigprocmask_ptrace.h').read_text()
 activity = Path(sys.argv[2]).read_text()
 capture = Path(sys.argv[2]).with_name('TraceOutputCapture.java').read_text()
 tree_cleanup = Path(sys.argv[2]).with_name('AppPrivateTreeCleanup.java').read_text()
@@ -123,13 +131,31 @@ assert 'close_virtual_fds_on_exec(state)' in src and 'child_state->virtual_fd_ta
 assert 'tracee_owns_virtual_fd' in src and 'GUEST_VSOCKET_POLLNVAL' in src
 diagnostic_test = Path(sys.argv[1]).parents[4] / 'tests/guest_diagnostics_test.c'
 ptrace_sigsys_test = Path(sys.argv[1]).parents[4] / 'tests/ptrace_seccomp_sigsys_regression.c'
+sigmask_test = Path(sys.argv[1]).parents[4] / 'tests/guest_sigprocmask_compat_test.c'
+ptrace_sigmask_test = Path(sys.argv[1]).parents[4] / 'tests/ptrace_sigprocmask_seccomp_regression.c'
 assert 'guest_diag_escape' in diagnostics and 'guest_diag_errno_name' in diagnostics
 assert 'case 126: return "sigprocmask"' in diagnostics
+assert '#define ARM_NR_SIGPROCMASK 126' in src
+assert 'if (nr == ARM_NR_SIGPROCMASK)' in src and 'mediate_guest_sigprocmask(pid, state, regs, pending_return)' in src
+assert 'GUEST SIGPROCMASK COMPAT:' in src and 'GUEST SIGPROCMASK PTRACE FAILURE:' in src
+assert 'refusing fake success' in src and 'PTRACE_GETSIGMASK/SETSIGMASK' in src
+assert 'probe_tracee_sigmask_api(pid)' in trace and 'real-mask-preserved=1' in src
+assert 'guest_sigprocmask_apply_low_word' in sigmask_compat
+assert 'GUEST_ARM_SIGPROCMASK_HIGH_WORD_MASK' in sigmask_compat
+assert 'ops->set_mask(ops->context, after)' in sigmask_compat
+assert 'ops->write_u32(ops->context, old_set_address, report->old_set)' in sigmask_compat
+assert '#define PTRACE_GETSIGMASK 0x420a' in sigmask_ptrace
+assert '#define PTRACE_SETSIGMASK 0x420b' in sigmask_ptrace
+assert 'test_bad_oldset_occurs_after_mask_update' in sigmask_test.read_text()
+assert 'test_ptrace_failures_are_internal_not_guest_success' in sigmask_test.read_text()
+assert 'SYS_rt_sigprocmask' in ptrace_sigmask_test.read_text()
+assert 'pending SIGUSR1 delivered after SIG_UNBLOCK' in ptrace_sigmask_test.read_text()
 assert 'guest_diag_parse_proc_maps_line' in sigsys_context
 assert 'guest_diag_find_proc_map' in sigsys_context and 'guest_diag_read_proc_seccomp_mode' in sigsys_context
 assert '0xafd0bf6c' in diagnostic_test.read_text() and '0xbf6c' in diagnostic_test.read_text()
 assert 'guest_diag_find_proc_map(getpid()' in diagnostic_test.read_text()
 assert 'test_nonplaceholder_sigsys_is_forwarded' in ptrace_sigsys_test.read_text()
+assert 'test_nonplaceholder_sigsys_is_forwarded(126)' in ptrace_sigsys_test.read_text()
 assert 'broker_sigsys_take(&candidate, SIGSYS, info.si_code, info.si_syscall)' in ptrace_sigsys_test.read_text()
 assert 'PTRACE_CONT, child, NULL, (void *)(uintptr_t)SIGSYS' in ptrace_sigsys_test.read_text()
 assert 'MAX_BROKER_DENIAL_DIAGNOSTICS 24u' in src
@@ -366,14 +392,15 @@ assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activ
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'HISTORICAL DEVICE TRACE (user-provided v0.6.11 Android 12 log; not this run)' in activity
-assert 'non-placeholder SYS_SECCOMP SIGSYS for ARM syscall 126 (sigprocmask, r0=0)' in activity
-assert 'prior candidate 202/getegid32 did not match' in activity
-assert 'runtime maps were not recorded' in activity
+assert 'HISTORICAL DEVICE TRACE (user-provided v0.6.12 Android 12 log; not this run)' in activity
+assert 'tracee-seccomp-mode=2' in activity and 'ARM syscall 126 sigprocmask(SIG_BLOCK), r0=0' in activity
+assert 'Runtime maps that PC to APK-extracted /system/lib/libc.so offset 0xbf6c' in activity
+assert 'SHA-256 matches official API10 libc' in activity
+assert 'This proves a genuine seccomp trap, not a broker placeholder' in activity
 assert 'tracked=4, reaped=4, unresolved=0' in activity
 assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
-assert 'No v0.6.12 device trace has been recorded yet' in activity
-assert 'v0.6.12 adds bounded read-only module-map and Seccomp-mode diagnostics only' in activity
+assert 'No v0.6.13 device trace has been recorded yet' in activity
+assert 'v0.6.13 routes only syscall126 through actual PTRACE_GETSIGMASK/SETSIGMASK semantics' in activity
 assert 'network-effects=guest-software-broker-only' in src
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
@@ -410,11 +437,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.12-test-signed-apk' in upload
-assert 'gingervm-v0.6.12-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 21" in gradle and "versionName '0.6.12'" in gradle
+assert 'gingervm-continuous-trace-v0.6.13-test-signed-apk' in upload
+assert 'gingervm-v0.6.13-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 22" in gradle and "versionName '0.6.13'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.12' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.13' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
