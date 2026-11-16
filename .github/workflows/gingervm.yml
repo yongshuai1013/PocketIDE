@@ -62,16 +62,11 @@ jobs:
     name: Build GingerVM v0.6.10 test-signed Android APK
     runs-on: ubuntu-latest
     steps:
-      - name: Mask test signing passphrase in job logs
-        run: |
-          set -euo pipefail
-          TEST_SIGNING_PASS=$(printf '%s' 'YW5kcm9pZA==' | base64 --decode)
-          printf '::add-mask::%s\n' "$TEST_SIGNING_PASS"
-          printf 'GINGERVM_SIGNING_PASSWORD=%s\n' "$TEST_SIGNING_PASS" >> "$GITHUB_ENV"
-          unset TEST_SIGNING_PASS
-
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Mask test signing passphrase in job logs
+        run: bash .github/scripts/mask_gingervm_test_signing.sh
 
       - name: Set up Java 21
         uses: actions/setup-java@v4

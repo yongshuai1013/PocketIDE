@@ -83,6 +83,7 @@ stager = Path(sys.argv[5]).read_text()
 build_path = Path(sys.argv[6]).resolve()
 build = build_path.read_text()
 workflow = (build_path.parents[1] / '.github/workflows/gingervm.yml').read_text()
+signing_mask_script = (build_path.parents[1] / '.github/scripts/mask_gingervm_test_signing.sh').read_text()
 
 # No privileged host mounts or host sockets; guest behavior stays app-private/software-only.
 assert not re.search(r'(?<![A-Za-z0-9_])mount\s*\(', src)
@@ -342,15 +343,22 @@ push_branches = workflow.split('branches:', 1)[1].split('paths:', 1)[0]
 assert '- main' in push_branches and 'validation/gingervm-apk' not in push_branches
 assert 'GINGERVM_SIGNING_KEY_ALIAS: gingervm-test' in workflow
 assert not re.search(r'GINGERVM_SIGNING_PASSWORD:\s*[^\n]+', workflow)
-assert "base64 --decode" in workflow
-assert "printf '::add-mask::%s\\n' \"$TEST_SIGNING_PASS\"" in workflow
+assert 'TEST_SIGNING_PASS' not in workflow
+assert 'base64 --decode' not in workflow
+assert '::add-mask::' not in workflow
 android_job = workflow.split('  android-apk:', 1)[1]
+checkout_step = android_job.index('name: Check out source')
 mask_step = android_job.index('name: Mask test signing passphrase in job logs')
-assert mask_step < android_job.index('name: Check out source')
+assert checkout_step < mask_step
 assert mask_step < android_job.index('name: Set up Android SDK')
-mask_block = android_job.split('name: Mask test signing passphrase in job logs', 1)[1].split('name: Check out source', 1)[0]
-assert 'GINGERVM_SIGNING_PASSWORD:' not in mask_block
-assert 'GINGERVM_SIGNING_PASSWORD=%s' in mask_block and '>> "$GITHUB_ENV"' in mask_block
+mask_block = android_job.split('name: Mask test signing passphrase in job logs', 1)[1].split('name: Set up Java 21', 1)[0]
+assert 'bash .github/scripts/mask_gingervm_test_signing.sh' in mask_block
+assert 'GINGERVM_SIGNING_PASSWORD' not in mask_block and 'TEST_SIGNING_PASS' not in mask_block
+assert 'base64 --decode' not in mask_block
+assert 'base64 --decode' in signing_mask_script
+assert "printf '::add-mask::%s\\n' \"$TEST_SIGNING_PASS\"" in signing_mask_script
+assert 'GINGERVM_SIGNING_PASSWORD=%s' in signing_mask_script and '>> "$GITHUB_ENV"' in signing_mask_script
+assert 'set -x' not in signing_mask_script and 'echo "$TEST_SIGNING_PASS"' not in signing_mask_script
 build_block = android_job.split('name: Build and verify continuous-trace APK', 1)[1].split('name: Remove runner copy of test signing key', 1)[0]
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
