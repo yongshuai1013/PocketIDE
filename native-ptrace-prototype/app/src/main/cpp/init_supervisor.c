@@ -26,6 +26,7 @@
 #include "guest_socket_virtual.h"
 #include "guest_socket_path_ops.h"
 #include "guest_diagnostics.h"
+#include "guest_sigsys_context.h"
 #include "guest_script_launch.h"
 
 #ifndef __WALL
@@ -199,6 +200,7 @@
 #define MAX_BROKER_DENIAL_DIAGNOSTICS 24u
 #define MAX_EXEC_FAILURE_DIAGNOSTICS 16u
 #define GUEST_DIAGNOSTIC_TEXT_CAPACITY 512u
+#define MAX_SIGSYS_CONTEXT_DIAGNOSTICS 16u
 #define VIRTUAL_FD_BASE GUEST_VSOCKET_FD_BASE
 #define MAX_VIRTUAL_FDS GUEST_VSOCKET_MAX_FDS
 #define MAX_TRACEES 32
@@ -253,6 +255,8 @@ static unsigned long broker_denial_diagnostics_emitted;
 static unsigned long broker_denial_diagnostics_suppressed;
 static unsigned long exec_failure_diagnostics_emitted;
 static unsigned long exec_failure_diagnostics_suppressed;
+static unsigned long sigsys_context_diagnostics_emitted;
+static unsigned long sigsys_context_diagnostics_suppressed;
 static unsigned long path_rewrites;
 static unsigned long guest_target_path_opens;
 static unsigned long virtual_mount_count;
@@ -420,6 +424,70 @@ static void log_broker_denial_detail(pid_t host_pid, const struct tracee_state *
             guest_diag_syscall_name(nr), args[0], args[1], args[2], args[3], args[4], args[5],
             safe_path, result, error_number, guest_diag_errno_name(error_number),
             reason ? reason : "unspecified", exe_truncated, path_truncated);
+}
+
+static void log_unbrokered_seccomp_sigsys_context(
+        pid_t host_pid, const struct tracee_state *state, int siginfo_code,
+        int sigsys_syscall, unsigned int sigsys_arch, void *sigsys_call_addr,
+        const struct compat_pt_regs *regs, int regs_rc) {
+    if (sigsys_context_diagnostics_emitted >= MAX_SIGSYS_CONTEXT_DIAGNOSTICS) {
+        sigsys_context_diagnostics_suppressed++;
+        return;
+    }
+    sigsys_context_diagnostics_emitted++;
+
+    const char *exe = state && state->exec_target[0] ? state->exec_target : "<unknown>";
+    const char *script = state && state->exec_script_path[0]
+        ? state->exec_script_path : "<none>";
+    char safe_exe[GUEST_DIAGNOSTIC_TEXT_CAPACITY];
+    char safe_script[GUEST_DIAGNOSTIC_TEXT_CAPACITY];
+    char safe_module[GUEST_DIAGNOSTIC_TEXT_CAPACITY];
+    int exe_truncated = guest_diag_escape(exe, safe_exe, sizeof(safe_exe));
+    int script_truncated = guest_diag_escape(script, safe_script, sizeof(safe_script));
+
+    uint32_t live[6] = {0, 0, 0, 0, 0, 0};
+    uint32_t live_r7 = UINT32_MAX;
+    uint32_t live_pc = (uint32_t)(uintptr_t)sigsys_call_addr;
+    if (regs_rc == 0 && regs) {
+        for (size_t i = 0; i < 6; ++i) live[i] = regs->uregs[i];
+        live_r7 = regs->uregs[7];
+        live_pc = regs->uregs[15];
+    }
+
+    struct guest_diag_proc_map mapping;
+    memset(&mapping, 0, sizeof(mapping));
+    int map_rc = guest_diag_find_proc_map(host_pid, live_pc, &mapping);
+    const char *module = map_rc == 0 ? mapping.path : "<unresolved>";
+    int module_truncated = guest_diag_escape(module, safe_module, sizeof(safe_module));
+    uint64_t module_offset = map_rc == 0
+        ? guest_diag_proc_map_file_offset(&mapping, live_pc) : UINT64_MAX;
+    int seccomp_mode = guest_diag_read_proc_seccomp_mode(host_pid);
+    int candidate_syscall = state ? state->broker_sigsys.syscall_number : -1;
+    int candidate_committed = state ? state->broker_sigsys.response_committed : 0;
+    int candidate_armed = state ? state->broker_sigsys.armed : 0;
+    int last_syscall = state ? state->last_syscall : -1;
+    uint32_t last_args[6] = {0, 0, 0, 0, 0, 0};
+    if (state) memcpy(last_args, state->last_syscall_args, sizeof(last_args));
+
+    printf("GUEST SIGSYS CONTEXT: origin=SYS_SECCOMP host-pid=%d guest-pid=%d guest-executable=\"%s\" guest-script=\"%s\" "
+           "si-code=%d si-syscall=%d(%s) si-arch=0x%08x si-call-addr=0x%08x "
+           "candidate=%d response-committed=%d candidate-syscall=%d(%s) "
+           "last-syscall=%d(%s) last-args=%u,%u,%u,%u,%u,%u "
+           "live-r0=%u live-r1=%u live-r2=%u live-r3=%u live-r4=%u live-r5=%u live-r7=%u live-pc=0x%08x regs-rc=%d "
+           "tracee-seccomp-mode=%d pc-map-rc=%d map=0x%llx-0x%llx perms=%s module-offset=0x%llx mapped-module=\"%s\" truncated=%d,%d,%d\n",
+           host_pid, state ? state->guest_pid : 0, safe_exe, safe_script,
+           siginfo_code, sigsys_syscall, guest_diag_syscall_name(sigsys_syscall),
+           sigsys_arch, (uint32_t)(uintptr_t)sigsys_call_addr,
+           candidate_armed, candidate_committed, candidate_syscall,
+           guest_diag_syscall_name(candidate_syscall), last_syscall,
+           guest_diag_syscall_name(last_syscall), last_args[0], last_args[1],
+           last_args[2], last_args[3], last_args[4], last_args[5],
+           live[0], live[1], live[2], live[3], live[4], live[5], live_r7,
+           live_pc, regs_rc, seccomp_mode, map_rc,
+           (unsigned long long)mapping.start, (unsigned long long)mapping.end,
+           map_rc == 0 ? mapping.permissions : "----",
+           (unsigned long long)module_offset, safe_module,
+           exe_truncated, script_truncated, module_truncated || mapping.path_truncated);
 }
 
 static int guest_exec_failure(const char **failure_reason, const char *reason, int result) {
@@ -2504,6 +2572,11 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 }
                 continue;
             }
+            if (siginfo_rc == 0 && seccomp_details && sigsys_syscall >= 0) {
+                log_unbrokered_seccomp_sigsys_context(waited, state, siginfo_code,
+                    sigsys_syscall, sigsys_arch, sigsys_call_addr,
+                    signal_regs_rc == 0 ? &signal_regs : NULL, signal_regs_rc);
+            }
             if (state->broker_sigsys.armed) {
                 printf("BROKERED SIGSYS CANDIDATE REJECTED: pid=%d si-code=%d si-syscall=%d expected-placeholder-syscall=-1 expected-seccomp=%d; forwarding signal\n",
                        waited, siginfo_code, sigsys_syscall, SYS_SECCOMP);
@@ -2621,6 +2694,9 @@ int main(int argc, char **argv) {
            broker_denial_diagnostics_emitted, broker_denial_diagnostics_suppressed,
            MAX_BROKER_DENIAL_DIAGNOSTICS, exec_failure_diagnostics_emitted,
            exec_failure_diagnostics_suppressed, MAX_EXEC_FAILURE_DIAGNOSTICS);
+    printf("SIGSYS CONTEXT DIAGNOSTICS: emitted=%lu suppressed=%lu (limit=%u); non-placeholder SYS_SECCOMP records only; signal forwarding unchanged\n",
+           sigsys_context_diagnostics_emitted, sigsys_context_diagnostics_suppressed,
+           MAX_SIGSYS_CONTEXT_DIAGNOSTICS);
     printf("VIRTUAL UEVENT SUMMARY: sockets=%lu binds=%lu setsockopt=%lu fd=%d bound=%d; /dev/.coldboot_done opened-by-ueventd=%d; /init wait released=%d; synthetic device events delivered=0\n",
            virtual_uevent_socket_count, virtual_uevent_bind_count,
            virtual_uevent_setsockopt_count, virtual_uevent_fd,

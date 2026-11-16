@@ -71,7 +71,10 @@ static inline const char *guest_diag_syscall_name(int number) {
         case 102: return "socketcall";
         case 114: return "wait4";
         case 120: return "clone";
+        case 126: return "sigprocmask";
         case 168: return "poll";
+        case 175: return "rt_sigprocmask";
+        case 202: return "getegid32";
         case 281: return "socket";
         case 282: return "bind";
         case 283: return "connect";

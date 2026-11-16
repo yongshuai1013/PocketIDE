@@ -73,6 +73,7 @@ uevent = Path(sys.argv[1]).with_name('guest_uevent_virtual.h').read_text()
 socket_model = Path(sys.argv[1]).with_name('guest_socket_virtual.h').read_text()
 socket_path = Path(sys.argv[1]).with_name('guest_socket_path_ops.h').read_text()
 diagnostics = Path(sys.argv[1]).with_name('guest_diagnostics.h').read_text()
+sigsys_context = Path(sys.argv[1]).with_name('guest_sigsys_context.h').read_text()
 script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
 activity = Path(sys.argv[2]).read_text()
 capture = Path(sys.argv[2]).with_name('TraceOutputCapture.java').read_text()
@@ -121,7 +122,16 @@ assert 'guest_socket_marker_create_app_private(host_path, guest_root)' in src
 assert 'close_virtual_fds_on_exec(state)' in src and 'child_state->virtual_fd_table_id' in src
 assert 'tracee_owns_virtual_fd' in src and 'GUEST_VSOCKET_POLLNVAL' in src
 diagnostic_test = Path(sys.argv[1]).parents[4] / 'tests/guest_diagnostics_test.c'
+ptrace_sigsys_test = Path(sys.argv[1]).parents[4] / 'tests/ptrace_seccomp_sigsys_regression.c'
 assert 'guest_diag_escape' in diagnostics and 'guest_diag_errno_name' in diagnostics
+assert 'case 126: return "sigprocmask"' in diagnostics
+assert 'guest_diag_parse_proc_maps_line' in sigsys_context
+assert 'guest_diag_find_proc_map' in sigsys_context and 'guest_diag_read_proc_seccomp_mode' in sigsys_context
+assert '0xafd0bf6c' in diagnostic_test.read_text() and '0xbf6c' in diagnostic_test.read_text()
+assert 'guest_diag_find_proc_map(getpid()' in diagnostic_test.read_text()
+assert 'test_nonplaceholder_sigsys_is_forwarded' in ptrace_sigsys_test.read_text()
+assert 'broker_sigsys_take(&candidate, SIGSYS, info.si_code, info.si_syscall)' in ptrace_sigsys_test.read_text()
+assert 'PTRACE_CONT, child, NULL, (void *)(uintptr_t)SIGSYS' in ptrace_sigsys_test.read_text()
 assert 'MAX_BROKER_DENIAL_DIAGNOSTICS 24u' in src
 assert 'MAX_EXEC_FAILURE_DIAGNOSTICS 16u' in src
 assert 'GUEST EXEC FAILURE DETAIL' in src and 'BROKER DENIED DETAIL' in src
@@ -245,6 +255,12 @@ assert 'si-syscall=%d si-arch=0x%x si-call-addr=%p' in sigsys
 assert 'last-args=%u,%u,%u,%u,%u,%u' in sigsys and 'live-r7=%u live-r0=%u' in sigsys
 assert 'brokered_sigsys_suppressed++' in sigsys and 'resume_trace(waited, 0)' in sigsys
 assert 'BROKERED SYSCALL SIGSYS SUPPRESSED' in sigsys
+assert 'log_unbrokered_seccomp_sigsys_context' in sigsys and 'sigsys_syscall >= 0' in sigsys
+assert sigsys.index('broker_sigsys_take') < sigsys.index('log_unbrokered_seccomp_sigsys_context')
+assert 'guest-executable=' in src and 'mapped-module=' in src and 'tracee-seccomp-mode=' in src
+assert 'SIGSYS CONTEXT DIAGNOSTICS:' in src and 'signal forwarding unchanged' in src
+assert 'MAX_SIGSYS_CONTEXT_DIAGNOSTICS 16u' in src
+assert 'resume_trace(waited, sig)' in trace
 assert 'broker_sigsys_arm(&state->broker_sigsys' in trace
 assert 'broker_sigsys_mark_response_committed(&state->broker_sigsys)' in trace
 assert 'broker_sigsys_expire_before_next_entry(&state->broker_sigsys)' in trace
@@ -350,14 +366,15 @@ assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activ
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'HISTORICAL DEVICE TRACE (user-provided v0.6.10 Android 12 log; not this run)' in activity
-assert 'Guest PID 13 attempted /system/etc/init.goldfish.sh' in activity
+assert 'HISTORICAL DEVICE TRACE (user-provided v0.6.11 Android 12 log; not this run)' in activity
+assert 'non-placeholder SYS_SECCOMP SIGSYS for ARM syscall 126 (sigprocmask, r0=0)' in activity
+assert 'prior candidate 202/getegid32 did not match' in activity
+assert 'runtime maps were not recorded' in activity
 assert 'tracked=4, reaped=4, unresolved=0' in activity
 assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
-assert 'No v0.6.11 device trace has been recorded yet' in activity
-assert 'guest-script-has-no-execute-bit' in activity
-assert 'script mode is 0550' in activity and 'authenticated manifest' in activity
-assert 'does not execute a host shell or perform host networking' in activity
+assert 'No v0.6.12 device trace has been recorded yet' in activity
+assert 'v0.6.12 adds bounded read-only module-map and Seccomp-mode diagnostics only' in activity
+assert 'network-effects=guest-software-broker-only' in src
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
 assert 'android:grantUriPermissions="true"' in manifest and '${applicationId}.trace-logs' in manifest
@@ -393,11 +410,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.11-test-signed-apk' in upload
-assert 'gingervm-v0.6.11-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 20" in gradle and "versionName '0.6.11'" in gradle
+assert 'gingervm-continuous-trace-v0.6.12-test-signed-apk' in upload
+assert 'gingervm-v0.6.12-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 21" in gradle and "versionName '0.6.12'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.11' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.12' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
