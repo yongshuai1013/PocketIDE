@@ -24,6 +24,12 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_tracee_slots_test.c" -o "$TMP/guest_tracee_slots_test"
 "$TMP/guest_tracee_slots_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/ptrace_child_stop_queue_test.c" -o "$TMP/ptrace_child_stop_queue_test"
+"$TMP/ptrace_child_stop_queue_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_network_virtual_test.c" -o "$TMP/guest_network_virtual_test"
+"$TMP/guest_network_virtual_test" "$ROOT/app/src/main/assets/api10-system/etc/init.goldfish.sh"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_device_boundary_test.c" -o "$TMP/guest_device_boundary_test"
 "$TMP/guest_device_boundary_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -80,6 +86,11 @@ if [[ "$(uname -m)" == "x86_64" ]]; then
   cc -std=c11 -O2 -Wall -Wextra -Werror \
     "$ROOT/tests/ptrace_cancel_cleanup_regression.c" -o "$TMP/ptrace_cancel_cleanup_regression"
   "$TMP/ptrace_cancel_cleanup_regression"
+  cc -std=c11 -O2 -Wall -Wextra -Werror \
+    "$ROOT/tests/ptrace_tree_regression.c" -o "$TMP/ptrace_tree_regression"
+  cc -std=c11 -O2 -Wall -Wextra -Werror \
+    "$ROOT/tests/ptrace_tree_tracee.c" -o "$TMP/ptrace_tree_tracee"
+  "$TMP/ptrace_tree_regression" "$TMP/ptrace_tree_tracee"
 else
   echo 'ptrace seccomp/cancellation kernel regressions: SKIP (host tests are x86_64 Linux only)'
 fi
@@ -116,10 +127,14 @@ profile = Path(sys.argv[1]).with_name('guest_hardware_profile.h').read_text()
 pseudo_device = Path(sys.argv[1]).with_name('guest_pseudo_device.h').read_text()
 tracee_slots = Path(sys.argv[1]).with_name('guest_tracee_slots.h').read_text()
 slots_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_tracee_slots_test.c').read_text()
+pending_child_stops = Path(sys.argv[1]).with_name('ptrace_child_stop_queue.h').read_text()
+pending_child_stop_test = Path(sys.argv[1]).parents[4].joinpath('tests/ptrace_child_stop_queue_test.c').read_text()
 device_boundary = Path(sys.argv[1]).with_name('guest_device_boundary.h').read_text()
 sigmask_compat = Path(sys.argv[1]).with_name('guest_sigprocmask_compat.h').read_text()
 sigmask_ptrace = Path(sys.argv[1]).with_name('guest_sigprocmask_ptrace.h').read_text()
 repo_root = Path(sys.argv[1]).parents[4]
+network_test = (repo_root / 'tests/guest_network_virtual_test.c').read_text()
+network_test_runner = (repo_root / 'tests/run_init_broker_regression.sh').read_text()
 guest_image = repo_root / 'guest-image/google-api10-android-2.3.7'
 system_build_prop = (guest_image / 'system-tree/build.prop').read_text()
 ramdisk_default_prop = (guest_image / 'ramdisk-root/default.prop').read_text()
@@ -228,6 +243,18 @@ assert 'guest-executable=' in src and 'errno=%d(%s) reason=%s' in src
 assert 'guest_diag_escape' in src and 'state->last_syscall_args' in src
 assert 'pending_exec_target' in src and 'child_state->exec_target' in src
 assert 'kernel-execve-returned-error-after-path-rewrite' in src
+assert '#include "ptrace_child_stop_queue.h"' in src
+assert 'PTRACE CHILD INITIAL STOP DEFERRED:' in src
+assert 'PTRACE CHILD INITIAL STOP ADOPTED:' in src
+assert 'ptrace_child_stop_queue_take' in src and 'set_guest_trace_options(child_pid)' in src
+assert 'ptrace_child_stop_capacity_available' in src
+assert 'pending_child_stops.entries[i].pid' in src and 'pending_child_stop_queued_for_cleanup' in src
+assert 'ptrace_child_wait_status_is_initial_stop' in pending_child_stops
+assert 'ptrace_child_stop_capacity_available' in pending_child_stops
+assert 'PTRACE_PENDING_CHILD_STOP_LIMIT 32u' in pending_child_stops
+assert 'exact parent-event PID match required' in pending_child_stop_test
+assert 'ptrace_child_stop_queue_take' in pending_child_stop_test
+assert 'test_pending_stops_share_the_tracee_budget' in pending_child_stop_test
 assert '#include "guest_script_launch.h"' in src
 assert 'mediate_guest_script_execve' in src and 'guest_script_path_is_whitelisted(guest)' in src
 assert 'guest_script_file_is_authorized' in src and 'O_NOFOLLOW' in src
@@ -343,6 +370,14 @@ for literal in ('ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up',
                 'route add default gw 10.0.2.2 dev eth0',
                 'net.eth0.dns1 10.0.2.3'):
     assert literal in goldfish_script + goldfish_rc, literal
+assert 'test_staged_init_goldfish_network_sequence' in network_test
+assert 'guest_net_socket_args_valid' in network_test and '== -ENETDOWN' in network_test
+for ioctl in ('GUEST_NET_SIOCSIFADDR', 'GUEST_NET_SIOCSIFNETMASK',
+              'GUEST_NET_SIOCGIFFLAGS', 'GUEST_NET_SIOCSIFFLAGS',
+              'guest_net_add_route'):
+    assert ioctl in network_test, ioctl
+assert 'guest_network_virtual_test.c' in network_test_runner
+assert 'app/src/main/assets/api10-system/etc/init.goldfish.sh' in network_test_runner
 for node in ('/dev/null', '/dev/zero', '/dev/full', '/dev/random', '/dev/urandom', '/dev/ashmem', '/dev/binder'):
     assert node in ueventd_rc, node
 assert 'GUEST_MODE_IFCHR 0020000u' in pseudo_device
@@ -485,7 +520,7 @@ assert 'guestLibraryDir, "/init"' in continuous_run
 assert 'one original /init with its traced child tree' in continuous_run
 assert 'changing only PT_INTERP' in continuous_run and '/proc/self/fd/198' in continuous_run
 assert 'GUEST TARGET ELF CODE PC:' in src and 'this is not proof of C main()' in src
-assert 'A dynamic-linker entry is not proof' in activity
+assert 'A linker entry is not proof of target main, Zygote, framework, desktop or display output' in activity
 assert 'dynamic_executable_count' in activity and 'dynamic_sha256' in activity
 assert 'captured.size() > 192 * 1024' not in activity and 'reader.join(100L)' in activity
 assert 'writeLatestLog(completeLog)' in activity and 'out.getFD().sync()' in activity
@@ -520,18 +555,21 @@ assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activ
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'LATEST DEVICE TRACE (owner-provided v0.6.15 Android 12 log)' in activity
-assert 'Goldfish uevent delivery and coldboot marker/stat release succeeded' in activity
-assert '38 fork/clone/vfork events, 30 guest execs and 29 original linker entries' in activity
-assert 'only e_entry syscall-PC hit identified was /sbin/ueventd' in activity
-assert 'app_process entered the linker but its target executable-code/e_entry was not observed' in activity
-assert 'ARM sendto(290)/recvfrom(292) on the property stream returned ENOSYS' in activity
-assert 'The 32-slot registry stayed within bounds' in activity
-assert 'cleanup unresolved=0' in activity
-assert 'qemud exited 1, but no qemu_pipe open was observed, so its cause is unproven' in activity
-assert 'No host AF_UNIX or network calls were made' in activity
-assert 'This v0.6.15 device trace is the current verified baseline' in activity
-assert 'v0.6.16 mediates only the source-confirmed API10 property sendto/recvfrom stream path' in activity
+assert 'LATEST DEVICE TRACE (owner-provided v0.6.16 Android 12 log)' in activity
+assert 'Goldfish uevent delivery, coldboot marker and PID 1 stat succeeded' in activity
+assert '42 fork/clone/vfork events, 32 guest execs and 31 original linker entries' in activity
+assert 'only ET_EXEC entry hit identified was /sbin/ueventd' in activity
+assert 'app_process entered the linker, but its target-code entry was not observed' in activity
+assert 'property listener bound/listened, but connect/accept/sendto/recvfrom were all 0' in activity
+assert 'old trace killed host PID 14912 as unregistered immediately before a later fork-event record identified the same child PID under guest PID 13' in activity
+assert 'supervisor ended by bounded timeout; cleanup tracked=12/reaped=12/unresolved=0' in activity
+assert 'v0.6.17 defers only recognized ptrace child-initial-stop statuses until an exact parent event PID match' in activity
+assert 'pending children share the same hard 32-slot budget' in activity
+assert 'new device trace must show whether the child is adopted and which guest command runs' in activity
+assert 'app display panel remains an honest no-frame placeholder' in activity
+assert 'no guest Binder/framebuffer backend or guest-originated frame has been observed' in activity
+assert 'No host Binder/framebuffer or synthetic Android screen is used' in activity
+assert 'This v0.6.16 owner-provided device trace is the current verified baseline' in activity
 assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
 assert 'network-effects=guest-software-broker-only' in src
 assert 'guest_tracee_slot_allocate' in src and 'guest_tracee_slot_mark_ptrace_exit' in src
@@ -582,11 +620,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.16-test-signed-apk' in upload
-assert 'gingervm-v0.6.16-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 25" in gradle and "versionName '0.6.16'" in gradle
+assert 'gingervm-continuous-trace-v0.6.17-test-signed-apk' in upload
+assert 'gingervm-v0.6.17-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 26" in gradle and "versionName '0.6.17'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.16' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.17' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

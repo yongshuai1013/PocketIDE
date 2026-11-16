@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include "../app/src/main/cpp/ptrace_child_stop_queue.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -23,6 +24,7 @@ struct traced_child {
 
 static struct traced_child children[MAX_TEST_TRACEES];
 static size_t child_count;
+static struct ptrace_child_stop_queue pending_child_stops;
 
 static struct traced_child *find_child(pid_t pid) {
     for (size_t i = 0; i < child_count; ++i)
@@ -45,6 +47,11 @@ static void kill_tree(void) {
         if (!children[i].alive) continue;
         (void)ptrace(PTRACE_KILL, children[i].pid, NULL, NULL);
         (void)kill(children[i].pid, SIGKILL);
+    }
+    for (size_t i = 0; i < pending_child_stops.count; ++i) {
+        pid_t pid = pending_child_stops.entries[i].pid;
+        (void)ptrace(PTRACE_KILL, pid, NULL, NULL);
+        (void)kill(pid, SIGKILL);
     }
 }
 
@@ -69,6 +76,7 @@ int main(int argc, char **argv) {
     assert(resume_syscall(root, 0) == 0);
 
     unsigned fork_events = 0, exec_events = 0, exits = 0;
+    unsigned deferred_stops = 0, adopted_stops = 0;
     int root_exit = -1;
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
@@ -78,7 +86,12 @@ int main(int argc, char **argv) {
     while (1) {
         size_t alive = 0;
         for (size_t i = 0; i < child_count; ++i) alive += children[i].alive != 0;
-        if (alive == 0) break;
+        if (alive == 0) {
+            if (pending_child_stops.count == 0) break;
+            kill_tree();
+            fprintf(stderr, "orphaned pending child stops=%zu\n", pending_child_stops.count);
+            return 2;
+        }
 
         pid_t waited = waitpid(-1, &status, __WALL | WNOHANG);
         if (waited == 0) {
@@ -101,8 +114,13 @@ int main(int argc, char **argv) {
         }
         struct traced_child *entry = find_child(waited);
         if (!entry) {
+            if (ptrace_child_wait_status_is_initial_stop(status) &&
+                ptrace_child_stop_queue_add(&pending_child_stops, waited, status) == 0) {
+                deferred_stops++;
+                continue;
+            }
             kill_tree();
-            fprintf(stderr, "unregistered child pid=%d\n", waited);
+            fprintf(stderr, "unregistered child pid=%d wait-status=0x%x\n", waited, status);
             return 2;
         }
         if (WIFEXITED(status)) {
@@ -124,8 +142,18 @@ int main(int argc, char **argv) {
             unsigned long child_message = 0;
             assert(ptrace(PTRACE_GETEVENTMSG, waited, NULL, &child_message) == 0);
             pid_t new_pid = (pid_t)child_message;
+            int pending_status = 0;
+            int pending_match = ptrace_child_stop_queue_take(
+                &pending_child_stops, new_pid, &pending_status);
+            assert(pending_match >= 0);
             assert(add_child(new_pid) == 0);
             fork_events++;
+            if (pending_match) {
+                assert(ptrace_child_wait_status_is_initial_stop(pending_status));
+                assert(ptrace(PTRACE_SETOPTIONS, new_pid, NULL, (void *)options) == 0);
+                assert(resume_syscall(new_pid, 0) == 0);
+                adopted_stops++;
+            }
             assert(resume_syscall(waited, 0) == 0);
             continue;
         }
@@ -150,8 +178,9 @@ int main(int argc, char **argv) {
     assert(fork_events >= 1);
     assert(exec_events >= 1);
     assert(exits >= 2);
+    assert(pending_child_stops.count == 0);
     assert(root_exit == 0);
-    printf("host ptrace process-tree regression: PASS (fork events=%u, exec events=%u, exits=%u, parent wait=0)\n",
-           fork_events, exec_events, exits);
+    printf("host ptrace process-tree regression: PASS (fork events=%u, exec events=%u, exits=%u, child-stops-deferred=%u exact-event-adopted=%u, parent wait=0)\n",
+           fork_events, exec_events, exits, deferred_stops, adopted_stops);
     return 0;
 }

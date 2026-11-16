@@ -41,6 +41,7 @@
 #include "guest_entry_probe.h"
 #include "guest_tracee_slots.h"
 #include "guest_device_boundary.h"
+#include "ptrace_child_stop_queue.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -398,6 +399,11 @@ static struct tracee_state tracees[MAX_TRACEES];
 static struct guest_tracee_slot_pool tracee_slot_pool;
 static size_t tracee_count;
 static size_t active_tracee_count;
+static struct ptrace_child_stop_queue pending_child_stops;
+static unsigned long pending_child_stop_deferred;
+static unsigned long pending_child_stop_adopted;
+static unsigned long pending_child_stop_rejected;
+static unsigned long pending_child_stop_queued_for_cleanup;
 static pid_t next_guest_pid = 2;
 static pid_t next_guest_tid = 2;
 static uint32_t next_virtual_fd_table_id = 2;
@@ -2784,10 +2790,13 @@ static void kill_tracee(pid_t pid) {
     (void)waitpid(pid, &status, __WALL);
 }
 static int kill_all_tracees(void) {
-    pid_t pids[MAX_TRACEES];
+    pid_t pids[MAX_TRACEES + PTRACE_PENDING_CHILD_STOP_LIMIT];
     size_t count = 0;
     for (size_t i = 0; i < tracee_count; ++i)
         if (tracees[i].alive) pids[count++] = tracees[i].pid;
+    pending_child_stop_queued_for_cleanup += pending_child_stops.count;
+    for (size_t i = 0; i < pending_child_stops.count; ++i)
+        pids[count++] = pending_child_stops.entries[i].pid;
     struct ptrace_cleanup_result cleanup = ptrace_terminate_and_reap(pids, count);
     printf("TRACE CLEANUP: tracked=%zu reaped=%zu already-gone=%zu unresolved=%zu\n",
            cleanup.requested, cleanup.reaped, cleanup.already_gone, cleanup.unresolved);
@@ -2795,6 +2804,7 @@ static int kill_all_tracees(void) {
     trace_cleanup_unresolved = cleanup.unresolved;
     tracee_count = 0;
     active_tracee_count = 0;
+    memset(&pending_child_stops, 0, sizeof(pending_child_stops));
     active_tracee = NULL;
     traced_pid = -1;
     return cleanup.unresolved == 0 ? 0 : -1;
@@ -3600,6 +3610,9 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
     saw_exec = 1;
     memset(tracees, 0, sizeof(tracees));
     memset(&tracee_slot_pool, 0, sizeof(tracee_slot_pool));
+    memset(&pending_child_stops, 0, sizeof(pending_child_stops));
+    pending_child_stop_deferred = pending_child_stop_adopted = 0;
+    pending_child_stop_rejected = pending_child_stop_queued_for_cleanup = 0;
     tracee_count = 0;
     active_tracee_count = 0;
     next_guest_pid = 2;
@@ -3636,7 +3649,12 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             break;
         }
         if (active_tracee_count == 0) {
-            return 0;
+            if (pending_child_stops.count == 0) return 0;
+            fprintf(stderr, "orphaned pending ptrace child stops=%zu with no registered parent; terminating fail-closed\n",
+                    pending_child_stops.count);
+            pending_child_stop_rejected += pending_child_stops.count;
+            (void)kill_all_tracees();
+            return -1;
         }
         waited = waitpid(-1, &status, __WALL | WNOHANG);
         if (waited == 0) {
@@ -3650,14 +3668,47 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             continue;
         }
         if (waited < 0 && errno == EINTR) continue;
-        if (waited < 0 && errno == ECHILD && active_tracee_count == 0) return 0;
+        if (waited < 0 && errno == ECHILD && active_tracee_count == 0 &&
+            pending_child_stops.count == 0) return 0;
         if (waited < 0) {
             fprintf(stderr, "waitpid on guest process tree failed: errno=%d\n", errno);
             kill_all_tracees(); return -1;
         }
         struct tracee_state *state = find_tracee(waited);
         if (!state) {
-            fprintf(stderr, "unregistered traced pid=%d; killing it fail-closed\n", waited);
+            int wait_event = (unsigned)status >> 16;
+            int wait_signal = WIFSTOPPED(status) ? WSTOPSIG(status) : 0;
+            if (ptrace_child_wait_status_is_initial_stop(status)) {
+                size_t retained = guest_tracee_slot_retained_count(&tracee_slot_pool);
+                if (!ptrace_child_stop_capacity_available(
+                        retained, pending_child_stops.count, MAX_TRACEES)) {
+                    process_limit_hit = 1;
+                    blocked_process_count++;
+                    pending_child_stop_rejected++;
+                    fprintf(stderr, "PROCESS TREE LIMIT: pending child initial stop host-pid=%d wait-status=0x%x retained-unreaped=%zu pending=%zu maximum=%d; refusing untracked child fail-closed\n",
+                            waited, status, retained, pending_child_stops.count,
+                            MAX_TRACEES);
+                    kill_untracked_tracee(waited);
+                    break;
+                }
+                int queue_rc = ptrace_child_stop_queue_add(
+                    &pending_child_stops, waited, status);
+                if (queue_rc == 0) {
+                    pending_child_stop_deferred++;
+                    printf("PTRACE CHILD INITIAL STOP DEFERRED: host-pid=%d wait-status=0x%x signal=%d event=%u pending=%zu; waiting for exact parent PTRACE_EVENT_FORK/VFORK/CLONE match before registration or resume\n",
+                           waited, status, wait_signal, (unsigned)wait_event,
+                           pending_child_stops.count);
+                    continue;
+                }
+                pending_child_stop_rejected++;
+                fprintf(stderr, "cannot defer ptrace child initial stop host-pid=%d wait-status=0x%x errno=%d; killing fail-closed\n",
+                        waited, status, -queue_rc);
+            } else {
+                pending_child_stop_rejected++;
+                fprintf(stderr, "unregistered traced pid=%d wait-status=0x%x stopped=%d signal=%d event=%u; killing fail-closed\n",
+                        waited, status, WIFSTOPPED(status), wait_signal,
+                        (unsigned)wait_event);
+            }
             (void)ptrace(PTRACE_KILL, waited, NULL, NULL);
             (void)kill(waited, SIGKILL);
             continue;
@@ -3719,22 +3770,36 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 kill_all_tracees(); return -1;
             }
             pid_t child_pid = (pid_t)child_message;
+            int pending_child_status = 0;
+            int pending_child_match = ptrace_child_stop_queue_take(
+                &pending_child_stops, child_pid, &pending_child_status);
+            if (pending_child_match < 0) {
+                fprintf(stderr, "invalid deferred child-stop queue for ptrace child=%d\n",
+                        child_pid);
+                kill_all_tracees(); return -1;
+            }
             int child_is_thread = event == PTRACE_EVENT_CLONE &&
                 state->last_syscall == ARM_NR_CLONE && (state->clone_flags & 0x00010000UL);
             pid_t child_guest_pid = child_is_thread ? state->guest_pid : next_guest_pid++;
             pid_t child_guest_tid = child_is_thread ? next_guest_tid++ : child_guest_pid;
             pid_t child_parent_guest_pid = child_is_thread ? state->guest_parent_pid : state->guest_pid;
-            struct tracee_state *child_state = add_tracee(child_pid, 1,
-                child_guest_pid, child_guest_tid, child_parent_guest_pid,
-                child_is_thread);
+            size_t retained_before_admission =
+                guest_tracee_slot_retained_count(&tracee_slot_pool);
+            struct tracee_state *child_state = NULL;
+            if (ptrace_child_stop_capacity_available(retained_before_admission,
+                    pending_child_stops.count, MAX_TRACEES)) {
+                child_state = add_tracee(child_pid, 1, child_guest_pid,
+                    child_guest_tid, child_parent_guest_pid, child_is_thread);
+            }
             if (!child_state) {
                 process_limit_hit = 1;
                 blocked_process_count++;
-                fprintf(stderr, "PROCESS TREE LIMIT: refusing child host-pid=%d guest-pid=%d active=%zu maximum-active=%zu retained-unreaped=%zu slots=%zu/%d; no exited-unreaped record was recycled\n",
+                fprintf(stderr, "PROCESS TREE LIMIT: refusing child host-pid=%d guest-pid=%d active=%zu maximum-active=%zu retained=%zu pending-stops=%zu slots=%zu/%d; no exited-unreaped record was recycled\n",
                         child_pid, child_guest_pid, tracee_slot_pool.active_count,
-                        tracee_slot_pool.maximum_active,
-                        guest_tracee_slot_retained_count(&tracee_slot_pool),
-                        tracee_slot_pool.high_water, MAX_TRACEES);
+                        tracee_slot_pool.maximum_active, retained_before_admission,
+                        pending_child_stops.count, tracee_slot_pool.high_water,
+                        MAX_TRACEES);
+                if (pending_child_match) pending_child_stop_rejected++;
                 kill_untracked_tracee(child_pid);
             } else {
                 int shares_files = event == PTRACE_EVENT_CLONE &&
@@ -3777,6 +3842,26 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                        tracee_slot_pool.high_water,
                        guest_tracee_slot_retained_count(&tracee_slot_pool),
                        tracee_slot_pool.reused_count);
+                if (pending_child_match) {
+                    if (!ptrace_child_wait_status_is_initial_stop(pending_child_status) ||
+                        set_guest_trace_options(child_pid) != 0) {
+                        fprintf(stderr, "cannot configure exact-event-adopted child pid=%d initial-status=0x%x errno=%d\n",
+                                child_pid, pending_child_status, errno);
+                        kill_all_tracees(); return -1;
+                    }
+                    child_state->needs_options = 0;
+                    if (resume_trace(child_pid, 0) != 0) {
+                        fprintf(stderr, "cannot resume exact-event-adopted child pid=%d errno=%d\n",
+                                child_pid, errno);
+                        kill_all_tracees(); return -1;
+                    }
+                    pending_child_stop_adopted++;
+                    printf("PTRACE CHILD INITIAL STOP ADOPTED: parent-host-pid=%d parent-guest-pid=%d child-host-pid=%d child-guest-pid=%d child-wait-status=0x%x event=%s exact-PTRACE_GETEVENTMSG-match=1 options-set=1 resumed=1\n",
+                           waited, state->guest_pid, child_pid, child_guest_pid,
+                           pending_child_status,
+                           event == PTRACE_EVENT_FORK ? "fork" :
+                               event == PTRACE_EVENT_VFORK ? "vfork" : "clone");
+                }
             }
             if (resume_trace(waited, 0) != 0) { kill_all_tracees(); return -1; }
             if (process_limit_hit) {
@@ -4179,6 +4264,10 @@ int main(int argc, char **argv) {
            tracee_slot_pool.maximum_active, tracee_slot_pool.high_water,
            tracee_slot_pool.reused_count, guest_thread_ptrace_exits,
            guest_tracee_slot_retained_count(&tracee_slot_pool), process_limit_hit);
+    printf("PTRACE CHILD STOP ORDER: deferred=%lu exact-event-adopted=%lu rejected=%lu queued-for-cleanup=%lu pending-at-summary=%zu; only an exact parent PTRACE_GETEVENTMSG match resumes an out-of-order child\n",
+           pending_child_stop_deferred, pending_child_stop_adopted,
+           pending_child_stop_rejected, pending_child_stop_queued_for_cleanup,
+           pending_child_stops.count);
     printf("GUEST STARTUP STAGE SUMMARY: original-init-post-exec=%s; original-linker-entry-events=%lu; target-ELF-code-syscall-PCs=%lu; app_process-code-PCs=%lu; ET_EXEC-e_entry-PC-hits=%lu (app_process=%lu ueventd=%lu other=%lu); qemud-execs=%lu exits=%lu last-exit=%d; qemu-props-execs=%lu; C-main/Zygote/framework/system_server/desktop=unproven\n",
            saw_exec ? "observed" : "not-observed", dynamic_exec_started_count,
            guest_target_elf_text_entry_count, guest_app_process_elf_text_entry_count,
