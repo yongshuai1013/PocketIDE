@@ -325,6 +325,26 @@ struct tracee_state {
     uint16_t target_elf_type;
     uint32_t target_elf_entry;
 };
+struct guest_coldboot_marker_runtime {
+    char backing_path[PATH_MAX];
+    pid_t host_pid;
+    pid_t guest_pid;
+    int guest_fd;
+    int fd_valid;
+    int open_seen;
+    int32_t open_result;
+    uint32_t open_flags;
+    uint32_t open_mode;
+    int close_seen;
+    int32_t close_result;
+    unsigned long write_calls;
+    unsigned long fsync_calls;
+    unsigned long fdatasync_calls;
+    int last_lstat_observed;
+    int last_lstat_result;
+    int last_lstat_errno;
+    struct stat last_lstat;
+};
 enum pending_kind { PENDING_NONE, PENDING_RESULT };
 
 static pid_t traced_pid = -1;
@@ -537,6 +557,7 @@ static int virtual_uevent_passcred;
 static int virtual_uevent_rcvbuf_configured;
 static struct guest_uevent_queue guest_uevent_queue;
 static struct guest_coldboot_observation coldboot_observation;
+static struct guest_coldboot_marker_runtime coldboot_marker_runtime;
 static struct guest_network_state guest_network_state;
 static struct guest_path_fd_table guest_path_fds;
 static struct guest_arm32_timezone guest_timezone;
@@ -1034,6 +1055,86 @@ static int map_guest_path(const char *guest, char *host, size_t capacity) {
     return map_guest_physical_path(guest, guest, host, capacity);
 }
 
+static const char *guest_coldboot_file_type(mode_t mode) {
+    if (S_ISREG(mode)) return "regular";
+    if (S_ISDIR(mode)) return "directory";
+    if (S_ISLNK(mode)) return "symlink";
+    if (S_ISCHR(mode)) return "character";
+    if (S_ISBLK(mode)) return "block";
+    if (S_ISFIFO(mode)) return "fifo";
+    if (S_ISSOCK(mode)) return "socket";
+    return "unknown";
+}
+
+static int guest_coldboot_stat_leaf_nofollow(const char *backing_path,
+                                              struct stat *st) {
+    if (!backing_path || !st || !path_is_within(backing_path, guest_root))
+        return -EACCES;
+    char parent[PATH_MAX];
+    size_t path_length = strlen(backing_path);
+    if (path_length == 0 || path_length >= sizeof(parent)) return -ENAMETOOLONG;
+    memcpy(parent, backing_path, path_length + 1u);
+    char *slash = strrchr(parent, '/');
+    if (!slash || !slash[1]) return -EACCES;
+    size_t leaf_length = strlen(slash + 1);
+    if (leaf_length > NAME_MAX) return -ENAMETOOLONG;
+    char leaf[NAME_MAX + 1];
+    memcpy(leaf, slash + 1, leaf_length + 1u);
+    if (slash == parent) slash[1] = '\0';
+    else *slash = '\0';
+    int dirfd = guest_safe_dir_open_beneath_root(guest_root, parent, 0, 0700);
+    if (dirfd < 0) return dirfd;
+    int rc = fstatat(dirfd, leaf, st, AT_SYMLINK_NOFOLLOW);
+    int saved_errno = errno;
+    close(dirfd);
+    return rc == 0 ? 0 : -saved_errno;
+}
+
+static void log_guest_coldboot_marker_snapshot(const char *stage,
+                                                pid_t guest_pid,
+                                                int32_t guest_result,
+                                                const char *backing_path,
+                                                int same_open_backing) {
+    char relative[PATH_MAX] = "<unavailable>";
+    int contained = backing_path && backing_path[0] &&
+        path_is_within(backing_path, guest_root);
+    if (contained) {
+        size_t root_length = strlen(guest_root);
+        const char *suffix = backing_path + root_length;
+        if (*suffix == '\0') suffix = "/";
+        if (snprintf(relative, sizeof(relative), "%s", suffix) >=
+            (int)sizeof(relative)) {
+            contained = 0;
+            snprintf(relative, sizeof(relative), "<too-long>");
+        }
+    }
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    int lstat_result = -1;
+    int metadata_rc = contained
+        ? guest_coldboot_stat_leaf_nofollow(backing_path, &st) : -EACCES;
+    int lstat_errno = metadata_rc == 0 ? 0 : -metadata_rc;
+    if (metadata_rc == 0) lstat_result = 0;
+    const char *type = lstat_result == 0
+        ? guest_coldboot_file_type(st.st_mode) : "missing-or-inaccessible";
+    if (contained && coldboot_marker_runtime.backing_path[0] &&
+        strcmp(backing_path, coldboot_marker_runtime.backing_path) == 0) {
+        coldboot_marker_runtime.last_lstat_observed = 1;
+        coldboot_marker_runtime.last_lstat_result = lstat_result;
+        coldboot_marker_runtime.last_lstat_errno = lstat_errno;
+        if (lstat_result == 0) coldboot_marker_runtime.last_lstat = st;
+        else memset(&coldboot_marker_runtime.last_lstat, 0,
+                    sizeof(coldboot_marker_runtime.last_lstat));
+    }
+    printf("%s: guest-pid=%d path=%s guest-result=%d backing=guest-root:%s contained=%d nofollow-stat-result=%d nofollow-stat-errno=%d leaf-type=%s mode=0%o inode=%llu size=%lld same-open-backing=%d; metadata uses a descriptor-relative fstatat(AT_SYMLINK_NOFOLLOW) walk beneath the app-private root\n",
+           stage, guest_pid, GUEST_COLD_BOOT_MARKER_PATH, guest_result,
+           relative, contained, lstat_result, lstat_errno, type,
+           lstat_result == 0 ? (unsigned)st.st_mode : 0u,
+           lstat_result == 0 ? (unsigned long long)st.st_ino : 0ull,
+           lstat_result == 0 ? (long long)st.st_size : 0ll,
+           same_open_backing);
+}
+
 static int guest_path_lexical_host(const char *guest, char *host, size_t capacity) {
     if (!guest || guest[0] != '/' || guest_path_has_parent(guest) || !host || capacity == 0)
         return -EACCES;
@@ -1172,6 +1273,20 @@ static int rewrite_path_arg(pid_t pid, struct compat_pt_regs *regs, unsigned arg
     char host[PATH_MAX];
     rc = map_guest_path(guest_out, host, sizeof(host));
     if (rc != 0) return rc;
+    struct tracee_state *state = active_tracee && active_tracee->pid == pid
+        ? active_tracee : NULL;
+    if (state && nr == ARM_NR_OPEN &&
+        state->guest_pid != 0 &&
+        strcmp(state->exec_target, "/sbin/ueventd") == 0 &&
+        strcmp(guest_out, GUEST_COLD_BOOT_MARKER_PATH) == 0) {
+        coldboot_marker_runtime.backing_path[0] = '\0';
+        if (path_is_within(host, guest_root)) {
+            snprintf(coldboot_marker_runtime.backing_path,
+                     sizeof(coldboot_marker_runtime.backing_path), "%s", host);
+            coldboot_marker_runtime.host_pid = pid;
+            coldboot_marker_runtime.guest_pid = state->guest_pid;
+        }
+    }
     size_t bytes = strlen(host) + 1;
     if (bytes >= 2048) return -ENAMETOOLONG;
     uint32_t scratch = (regs->uregs[13] - SCRATCH_BELOW_SP) & ~((uint32_t)sizeof(long) - 1u);
@@ -1570,6 +1685,7 @@ static int virtual_mount(pid_t pid, const struct compat_pt_regs *regs) {
         if (marker_len <= 0 || (size_t)marker_len >= sizeof(marker_path)) return -ENAMETOOLONG;
         if (unlink(marker_path) != 0 && errno != ENOENT) return -errno;
         memset(&coldboot_observation, 0, sizeof(coldboot_observation));
+        memset(&coldboot_marker_runtime, 0, sizeof(coldboot_marker_runtime));
         guest_uevent_queue_init(&guest_uevent_queue);
         static const char *const devices[] = {"null", "zero", "full", "random", "urandom",
             "__properties__", "binder", "ashmem", NULL};
@@ -4985,17 +5101,65 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 int marker_release_observed = 0;
                 if (state->last_syscall == ARM_NR_OPEN &&
                     strcmp(state->last_guest_path, GUEST_COLD_BOOT_MARKER_PATH) == 0 &&
-                    syscall_result >= 0) {
-                    marker_release_observed = guest_coldboot_note_marker_open(
+                    strcmp(state->exec_target, "/sbin/ueventd") == 0) {
+                    uint32_t marker_flags = state->last_syscall_args[1];
+                    uint32_t marker_mode = state->last_syscall_args[2];
+                    int was_observed = coldboot_observation.marker_opened_by_ueventd;
+                    (void)guest_coldboot_note_marker_open(
                         &coldboot_observation,
-                        strcmp(state->exec_target, "/sbin/ueventd") == 0,
-                        state->last_guest_path, syscall_result);
-                    printf("GUEST COLD-BOOT MARKER OPEN: host-pid=%d guest-pid=%d executable=%s path=%s fd=%d flags=0x%x create=%d app-private-virtual-dev=%d\n",
+                        1, state->last_guest_path, marker_flags, marker_mode,
+                        syscall_result);
+                    if (!was_observed && coldboot_observation.marker_opened_by_ueventd) {
+                        coldboot_marker_runtime.open_seen = 1;
+                        coldboot_marker_runtime.open_result = syscall_result;
+                        coldboot_marker_runtime.open_flags = marker_flags;
+                        coldboot_marker_runtime.open_mode = marker_mode;
+                        coldboot_marker_runtime.guest_fd = syscall_result;
+                        coldboot_marker_runtime.fd_valid = 1;
+                        coldboot_marker_runtime.host_pid = waited;
+                        coldboot_marker_runtime.guest_pid = state->guest_pid;
+                    }
+                    printf("GUEST COLD-BOOT MARKER OPEN: host-pid=%d guest-pid=%d executable=%s path=%s result=%d fd=%d flags=0x%x mode=0%o create=%d api10-args-match=%d fd-kind=guest-app-private-file virtual-fd=0\n",
                            waited, state->guest_pid, state->exec_target,
-                           state->last_guest_path, syscall_result,
-                           state->last_syscall_args[1],
-                           (state->last_syscall_args[1] & O_CREAT) != 0,
-                           coldboot_observation.marker_opened_by_ueventd);
+                           state->last_guest_path, syscall_result, syscall_result,
+                           marker_flags, marker_mode, (marker_flags & O_CREAT) != 0,
+                           guest_coldboot_marker_open_args_valid(marker_flags,
+                                                                 marker_mode));
+                    char mapped_marker[PATH_MAX];
+                    const char *open_backing = coldboot_marker_runtime.backing_path;
+                    if (!open_backing[0] &&
+                        map_guest_path(state->last_guest_path, mapped_marker,
+                                       sizeof(mapped_marker)) == 0)
+                        open_backing = mapped_marker;
+                    log_guest_coldboot_marker_snapshot(
+                        "GUEST COLD-BOOT MARKER OPEN BACKING", state->guest_pid,
+                        syscall_result, open_backing,
+                        coldboot_marker_runtime.backing_path[0] != '\0' &&
+                        strcmp(open_backing, coldboot_marker_runtime.backing_path) == 0);
+                }
+                if (coldboot_marker_runtime.open_seen &&
+                    coldboot_marker_runtime.fd_valid &&
+                    waited == coldboot_marker_runtime.host_pid &&
+                    (int32_t)state->last_syscall_args[0] ==
+                        coldboot_marker_runtime.guest_fd) {
+                    if (state->last_syscall == ARM_NR_WRITE)
+                        coldboot_marker_runtime.write_calls++;
+                    else if (state->last_syscall == ARM_NR_FSYNC)
+                        coldboot_marker_runtime.fsync_calls++;
+                    else if (state->last_syscall == ARM_NR_FDATASYNC)
+                        coldboot_marker_runtime.fdatasync_calls++;
+                    else if (state->last_syscall == ARM_NR_CLOSE) {
+                        coldboot_marker_runtime.close_seen = 1;
+                        coldboot_marker_runtime.close_result = syscall_result;
+                        (void)guest_coldboot_note_marker_close(
+                            &coldboot_observation,
+                            strcmp(state->exec_target, "/sbin/ueventd") == 0,
+                            (int32_t)state->last_syscall_args[0], syscall_result);
+                        log_guest_coldboot_marker_snapshot(
+                            "GUEST COLD-BOOT MARKER CLOSE", state->guest_pid,
+                            syscall_result, coldboot_marker_runtime.backing_path, 1);
+                        coldboot_marker_runtime.fd_valid = 0;
+                    }
                 }
                 int marker_stat_syscall = state->last_syscall == ARM_NR_STAT64 ||
                     state->last_syscall == ARM_NR_LSTAT64 ||
@@ -5007,23 +5171,48 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                            state->last_syscall,
                            guest_diag_syscall_name(state->last_syscall),
                            syscall_result, state->last_guest_path);
+                    char precheck_backing[PATH_MAX];
+                    int precheck_rc = map_guest_path(state->last_guest_path,
+                        precheck_backing, sizeof(precheck_backing));
+                    log_guest_coldboot_marker_snapshot(
+                        "GUEST UEVENTD COLD-BOOT MARKER PRECHECK BACKING",
+                        state->guest_pid, syscall_result,
+                        precheck_rc == 0 ? precheck_backing : NULL, 0);
                 }
                 if (state->guest_pid == 1 && marker_stat_syscall &&
                     strcmp(state->last_guest_path, GUEST_COLD_BOOT_MARKER_PATH) == 0) {
                     marker_release_observed = guest_coldboot_note_pid1_stat(
                         &coldboot_observation, 1, state->last_guest_path, syscall_result) ||
                         marker_release_observed;
-                    if (coldboot_observation.pid1_stat_checks <= 8)
-                        printf("GUEST COLD-BOOT PID1 STAT: syscall=%d(%s) result=%d path=%s marker-open-by-ueventd=%d stat-success-after-marker=%d checks=%lu\n",
+                    char pid1_marker_backing[PATH_MAX];
+                    int pid1_map_rc = map_guest_path(state->last_guest_path,
+                        pid1_marker_backing, sizeof(pid1_marker_backing));
+                    int same_open_backing = pid1_map_rc == 0 &&
+                        coldboot_marker_runtime.backing_path[0] &&
+                        strcmp(pid1_marker_backing,
+                               coldboot_marker_runtime.backing_path) == 0;
+                    if (coldboot_observation.pid1_stat_checks <= 8 ||
+                        syscall_result == 0)
+                        printf("GUEST COLD-BOOT PID1 STAT: syscall=%d(%s) result=%d path=%s marker-open-by-ueventd=%d stat-success-after-marker=%d checks=%lu same-open-backing=%d marker-close-seen=%d marker-close-result=%d\n",
                                state->last_syscall,
                                guest_diag_syscall_name(state->last_syscall),
                                syscall_result, state->last_guest_path,
                                coldboot_observation.marker_opened_by_ueventd,
                                coldboot_observation.pid1_stat_succeeded_after_marker,
-                               coldboot_observation.pid1_stat_checks);
+                               coldboot_observation.pid1_stat_checks,
+                               same_open_backing,
+                               coldboot_marker_runtime.close_seen,
+                               coldboot_marker_runtime.close_result);
+                    if (coldboot_observation.pid1_stat_checks <= 8 ||
+                        syscall_result == 0)
+                        log_guest_coldboot_marker_snapshot(
+                            "GUEST COLD-BOOT PID1 STAT BACKING", state->guest_pid,
+                            syscall_result,
+                            pid1_map_rc == 0 ? pid1_marker_backing : NULL,
+                            same_open_backing);
                 }
                 if (marker_release_observed)
-                    puts("INIT COLD-BOOT WAIT CONDITION OBSERVED: after ueventd created the guest marker, API10 wait_for_file's PID1 stat(/dev/.coldboot_done) returned 0; source loop condition is satisfied, builtin return itself is not directly traced");
+                    puts("INIT COLD-BOOT WAIT CONDITION OBSERVED: source-shaped ueventd O_WRONLY|O_CREAT mode-0000 marker open succeeded and API10 wait_for_file's PID1 stat(/dev/.coldboot_done) returned 0; the loop condition is satisfied, builtin return itself is not directly traced");
                 if (state->pending) regs.uregs[0] = (uint32_t)state->pending_return;
                 if (state->pending && set_regs(waited, &regs) != 0) { fprintf(stderr, "cannot set virtual return value pid=%d: errno=%d\n", waited, errno); kill_all_tracees(); return -1; }
                 if (state->pending) {
@@ -5159,6 +5348,7 @@ int main(int argc, char **argv) {
     guest_net_state_init(&guest_network_state);
     guest_path_fd_table_init(&guest_path_fds);
     memset(&coldboot_observation, 0, sizeof(coldboot_observation));
+    memset(&coldboot_marker_runtime, 0, sizeof(coldboot_marker_runtime));
     memset(&guest_timezone, 0, sizeof(guest_timezone));
     if (argc != 6 || strcmp(argv[5], "/init") != 0) {
         fprintf(stderr, "usage: gingervm-init-supervisor <original-init-in-native-libs> <app-private-guest-root> <allowed-guest-native-lib-dir> <trace-ms> /init\n");
@@ -5335,6 +5525,46 @@ int main(int argc, char **argv) {
            coldboot_observation.pid1_stat_succeeded_after_marker,
            coldboot_observation.marker_stat_pair_observed,
            coldboot_observation.pid1_stat_checks);
+    char marker_relative[PATH_MAX] = "<unavailable>";
+    int marker_backing_contained = coldboot_marker_runtime.backing_path[0] &&
+        path_is_within(coldboot_marker_runtime.backing_path, guest_root);
+    if (marker_backing_contained) {
+        size_t root_length = strlen(guest_root);
+        const char *suffix = coldboot_marker_runtime.backing_path + root_length;
+        if (*suffix == '\0') suffix = "/";
+        if (snprintf(marker_relative, sizeof(marker_relative), "%s", suffix) >=
+            (int)sizeof(marker_relative)) {
+            marker_backing_contained = 0;
+            snprintf(marker_relative, sizeof(marker_relative), "<too-long>");
+        }
+    }
+    const char *marker_leaf_type = coldboot_marker_runtime.last_lstat_observed &&
+        coldboot_marker_runtime.last_lstat_result == 0
+        ? guest_coldboot_file_type(coldboot_marker_runtime.last_lstat.st_mode)
+        : "not-present-or-inaccessible";
+    printf("GUEST COLD-BOOT MARKER FILE SUMMARY: open-seen=%d flags=0x%x mode-arg=0%o args-match=%d open-result=%d guest-fd=%d close-seen=%d close-result=%d marker-close-observed=%d writes=%lu fsyncs=%lu fdatasyncs=%lu backing-contained=%d backing=guest-root:%s lstat-observed=%d lstat-result=%d lstat-errno=%d leaf-type=%s mode=0%o inode=%llu size=%lld; metadata uses lstat beneath app-private guest root; API10 devices.c performs no marker write/fsync before close\n",
+           coldboot_marker_runtime.open_seen, coldboot_marker_runtime.open_flags,
+           coldboot_marker_runtime.open_mode,
+           guest_coldboot_marker_open_args_valid(
+               coldboot_marker_runtime.open_flags,
+               coldboot_marker_runtime.open_mode),
+           coldboot_marker_runtime.open_result, coldboot_marker_runtime.guest_fd,
+           coldboot_marker_runtime.close_seen, coldboot_marker_runtime.close_result,
+           coldboot_observation.marker_close_observed,
+           coldboot_marker_runtime.write_calls, coldboot_marker_runtime.fsync_calls,
+           coldboot_marker_runtime.fdatasync_calls, marker_backing_contained,
+           marker_relative, coldboot_marker_runtime.last_lstat_observed,
+           coldboot_marker_runtime.last_lstat_result,
+           coldboot_marker_runtime.last_lstat_errno, marker_leaf_type,
+           coldboot_marker_runtime.last_lstat_observed &&
+               coldboot_marker_runtime.last_lstat_result == 0
+                   ? (unsigned)coldboot_marker_runtime.last_lstat.st_mode : 0u,
+           coldboot_marker_runtime.last_lstat_observed &&
+               coldboot_marker_runtime.last_lstat_result == 0
+                   ? (unsigned long long)coldboot_marker_runtime.last_lstat.st_ino : 0ull,
+           coldboot_marker_runtime.last_lstat_observed &&
+               coldboot_marker_runtime.last_lstat_result == 0
+                   ? (long long)coldboot_marker_runtime.last_lstat.st_size : 0ll);
     printf("VIRTUAL PROPERTY STREAM SUMMARY: ARM sendto=%lu bytes=%lu recvfrom=%lu bytes=%lu errors=%lu diagnostics-emitted=%lu (limit=64); fixed API10 setprop request size=128 bytes; sendto/recvfrom supported only with flags=0 and NULL address outputs/inputs\n",
            virtual_property_sendto_count, virtual_property_sendto_bytes,
            virtual_property_recvfrom_count, virtual_property_recvfrom_bytes,
@@ -5349,6 +5579,36 @@ int main(int argc, char **argv) {
            virtual_property_socket_count, virtual_property_bind_count,
            virtual_property_connect_count, virtual_property_accept_count,
            virtual_socketpair_count);
+    if (strcmp(guest_program, "/init") == 0 && (trace_timed_out || trace_cancelled))
+        printf("INIT COLD-BOOT MARKER DETAILS: open-seen=%d open-result=%d flags=0x%x mode=0%o; close-seen=%d close-result=%d writes=%lu fsyncs=%lu fdatasyncs=%lu; final-contained-nofollow-stat-observed=%d result=%d errno=%d type=%s permissions=0%04o inode=%llu size=%lld\n",
+               coldboot_marker_runtime.open_seen,
+               coldboot_marker_runtime.open_result,
+               coldboot_marker_runtime.open_flags,
+               coldboot_marker_runtime.open_mode,
+               coldboot_marker_runtime.close_seen,
+               coldboot_marker_runtime.close_result,
+               coldboot_marker_runtime.write_calls,
+               coldboot_marker_runtime.fsync_calls,
+               coldboot_marker_runtime.fdatasync_calls,
+               coldboot_marker_runtime.last_lstat_observed,
+               coldboot_marker_runtime.last_lstat_result,
+               coldboot_marker_runtime.last_lstat_errno,
+               coldboot_marker_runtime.last_lstat_observed &&
+                       coldboot_marker_runtime.last_lstat_result == 0
+                   ? guest_coldboot_file_type(coldboot_marker_runtime.last_lstat.st_mode)
+                   : "unavailable",
+               coldboot_marker_runtime.last_lstat_observed &&
+                       coldboot_marker_runtime.last_lstat_result == 0
+                   ? (unsigned)(coldboot_marker_runtime.last_lstat.st_mode & 07777u)
+                   : 0u,
+               coldboot_marker_runtime.last_lstat_observed &&
+                       coldboot_marker_runtime.last_lstat_result == 0
+                   ? (unsigned long long)coldboot_marker_runtime.last_lstat.st_ino
+                   : 0ull,
+               coldboot_marker_runtime.last_lstat_observed &&
+                       coldboot_marker_runtime.last_lstat_result == 0
+                   ? (long long)coldboot_marker_runtime.last_lstat.st_size
+                   : 0ll);
     if (strcmp(guest_program, "/init") == 0 && (trace_timed_out || trace_cancelled))
         printf("INIT COLD-BOOT OBSERVATION: marker-open-by-ueventd=%d; PID1-stat-success-after-marker=%d; marker/stat-condition-observed=%d; one source-backed guest eth0 net event is modeled and drained by API10 ueventd during coldboot; wait builtin return is inferred from the API10 source condition, not directly traced\n",
                coldboot_observation.marker_opened_by_ueventd,

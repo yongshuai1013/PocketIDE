@@ -2,6 +2,7 @@
 #define GINGERVM_GUEST_UEVENT_VIRTUAL_H
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -73,6 +74,12 @@ struct guest_uevent_queue {
 
 struct guest_coldboot_observation {
     int marker_opened_by_ueventd;
+    uint32_t marker_open_flags;
+    uint32_t marker_open_mode;
+    int32_t marker_open_fd;
+    int32_t marker_open_result;
+    int marker_close_observed;
+    int32_t marker_close_result;
     int pid1_stat_succeeded_after_marker;
     int marker_stat_pair_observed;
     unsigned long pid1_stat_checks;
@@ -191,15 +198,44 @@ static inline int guest_uevent_enqueue_coldboot_add(
     return (int)length;
 }
 
-/* Returns 1 exactly once both API10 observations have occurred, in either order. */
+static inline int guest_coldboot_marker_open_args_valid(uint32_t flags,
+                                                         uint32_t mode) {
+    uint32_t source_flags = O_WRONLY | O_CREAT;
+    int flags_match = flags == source_flags;
+#ifdef O_LARGEFILE
+    flags_match = flags_match || flags == (source_flags | O_LARGEFILE);
+#endif
+    return flags_match && (mode & 07777u) == 0;
+}
+
+/* API10 devices.c creates the marker with open(O_WRONLY|O_CREAT, 0000). */
 static inline int guest_coldboot_note_marker_open(
         struct guest_coldboot_observation *observation, int is_ueventd,
-        const char *guest_path, int32_t result) {
+        const char *guest_path, uint32_t flags, uint32_t mode,
+        int32_t result) {
     if (!observation || !is_ueventd || !guest_path ||
-        strcmp(guest_path, GUEST_COLD_BOOT_MARKER_PATH) != 0 || result < 0)
+        strcmp(guest_path, GUEST_COLD_BOOT_MARKER_PATH) != 0 || result < 0 ||
+        !guest_coldboot_marker_open_args_valid(flags, mode) ||
+        observation->marker_opened_by_ueventd)
         return 0;
     observation->marker_opened_by_ueventd = 1;
+    observation->marker_open_flags = flags;
+    observation->marker_open_mode = mode;
+    observation->marker_open_fd = result;
+    observation->marker_open_result = result;
     return 0;
+}
+
+static inline int guest_coldboot_note_marker_close(
+        struct guest_coldboot_observation *observation, int is_ueventd,
+        int32_t fd, int32_t result) {
+    if (!observation || !is_ueventd ||
+        !observation->marker_opened_by_ueventd ||
+        fd != observation->marker_open_fd || observation->marker_close_observed)
+        return 0;
+    observation->marker_close_observed = 1;
+    observation->marker_close_result = result;
+    return 1;
 }
 
 static inline int guest_coldboot_note_pid1_stat(

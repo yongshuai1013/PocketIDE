@@ -413,7 +413,19 @@ assert 'GUEST COLD-BOOT PID1 STAT:' in src
 assert 'INIT COLD-BOOT WAIT CONDITION OBSERVED:' in src
 assert 'ARM_NR_FSTATAT64' in src and 'pid1_stat_succeeded_after_marker' in src
 assert 'guest_uevent_note_marker_open' not in src
-assert 'net and graphics sysfs add events remain app-private' in Path(sys.argv[1]).parents[4].joinpath('tests/guest_uevent_virtual_test.c').read_text()
+assert 'GUEST COLD-BOOT MARKER FILE SUMMARY:' in src
+assert 'guest_coldboot_marker_open_args_valid' in src
+assert 'guest_coldboot_note_marker_close' in src
+assert 'guest_safe_dir_open_beneath_root(guest_root, parent, 0, 0700)' in src
+assert 'fstatat(dirfd, leaf, st, AT_SYMLINK_NOFOLLOW)' in src
+assert 'diagnostic uses lstat only' not in src
+assert 'API10 devices.c performs no marker write/fsync before close' in src
+assert 'fdatasyncs=%lu' in src and 'marker-close-seen=%d' in src
+coldboot_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_uevent_virtual_test.c').read_text()
+assert 'test_api10_coldboot_sequence_model_and_marker_persistence' in coldboot_test
+assert 'queue.enqueued == 1 && queue.delivered == 1 && queue.count == 0' in coldboot_test
+assert 'O_WRONLY | O_CREAT' in coldboot_test and 'after.st_ino == opened.st_ino' in coldboot_test
+assert 'API10 guest-only uevent/coldboot sequence-model regression: PASS' in coldboot_test
 assert '#define GUEST_PROFILE_HARDWARE "goldfish"' in profile
 assert '#define GUEST_PROFILE_CPU_COUNT 1u' in profile
 assert 'explicit GingerVM synthetic defaults' in profile
@@ -767,14 +779,14 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.22-test-signed-apk' in upload
-assert 'gingervm-v0.6.22-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 31" in gradle and "versionName '0.6.22'" in gradle
+assert 'gingervm-continuous-trace-v0.6.23-test-signed-apk' in upload
+assert 'gingervm-v0.6.23-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 32" in gradle and "versionName '0.6.23'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.22' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.23' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
