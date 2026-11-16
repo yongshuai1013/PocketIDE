@@ -74,6 +74,11 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      - name: Cache Gradle wrapper and dependencies
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
         with:
