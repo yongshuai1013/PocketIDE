@@ -22,6 +22,7 @@
 
 #define GUEST_NET_IFF_UP 0x0001u
 #define GUEST_NET_IFF_BROADCAST 0x0002u
+#define GUEST_NET_IFF_LOOPBACK 0x0008u
 #define GUEST_NET_IFF_RUNNING 0x0040u
 #define GUEST_NET_IFF_MULTICAST 0x1000u
 #define GUEST_NET_RTF_UP 0x0001u
@@ -71,6 +72,8 @@ _Static_assert(offsetof(struct guest_arm32_rtentry, device_pointer) == 68u,
 
 struct guest_network_state {
     int eth0_present;
+    int lo_present;
+    uint16_t lo_flags;
     int address_set;
     int netmask_set;
     uint16_t flags;
@@ -90,6 +93,8 @@ static inline void guest_net_state_init(struct guest_network_state *state) {
     if (!state) return;
     memset(state, 0, sizeof(*state));
     state->eth0_present = 1;
+    state->lo_present = 1;
+    state->lo_flags = GUEST_NET_IFF_LOOPBACK;
     state->flags = GUEST_NET_IFF_BROADCAST | GUEST_NET_IFF_MULTICAST;
 }
 
@@ -138,11 +143,37 @@ static inline int guest_net_ifreq_has_eth0(const struct guest_arm32_ifreq *reque
            strcmp(request->name, GUEST_PROFILE_NET_IFACE) == 0;
 }
 
+static inline int guest_net_ifreq_has_name(const struct guest_arm32_ifreq *request,
+                                           const char *name) {
+    return request && name && memchr(request->name, '\0', sizeof(request->name)) != NULL &&
+           strcmp(request->name, name) == 0;
+}
+
 static inline int guest_net_apply_ifreq(struct guest_network_state *state,
                                          uint32_t request,
                                          struct guest_arm32_ifreq *ifr) {
     if (!state || !ifr) return -EFAULT;
-    if (!guest_net_ifreq_has_eth0(ifr) || !state->eth0_present) return -ENODEV;
+    int is_lo = guest_net_ifreq_has_name(ifr, "lo");
+    int is_eth0 = guest_net_ifreq_has_eth0(ifr);
+    if (is_lo && state->lo_present) {
+        switch (request) {
+            case GUEST_NET_SIOCGIFFLAGS:
+                ifr->value.flags = state->lo_flags |
+                    ((state->lo_flags & GUEST_NET_IFF_UP) ? GUEST_NET_IFF_RUNNING : 0u);
+                return 0;
+            case GUEST_NET_SIOCSIFFLAGS: {
+                const uint16_t allowed = GUEST_NET_IFF_UP | GUEST_NET_IFF_BROADCAST |
+                                         GUEST_NET_IFF_RUNNING | GUEST_NET_IFF_LOOPBACK;
+                if ((ifr->value.flags & (uint16_t)~allowed) != 0u ||
+                    (ifr->value.flags & GUEST_NET_IFF_LOOPBACK) == 0u) return -EINVAL;
+                state->lo_flags = ifr->value.flags;
+                return 0;
+            }
+            default:
+                return -EOPNOTSUPP;
+        }
+    }
+    if (!is_eth0 || !state->eth0_present) return -ENODEV;
     uint8_t address[4];
     switch (request) {
         case GUEST_NET_SIOCGIFFLAGS:

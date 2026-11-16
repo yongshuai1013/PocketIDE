@@ -21,6 +21,12 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_process_compat_test.c" -o "$TMP/guest_process_compat_test"
 "$TMP/guest_process_compat_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_tracee_slots_test.c" -o "$TMP/guest_tracee_slots_test"
+"$TMP/guest_tracee_slots_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_device_boundary_test.c" -o "$TMP/guest_device_boundary_test"
+"$TMP/guest_device_boundary_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_uevent_virtual_test.c" -o "$TMP/guest_uevent_virtual_test"
 "$TMP/guest_uevent_virtual_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -103,6 +109,9 @@ sigsys_context = Path(sys.argv[1]).with_name('guest_sigsys_context.h').read_text
 script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
 profile = Path(sys.argv[1]).with_name('guest_hardware_profile.h').read_text()
 pseudo_device = Path(sys.argv[1]).with_name('guest_pseudo_device.h').read_text()
+tracee_slots = Path(sys.argv[1]).with_name('guest_tracee_slots.h').read_text()
+slots_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_tracee_slots_test.c').read_text()
+device_boundary = Path(sys.argv[1]).with_name('guest_device_boundary.h').read_text()
 sigmask_compat = Path(sys.argv[1]).with_name('guest_sigprocmask_compat.h').read_text()
 sigmask_ptrace = Path(sys.argv[1]).with_name('guest_sigprocmask_ptrace.h').read_text()
 repo_root = Path(sys.argv[1]).parents[4]
@@ -154,7 +163,8 @@ assert 'guest_vsocket_poll_events(' in src and '&guest_sockets, fd, fds[i].event
 assert 'VIRTUAL PROPERTY SOCKET CREATE:' in src and 'VIRTUAL PROPERTY BIND:' in src
 assert 'VIRTUAL PROPERTY LISTEN:' in src and 'VIRTUAL PROPERTY ACCEPT:' in src
 assert 'VIRTUAL PROPERTY CONNECT:' in src and 'VIRTUAL PROPERTY SO_PEERCRED:' in src
-assert 'VIRTUAL SIGNAL SOCKETPAIR:' in src and 'VIRTUAL PROPERTY RECV:' in src
+assert 'VIRTUAL SIGNAL SOCKETPAIR:' in src and 'VIRTUAL GUEST SOCKET IO:' in src
+assert 'endpoint=%s direction=%s' in src and 'sigchld-socketpair' in src
 assert 'guest_socket_marker_create_app_private(host_path, guest_root)' in src
 assert 'close_virtual_fds_on_exec(state)' in src and 'child_state->virtual_fd_table_id' in src
 assert 'tracee_owns_virtual_fd' in src and 'GUEST_VSOCKET_POLLNVAL' in src
@@ -243,7 +253,31 @@ assert '"mode": source_mode' in stager
 assert '0550' in mode_test.read_text() and 'final-link.sh' in mode_test.read_text()
 assert 'outside-parent/outside.sh' in mode_test.read_text() and '../outside.sh' in mode_test.read_text()
 assert 'GUEST STARTUP STAGE: linker-entry=observed' in src
-assert 'GUEST TARGET ELF TEXT ENTRY:' in src and 'C main() symbol is not inferred' in src
+assert 'GUEST TARGET ELF CODE PC:' in src and 'this is not proof of C main()' in src
+assert 'GUEST TARGET ELF ENTRY METADATA:' in src and 'metadata only' in src
+assert 'pending_exec_backing_path' in src and 'exec_backing_path' in src
+assert 'guest_elf32_arm_entrypoint' in src and 'e_entry-PC-at-syscall' in src
+assert 'GUEST SIGCHLD FORWARDED:' in src and 'count_unreaped_guest_children' in src
+assert 'GUEST CHILD EXIT STATUS:' in src and 'GUEST WAIT4 ABI:' in src
+assert 'GUEST WAIT4 REAP:' in src and 'guest_wait4_calls' in src
+assert '#define ARM_NR_WAIT4 114' in src and 'ARM_NR_WAITPID' not in src
+assert 'guest_syscall_policy(7) == GUEST_SYSCALL_DENY' in Path(sys.argv[1]).parents[4].joinpath('tests/init_broker_policy_test.c').read_text()
+assert 'GUEST EMULATOR SERVICE EXEC:' in src and 'GUEST EMULATOR SERVICE EXIT:' in src
+assert 'guest_qemud_exec_count' in src and 'guest_qemu_props_exec_count' in src
+assert 'PROCESS TREE LIMIT: refusing child host-pid=' in src
+assert 'guest_tracee_slot_allocate(&tracee_slot_pool)' in src
+assert 'guest_tracee_slot_mark_reaped(&tracee_slot_pool' in src
+assert 'TRACE REGISTRY: hard-cap=' in src and 'maximum-active=' in src
+assert 'test_trace_lifetime_pressure_requires_guest_reap' in Path(sys.argv[1]).parents[4].joinpath('tests/guest_tracee_slots_test.c').read_text()
+assert 'test_api10_ifup_lo_flags_are_guest_only' in Path(sys.argv[1]).parents[4].joinpath('tests/guest_network_virtual_test.c').read_text()
+assert 'GUEST DEVICE BACKEND DENIED:' in src and 'guest_device_unimplemented_reason(guest)' in src
+assert 'pty-kernel-backend-not-implemented' in device_boundary
+assert 'binder-kernel-backend-not-implemented' in device_boundary
+assert 'ashmem-kernel-backend-not-implemented' in device_boundary
+assert 'goldfish-emulator-pipe-backend-not-implemented' in device_boundary
+assert 'GUEST URANDOM READ:' in src and 'syscall(SYS_getrandom' in src
+assert 'guest_pseudo_device_read_urandom' in src and 'GUEST_URANDOM_MAX_READ_BYTES' in pseudo_device
+assert 'GUEST RANDOM DEVICE OP UNSUPPORTED:' in src
 assert 'GUEST STARTUP STAGE SUMMARY' in src and 'BROKER DIAGNOSTIC SUMMARY' in src
 assert 'guest_diag_escape("bad\\n\\033\\\"path"' in diagnostic_test.read_text()
 assert 'GUEST_VSOCKET_MAX_FDS 32' in socket_model
@@ -426,7 +460,7 @@ assert continuous_run.count('runNative(') == 1
 assert 'guestLibraryDir, "/init"' in continuous_run
 assert 'one original /init with its traced child tree' in continuous_run
 assert 'changing only PT_INTERP' in continuous_run and '/proc/self/fd/198' in continuous_run
-assert 'GUEST TARGET ELF TEXT ENTRY:' in src and 'C main() symbol is not inferred' in src
+assert 'GUEST TARGET ELF CODE PC:' in src and 'this is not proof of C main()' in src
 assert 'A dynamic-linker entry is not proof' in activity
 assert 'dynamic_executable_count' in activity and 'dynamic_sha256' in activity
 assert 'captured.size() > 192 * 1024' not in activity and 'reader.join(100L)' in activity
@@ -462,17 +496,31 @@ assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activ
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'LATEST DEVICE TRACE (user-provided v0.6.13 Android 12 log; historical evidence)' in activity
-assert "PID1's successful stat of that marker after creation was not recorded" in activity
-assert 'v0.6.14 source adds a deterministic app-private no-device uevent fixture' in activity
-assert 'Syscall126 compatibility passed (11 calls, all result=0; real signal masks preserved)' in activity
-assert 'No synthetic device event was delivered' in activity
-assert 'denied ARM syscalls 67 sigaction, 57 setpgid and 79 settimeofday' in activity
-assert 'tracked=4, reaped=4, unresolved=0' in activity
+assert 'LATEST DEVICE TRACE (owner-provided v0.6.14 Android 12 log)' in activity
+assert "PID1's post-marker stat succeeded" in activity
+assert '31 fork/clone/vfork events, 25 guest execs and 24 original linker entries' in activity
+assert 'Target executable-code/e_entry hits were 0' in activity
+assert 'monotonic 32-record tracee registry' in activity
+assert 'tracked=17, reaped=13, already-gone=4, unresolved=0' in activity
+assert 'ifup lo returning ENODEV' in activity and '/dev/urandom reads returning EOPNOTSUPP' in activity
+assert 'process slots need ptrace exit plus guest wait4 reap; non-waitable thread slots need ptrace-confirmed terminal exit' in activity
+assert 'This v0.6.14 device trace is the current verified baseline' in activity
+assert 'v0.6.15 retains process slots until ptrace exit plus guest wait4 reap' in activity
 assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
-assert 'No v0.6.14 device trace has been recorded yet' in activity
-assert 'v0.6.14 adds source-backed guest-only uevent and syscall compatibility' in activity
 assert 'network-effects=guest-software-broker-only' in src
+assert 'guest_tracee_slot_allocate' in src and 'guest_tracee_slot_mark_ptrace_exit' in src
+assert 'guest_wait_status_pending = !tracees[i].guest_reaped' in src
+assert 'GUEST THREAD TRACE RELEASE:' in src
+assert 'guest_wait_status_is_terminal' in src and 'GUEST WAIT4 REAP:' in src
+assert 'VIRTUAL GUEST SOCKET IO:' in src and 'sigchld-socketpair' in src
+assert 'GUEST SETRLIMIT:' in src and 'GUEST IOPRIO_SET:' in src and 'GUEST GETPGID:' in src
+process_compat = Path(sys.argv[1]).with_name('guest_process_compat.h').read_text()
+assert 'GUEST_IOPRIO_CLASS_IDLE && data == 0u' in process_compat
+assert 'GUEST URANDOM READ:' in src and 'getrandom(GRND_NONBLOCK)' in src
+assert 'unknown-guest-dev-node-fails-closed' in device_boundary
+assert 'api10-ueventd-declared-hardware-backend-not-implemented' in device_boundary
+assert 'guest_wait_status_is_terminal(0x7fu)' in slots_test
+assert 'guest_tracee_slot_mark_ptrace_exit(&pool, (size_t)thread_slot, 0)' in slots_test
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
 assert 'android:grantUriPermissions="true"' in manifest and '${applicationId}.trace-logs' in manifest
@@ -508,11 +556,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.14-test-signed-apk' in upload
-assert 'gingervm-v0.6.14-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 23" in gradle and "versionName '0.6.14'" in gradle
+assert 'gingervm-continuous-trace-v0.6.15-test-signed-apk' in upload
+assert 'gingervm-v0.6.15-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 24" in gradle and "versionName '0.6.15'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.14' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.15' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

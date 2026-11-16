@@ -12,6 +12,9 @@
 
 #define GUEST_ARM32_STAT64_BYTES 96u
 #define GUEST_MODE_IFCHR 0020000u
+#define GUEST_URANDOM_MAX_READ_BYTES 256u
+
+typedef int (*guest_entropy_fill_fn)(void *context, unsigned char *out, size_t length);
 
 struct guest_pseudo_device_metadata {
     enum virtual_fd_kind kind;
@@ -67,6 +70,29 @@ static inline int guest_pseudo_device_read(enum virtual_fd_kind kind,
     if (length > (size_t)INT32_MAX) return -EINVAL;
     memset(out, 0, length);
     return (int)length;
+}
+
+/* Only the API10 /dev/urandom minor may use this explicit entropy provider.
+ * This helper never opens a host device and bounds one broker call. */
+static inline int guest_pseudo_device_read_urandom(uint32_t minor,
+                                                   unsigned char *out,
+                                                   size_t requested,
+                                                   size_t capacity,
+                                                   guest_entropy_fill_fn fill,
+                                                   void *context) {
+    if (requested == 0u) return 0;
+    if (minor == 8u) return -EOPNOTSUPP; /* blocking /dev/random is not emulated */
+    if (minor != 9u) return -ENODEV;
+    if (!out || !fill || capacity == 0u) return -EFAULT;
+    if (requested > (size_t)INT32_MAX) return -EINVAL;
+    size_t amount = requested;
+    if (amount > capacity) amount = capacity;
+    if (amount > GUEST_URANDOM_MAX_READ_BYTES) amount = GUEST_URANDOM_MAX_READ_BYTES;
+    int result = fill(context, out, amount);
+    if (result < 0) return result;
+    if ((size_t)result > amount) return -EIO;
+    if (result == 0) return -EAGAIN;
+    return result;
 }
 
 static inline int guest_pseudo_device_write(enum virtual_fd_kind kind,

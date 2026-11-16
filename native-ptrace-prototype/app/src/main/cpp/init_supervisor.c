@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -38,6 +39,8 @@
 #include "guest_pseudo_device.h"
 #include "guest_path_fd.h"
 #include "guest_entry_probe.h"
+#include "guest_tracee_slots.h"
+#include "guest_device_boundary.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -111,6 +114,9 @@
 #define ARM_NR_FCNTL64 221
 #define ARM_NR_GETPPID 64
 #define ARM_NR_SIGACTION 67
+#define ARM_NR_SETRLIMIT 75
+#define ARM_NR_GETPGID 132
+#define ARM_NR_IOPRIO_SET 314
 #define ARM_NR_SETGID 46
 #define ARM_NR_GETGID 47
 #define ARM_NR_GETEUID 49
@@ -226,6 +232,16 @@
 #define MAX_VIRTUAL_FDS GUEST_VSOCKET_MAX_FDS
 #define MAX_TRACEES 32
 #define GUEST_LINKER_FD 198
+#define GUEST_RANDOM_GRND_NONBLOCK 0x0001u
+#ifndef SYS_getrandom
+#if defined(__aarch64__)
+#define SYS_getrandom 278
+#elif defined(__x86_64__)
+#define SYS_getrandom 318
+#else
+#error "No audited host getrandom syscall number for this supervisor ABI"
+#endif
+#endif
 
 struct compat_pt_regs { uint32_t uregs[18]; };
 struct guest_mount { char target[PATH_MAX]; char backing[PATH_MAX]; };
@@ -243,6 +259,7 @@ struct tracee_state {
     uint32_t guest_euid;
     uint32_t guest_rgid;
     uint32_t guest_egid;
+    struct guest_process_compat_state process_compat;
     int alive;
     int is_thread;
     int guest_reaped;
@@ -259,7 +276,9 @@ struct tracee_state {
     char guest_cwd[GUEST_PATH_FD_PATH_CAPACITY];
     char last_guest_path[PATH_MAX];
     char exec_target[PATH_MAX];
+    char exec_backing_path[PATH_MAX];
     char pending_exec_target[PATH_MAX];
+    char pending_exec_backing_path[PATH_MAX];
     char exec_script_path[PATH_MAX];
     char pending_exec_script[PATH_MAX];
     int sigaction_compat_pending;
@@ -268,6 +287,10 @@ struct tracee_state {
     int target_elf_text_seen;
     uint32_t target_elf_text_pc;
     uint64_t target_elf_text_file_offset;
+    int target_elf_entry_valid;
+    int target_elf_entry_pc_seen;
+    uint16_t target_elf_type;
+    uint32_t target_elf_entry;
 };
 enum pending_kind { PENDING_NONE, PENDING_RESULT };
 
@@ -338,7 +361,20 @@ static unsigned long guest_sigaction_compat_calls;
 static unsigned long guest_sigaction_compat_failures;
 static unsigned long guest_setpgid_calls;
 static unsigned long guest_timezone_calls;
+static unsigned long guest_setrlimit_calls;
+static unsigned long guest_ioprio_set_calls;
+static unsigned long guest_getpgid_calls;
+static unsigned long guest_wait4_calls;
+static unsigned long guest_wait4_reap_diagnostics;
+static unsigned long guest_sigchld_deliveries;
+static size_t guest_unreaped_child_peak;
+static unsigned long guest_thread_ptrace_exits;
+static unsigned long guest_qemud_exec_count;
+static unsigned long guest_qemu_props_exec_count;
+static unsigned long guest_qemud_exit_count;
+static int guest_qemud_last_exit_code = -1;
 static unsigned long guest_target_elf_text_entry_count;
+static unsigned long guest_target_elf_declared_entry_pc_count;
 static unsigned long guest_shell_elf_text_entry_count;
 static unsigned long guest_app_process_elf_text_entry_count;
 static int saw_exec;
@@ -350,6 +386,7 @@ static size_t trace_cleanup_unresolved;
 static int guest_root_readonly;
 static int guest_system_readonly;
 static struct tracee_state tracees[MAX_TRACEES];
+static struct guest_tracee_slot_pool tracee_slot_pool;
 static size_t tracee_count;
 static size_t active_tracee_count;
 static pid_t next_guest_pid = 2;
@@ -819,20 +856,28 @@ static int guest_pseudo_device_backing_present(const char *guest) {
 static void observe_guest_target_elf_text(pid_t host_pid,
                                           struct tracee_state *state,
                                           const struct compat_pt_regs *regs) {
-    if (!state || !regs || state->target_elf_text_seen || !state->exec_target[0]) return;
+    if (!state || !regs || state->target_elf_text_seen ||
+        !state->exec_target[0] || !state->exec_backing_path[0]) return;
     uint32_t pc = regs->uregs[15] & ~1u;
     struct guest_diag_proc_map mapping;
     memset(&mapping, 0, sizeof(mapping));
     if (guest_diag_find_proc_map(host_pid, pc, &mapping) != 0) return;
-    char expected[PATH_MAX], canonical_expected[PATH_MAX];
-    if (map_guest_path(state->exec_target, expected, sizeof(expected)) != 0) return;
-    int match = guest_entry_mapping_matches(mapping.path, expected, mapping.permissions);
-    if (!match && realpath(expected, canonical_expected))
-        match = guest_entry_mapping_matches(mapping.path, canonical_expected, mapping.permissions);
+    char canonical_expected[PATH_MAX];
+    int match = guest_entry_mapping_matches(mapping.path, state->exec_backing_path,
+                                             mapping.permissions);
+    if (!match && realpath(state->exec_backing_path, canonical_expected))
+        match = guest_entry_mapping_matches(mapping.path, canonical_expected,
+                                             mapping.permissions);
     if (!match) return;
     state->target_elf_text_seen = 1;
     state->target_elf_text_pc = pc;
     state->target_elf_text_file_offset = guest_diag_proc_map_file_offset(&mapping, pc);
+    int exact_entry_pc = state->target_elf_entry_valid &&
+        state->target_elf_type == ET_EXEC && pc == state->target_elf_entry;
+    if (exact_entry_pc && !state->target_elf_entry_pc_seen) {
+        state->target_elf_entry_pc_seen = 1;
+        guest_target_elf_declared_entry_pc_count++;
+    }
     guest_target_elf_text_entry_count++;
     if (strcmp(state->exec_target, GUEST_API10_SHELL_PATH) == 0)
         guest_shell_elf_text_entry_count++;
@@ -842,11 +887,12 @@ static void observe_guest_target_elf_text(pid_t host_pid,
     char safe_module[GUEST_DIAGNOSTIC_TEXT_CAPACITY];
     int target_truncated = guest_diag_escape(state->exec_target, safe_target, sizeof(safe_target));
     int module_truncated = guest_diag_escape(mapping.path, safe_module, sizeof(safe_module));
-    printf("GUEST TARGET ELF TEXT ENTRY: host-pid=%d guest-pid=%d target=\"%s\" pc=0x%08x map=0x%llx-0x%llx perms=%s file-offset=0x%llx module=\"%s\"; target ELF code reached after linker; C main() symbol is not inferred truncated=%d,%d\n",
+    printf("GUEST TARGET ELF CODE PC: host-pid=%d guest-pid=%d target=\"%s\" pc=0x%08x map=0x%llx-0x%llx perms=%s file-offset=0x%llx module=\"%s\" declared-e_entry=0x%08x e_entry-PC-at-syscall=%d; target ELF code reached after linker; this is not proof of C main() truncated=%d,%d\n",
            host_pid, state->guest_pid, safe_target, pc,
            (unsigned long long)mapping.start, (unsigned long long)mapping.end,
            mapping.permissions, (unsigned long long)state->target_elf_text_file_offset,
-           safe_module, target_truncated, module_truncated || mapping.path_truncated);
+           safe_module, state->target_elf_entry_valid ? state->target_elf_entry : 0u,
+           exact_entry_pc, target_truncated, module_truncated || mapping.path_truncated);
 }
 
 static int map_guest_symlink_target(const char *target, char *host, size_t capacity) {
@@ -1846,10 +1892,30 @@ static int virtual_guest_socket_stream_io(pid_t pid, int fd, uint32_t buffer_add
         }
     }
     virtual_socket_calls++;
-    if (result > 0 && receive)
-        printf("VIRTUAL PROPERTY RECV: fd=%d bytes=%d; software queue only; host recv API not called\n",
-               fd, result);
+    if (result > 0) {
+        const char *endpoint = !entry ? "unknown" :
+            entry->kind == VIRTUAL_FD_SIGNAL ? "sigchld-socketpair" :
+            entry->kind == VIRTUAL_FD_PROPERTY ? "property-control" :
+            entry->kind == VIRTUAL_FD_PROPERTY_ACCEPTED ? "property-service-client" :
+            "other-guest-virtual-socket";
+        printf("VIRTUAL GUEST SOCKET IO: guest-pid=%d executable=%s fd=%d endpoint=%s direction=%s bytes=%d; app-private software queue only, host socket API not called\n",
+               state->guest_pid, state->exec_target, fd, endpoint,
+               receive ? "recv" : "send", result);
+    }
     return result;
+}
+
+static int guest_host_getrandom_fill(void *context, unsigned char *out,
+                                     size_t length) {
+    (void)context;
+    long result;
+    do {
+        result = syscall(SYS_getrandom, out, length,
+                         GUEST_RANDOM_GRND_NONBLOCK);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) return -errno;
+    if ((unsigned long)result > (unsigned long)INT32_MAX) return -EOVERFLOW;
+    return (int)result;
 }
 
 static int virtual_guest_pseudo_device_io(pid_t pid, int fd,
@@ -1862,17 +1928,34 @@ static int virtual_guest_pseudo_device_io(pid_t pid, int fd,
     struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
     if (!entry || entry->kind < VIRTUAL_FD_DEV_NULL ||
         entry->kind > VIRTUAL_FD_DEV_FULL) return 1;
-    if (entry->kind == VIRTUAL_FD_DEV_RANDOM) {
-        unsupported_guest_device_open_count++;
-        printf("GUEST RANDOM DEVICE READ UNSUPPORTED: guest-pid=%d executable=%s fd=%d; no guest entropy broker, host random device not substituted; result=%d\n",
-               state->guest_pid, state->exec_target, fd, -EOPNOTSUPP);
-        return -EOPNOTSUPP;
-    }
     unsigned access = entry->open_flags & 3u;
     if (receive && access == GUEST_VSOCKET_O_WRONLY) return -EBADF;
     if (!receive && access == GUEST_VSOCKET_O_RDONLY) return -EBADF;
     if (length > (uint32_t)INT32_MAX) return -EINVAL;
     if (length == 0) return 0;
+
+    if (entry->kind == VIRTUAL_FD_DEV_RANDOM) {
+        if (!receive || entry->device_minor != 9u) {
+            unsupported_guest_device_open_count++;
+            if (unsupported_guest_device_open_count <= 32u)
+                printf("GUEST RANDOM DEVICE OP UNSUPPORTED: guest-pid=%d executable=%s fd=%d minor=%u requested=%u read=%d result=%d; /dev/random and writes have no faithful guest backend, no host device is opened\n",
+                       state->guest_pid, state->exec_target, fd,
+                       entry->device_minor, length, receive, -EOPNOTSUPP);
+            return -EOPNOTSUPP;
+        }
+        unsigned char random_bytes[GUEST_URANDOM_MAX_READ_BYTES];
+        int random_result = guest_pseudo_device_read_urandom(entry->device_minor,
+            random_bytes, length, sizeof(random_bytes),
+            guest_host_getrandom_fill, NULL);
+        if (random_result > 0 && (buffer_address == 0 ||
+            write_remote(pid, buffer_address, random_bytes,
+                         (size_t)random_result) != 0)) random_result = -EFAULT;
+        virtual_pseudo_device_io_count++;
+        if (virtual_pseudo_device_io_count <= 32u)
+            printf("GUEST URANDOM READ: guest-pid=%d executable=%s fd=%d rdev=1:9 requested=%u returned=%d; bounded explicit host getrandom(GRND_NONBLOCK) provider, no host /dev access or hardware-identity claim\n",
+                   state->guest_pid, state->exec_target, fd, length, random_result);
+        return random_result;
+    }
 
     int result;
     if (!receive) {
@@ -2061,8 +2144,10 @@ static struct tracee_state *add_tracee(pid_t pid, int needs_options,
                                        pid_t guest_parent_pid, int is_thread) {
     struct tracee_state *existing = find_tracee(pid);
     if (existing) return existing;
-    if (tracee_count >= MAX_TRACEES) return NULL;
-    struct tracee_state *state = &tracees[tracee_count++];
+    int slot = guest_tracee_slot_allocate(&tracee_slot_pool);
+    if (slot < 0 || (unsigned)slot >= MAX_TRACEES) return NULL;
+    if ((size_t)slot >= tracee_count) tracee_count = (size_t)slot + 1u;
+    struct tracee_state *state = &tracees[slot];
     memset(state, 0, sizeof(*state));
     state->pid = pid;
     state->guest_pid = guest_pid;
@@ -2074,6 +2159,7 @@ static struct tracee_state *add_tracee(pid_t pid, int needs_options,
     state->alive = 1;
     state->needs_options = needs_options;
     state->last_syscall = -1;
+    guest_process_compat_init(&state->process_compat);
     active_tracee_count++;
     return state;
 }
@@ -2085,10 +2171,26 @@ static struct tracee_state *find_tracee_guest_pid(pid_t guest_pid) {
     return NULL;
 }
 
+static struct tracee_state *find_tracee_guest_pid_retained(pid_t guest_pid) {
+    for (size_t i = 0; i < tracee_count; ++i)
+        if (!tracees[i].is_thread && !tracees[i].guest_reaped &&
+            tracees[i].guest_pid == guest_pid) return &tracees[i];
+    return NULL;
+}
+
 static struct tracee_state *find_tracee_host_pid(pid_t pid) {
     for (size_t i = 0; i < tracee_count; ++i)
-        if (tracees[i].pid == pid) return &tracees[i];
+        if (!tracees[i].guest_reaped && tracees[i].pid == pid) return &tracees[i];
     return NULL;
+}
+
+static size_t count_unreaped_guest_children(pid_t parent_guest_pid) {
+    size_t count = 0;
+    for (size_t i = 0; i < tracee_count; ++i)
+        if (!tracees[i].is_thread && !tracees[i].guest_reaped &&
+            tracees[i].guest_parent_pid == parent_guest_pid &&
+            tracees[i].guest_pid > 0) count++;
+    return count;
 }
 
 static struct tracee_state *find_guest_child(pid_t parent_guest_pid, pid_t child_guest_pid) {
@@ -2107,6 +2209,19 @@ static void remove_tracee(pid_t pid) {
         uint32_t file_table_id = tracees[i].virtual_fd_table_id;
         tracees[i].virtual_fd_mask = 0;
         tracees[i].alive = 0;
+        if (tracees[i].is_thread && !tracees[i].guest_reaped) {
+            tracees[i].guest_reaped = 1;
+            guest_thread_ptrace_exits++;
+            if (guest_thread_ptrace_exits <= 64u)
+                printf("GUEST THREAD TRACE RELEASE: guest-pid=%d guest-tid=%d host-tid=%d; ptrace confirmed terminal exit, thread has no independent guest wait4 status\n",
+                       tracees[i].guest_pid, tracees[i].guest_tid,
+                       (int)tracees[i].pid);
+        }
+        int guest_wait_status_pending = !tracees[i].guest_reaped;
+        if (guest_tracee_slot_mark_ptrace_exit(&tracee_slot_pool, i,
+                                               guest_wait_status_pending) != 0)
+            fprintf(stderr, "tracee registry exit-state mismatch for guest-pid=%d slot=%zu\n",
+                    tracees[i].guest_pid, i);
         if (active_tracee_count > 0) active_tracee_count--;
         for (int slot = 0; slot < MAX_VIRTUAL_FDS; ++slot)
             if (owned & (UINT64_C(1) << (unsigned)slot))
@@ -2359,6 +2474,9 @@ static int mediate_guest_script_execve(pid_t pid, struct tracee_state *state,
     if (state) {
         snprintf(state->pending_exec_target, sizeof(state->pending_exec_target), "%s",
                  GUEST_API10_SHELL_PATH);
+        snprintf(state->pending_exec_backing_path,
+                 sizeof(state->pending_exec_backing_path), "%s",
+                 patched_shell_resolved);
         snprintf(state->pending_exec_script, sizeof(state->pending_exec_script), "%s",
                  GUEST_API10_GOLDFISH_SCRIPT);
         state->exec_was_dynamic = 1;
@@ -2497,6 +2615,8 @@ static int mediate_guest_execve(pid_t pid, struct tracee_state *state,
         return guest_exec_failure(failure_reason, "execve-path-register-update-failed", -EFAULT);
     if (state) {
         snprintf(state->pending_exec_target, sizeof(state->pending_exec_target), "%s", guest);
+        snprintf(state->pending_exec_backing_path,
+                 sizeof(state->pending_exec_backing_path), "%s", resolved);
         state->pending_exec_script[0] = '\0';
         state->exec_was_dynamic = dynamic_exec;
         state->exec_was_script = 0;
@@ -2735,6 +2855,20 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
             return 0;
         }
     }
+    if ((nr == ARM_NR_OPEN || nr == ARM_NR_OPENAT) &&
+        (strcmp(guest, "/dev") == 0 || strncmp(guest, "/dev/", 5u) == 0)) {
+        const char *unsupported = guest_device_unimplemented_reason(guest);
+        if (unsupported) {
+            unsupported_guest_device_open_count++;
+            if (unsupported_guest_device_open_count <= 64u)
+                printf("GUEST DEVICE BACKEND DENIED: guest-pid=%d executable=%s syscall=%s path=%s reason=%s result=%d; host /dev, Binder, ashmem, PTY and emulator pipe are never substituted\n",
+                       active_tracee ? active_tracee->guest_pid : -1,
+                       active_tracee ? active_tracee->exec_target : "<unknown>",
+                       guest_diag_syscall_name(nr), guest, unsupported,
+                       -EOPNOTSUPP);
+            return -EOPNOTSUPP;
+        }
+    }
     if (nr == ARM_NR_OPENAT &&
         strcmp(guest, GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH) == 0) {
         unsigned flags = regs->uregs[2];
@@ -2885,7 +3019,30 @@ static int translate_guest_pid_result(pid_t pid, struct tracee_state *state,
             regs->uregs[0] = (uint32_t)-ECHILD;
         } else {
             regs->uregs[0] = (uint32_t)child->guest_pid;
-            child->guest_reaped = 1;
+            uint32_t guest_status = 0;
+            int status_valid = regs->uregs[1] != 0u &&
+                read_remote(pid, regs->uregs[1], &guest_status, sizeof(guest_status)) == 0;
+            int terminal_status = status_valid && guest_wait_status_is_terminal(guest_status);
+            int confirmed_dead = !child->alive;
+            if (confirmed_dead || terminal_status) {
+                child->guest_reaped = 1;
+                size_t slot = (size_t)(child - tracees);
+                if (confirmed_dead && guest_tracee_slot_mark_reaped(&tracee_slot_pool, slot) != 0)
+                    fprintf(stderr, "tracee registry guest-reap-state mismatch for guest-pid=%d slot=%zu\n",
+                            child->guest_pid, slot);
+                guest_wait4_reap_diagnostics++;
+                if (guest_wait4_reap_diagnostics <= 128u)
+                    printf("GUEST WAIT4 REAP: parent=%d child=%d host-child=%d slot=%zu status=0x%08x status-valid=%d terminal=%d ptrace-dead=%d; guest status reaped, slot-reusable=%d\n",
+                           state->guest_pid, child->guest_pid, (int)result, slot,
+                           guest_status, status_valid, terminal_status, confirmed_dead,
+                           confirmed_dead);
+            } else {
+                guest_wait4_reap_diagnostics++;
+                if (guest_wait4_reap_diagnostics <= 128u)
+                    printf("GUEST WAIT4 NONTERMINAL: parent=%d child=%d host-child=%d status=0x%08x status-valid=%d child-still-traced=1; guest pid translated but registry slot retained\n",
+                           state->guest_pid, child->guest_pid, (int)result,
+                           guest_status, status_valid);
+            }
         }
         return set_regs(pid, regs) == 0 ? 0 : -EFAULT;
     }
@@ -3007,9 +3164,68 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         return 0;
     }
     if (nr == ARM_NR_WAIT4) {
+        guest_wait4_calls++;
+        int32_t requested = (int32_t)regs->uregs[0];
         int rc = mediate_guest_wait4(pid, regs);
-        if (rc == 0) return 0;
-        *pending_return = rc; *fake = 1; return 0;
+        if (rc != 0) {
+            *pending_return = rc;
+            *fake = 1;
+        }
+        if (guest_wait4_calls <= 64u)
+            printf("GUEST WAIT4 ABI: guest-pid=%d executable=%s requested=%d host-request=%d options=0x%x route=%s; this is the API10 ARM waitpid wrapper's wait4 syscall; only registered guest children are visible\n",
+                   state->guest_pid, state->exec_target, requested,
+                   (int32_t)regs->uregs[0], state->last_syscall_args[2],
+                   rc == 0 ? "supervised-child-wait" : "guest-error");
+        return 0;
+    }
+    if (nr == ARM_NR_SETRLIMIT) {
+        struct guest_arm32_rlimit requested = {0u, 0u};
+        uint32_t resource = regs->uregs[0];
+        uint32_t address = regs->uregs[1];
+        if (address == 0u) *pending_return = -EFAULT;
+        else if (read_remote(pid, address, &requested, sizeof(requested)) != 0)
+            *pending_return = -EFAULT;
+        else *pending_return = guest_process_setrlimit(&state->process_compat,
+            resource, requested, state->guest_euid);
+        guest_setrlimit_calls++;
+        printf("GUEST SETRLIMIT: guest-pid=%d executable=%s resource=%u current=%u maximum=%u guest-euid=%u result=%d; per-tracee RLIMIT_NICE state only, host limit unchanged\n",
+               state->guest_pid, state->exec_target, resource,
+               requested.current, requested.maximum, state->guest_euid,
+               *pending_return);
+        *fake = 1;
+        return 0;
+    }
+    if (nr == ARM_NR_IOPRIO_SET) {
+        uint32_t which = regs->uregs[0];
+        int32_t who = (int32_t)regs->uregs[1];
+        uint32_t priority = regs->uregs[2];
+        struct tracee_state *target = who == 0 ? state :
+            (who > 0 ? find_tracee_guest_pid_retained((pid_t)who) : NULL);
+        *pending_return = guest_process_ioprio_set(
+            target ? &target->process_compat : NULL, state->guest_euid,
+            target ? target->guest_ruid : 0u, target ? target->guest_euid : 0u,
+            which, who, target != NULL, priority);
+        guest_ioprio_set_calls++;
+        printf("GUEST IOPRIO_SET: guest-pid=%d executable=%s which=%u who=%d priority=0x%x target-guest-pid=%d guest-euid=%u result=%d; guest state only, host scheduler untouched\n",
+               state->guest_pid, state->exec_target, which, who, priority,
+               target ? target->guest_pid : 0, state->guest_euid,
+               *pending_return);
+        *fake = 1;
+        return 0;
+    }
+    if (nr == ARM_NR_GETPGID) {
+        int32_t requested = (int32_t)regs->uregs[0];
+        struct tracee_state *target = requested == 0 ? state :
+            (requested > 0 ? find_tracee_guest_pid_retained((pid_t)requested) : NULL);
+        *pending_return = guest_process_group_get(requested,
+            (uint32_t)state->guest_pid, state->guest_pgid,
+            target ? target->guest_pgid : 0u, target != NULL);
+        guest_getpgid_calls++;
+        printf("GUEST GETPGID: guest-pid=%d request-pid=%d target=%d result=%d; guest process table only, host getpgid not called\n",
+               state->guest_pid, requested, target ? target->guest_pid : 0,
+               *pending_return);
+        *fake = 1;
+        return 0;
     }
     if (nr == ARM_NR_KILL) {
         *pending_return = mediate_guest_kill(regs); *fake = 1; return 0;
@@ -3279,6 +3495,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
         return -1;
     }
     saw_exec = 1;
+    memset(tracees, 0, sizeof(tracees));
+    memset(&tracee_slot_pool, 0, sizeof(tracee_slot_pool));
     tracee_count = 0;
     active_tracee_count = 0;
     next_guest_pid = 2;
@@ -3290,6 +3508,18 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
     root->guest_pgid = 1;
     snprintf(root->guest_cwd, sizeof(root->guest_cwd), "/");
     snprintf(root->exec_target, sizeof(root->exec_target), "/init");
+    if (original_init_native_path(root->exec_backing_path,
+                                  sizeof(root->exec_backing_path)) != 0)
+        root->exec_backing_path[0] = '\0';
+    if (root->exec_backing_path[0]) {
+        char canonical_init[PATH_MAX];
+        if (realpath(root->exec_backing_path, canonical_init))
+            snprintf(root->exec_backing_path, sizeof(root->exec_backing_path),
+                     "%s", canonical_init);
+    }
+    root->target_elf_entry_valid = guest_elf32_arm_entrypoint(
+        root->exec_backing_path, &root->target_elf_type,
+        &root->target_elf_entry) == 0;
     printf("CONTINUOUS TRACE START: original static ARM32 /init pid=%d\n", pid);
     if (set_guest_trace_options(pid) != 0 || resume_trace(pid, 0) != 0) {
         fprintf(stderr, "ptrace setup failed: errno=%d\n", errno); kill_all_tracees(); return -1;
@@ -3331,12 +3561,46 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
         }
         if (WIFEXITED(status)) {
             printf("GUEST PROCESS EXIT: pid=%d code=%d\n", waited, WEXITSTATUS(status));
+            if (!state->is_thread && state->guest_parent_pid > 0) {
+                size_t unreaped = count_unreaped_guest_children(state->guest_parent_pid);
+                if (unreaped > guest_unreaped_child_peak)
+                    guest_unreaped_child_peak = unreaped;
+                printf("GUEST CHILD EXIT STATUS: parent-guest-pid=%d child-guest-pid=%d code=%d direct-unreaped-before-parent-wait=%zu; awaiting observed SIGCHLD/API10 ARM wait4, no registry slot recycled yet\n",
+                       state->guest_parent_pid, state->guest_pid,
+                       WEXITSTATUS(status), unreaped);
+            }
+            if (strcmp(state->exec_target, "/system/bin/qemud") == 0) {
+                guest_qemud_exit_count++;
+                guest_qemud_last_exit_code = WEXITSTATUS(status);
+                printf("GUEST EMULATOR SERVICE EXIT: guest-pid=%d service=qemud code=%d; no host emulator pipe was accessed\n",
+                       state->guest_pid, guest_qemud_last_exit_code);
+            } else if (strcmp(state->exec_target, "/system/bin/qemu-props") == 0) {
+                printf("GUEST EMULATOR SERVICE EXIT: guest-pid=%d service=qemu-props code=%d; boot-properties protocol completion not assumed\n",
+                       state->guest_pid, WEXITSTATUS(status));
+            }
             if (waited == pid) *exit_code = WEXITSTATUS(status);
             remove_tracee(waited);
             continue;
         }
         if (WIFSIGNALED(status)) {
             printf("GUEST PROCESS EXIT: pid=%d signal=%d\n", waited, WTERMSIG(status));
+            if (!state->is_thread && state->guest_parent_pid > 0) {
+                size_t unreaped = count_unreaped_guest_children(state->guest_parent_pid);
+                if (unreaped > guest_unreaped_child_peak)
+                    guest_unreaped_child_peak = unreaped;
+                printf("GUEST CHILD EXIT STATUS: parent-guest-pid=%d child-guest-pid=%d signal=%d direct-unreaped-before-parent-wait=%zu; awaiting observed SIGCHLD/API10 ARM wait4, no registry slot recycled yet\n",
+                       state->guest_parent_pid, state->guest_pid,
+                       WTERMSIG(status), unreaped);
+            }
+            if (strcmp(state->exec_target, "/system/bin/qemud") == 0) {
+                guest_qemud_exit_count++;
+                guest_qemud_last_exit_code = -WTERMSIG(status);
+                printf("GUEST EMULATOR SERVICE EXIT: guest-pid=%d service=qemud signal=%d\n",
+                       state->guest_pid, WTERMSIG(status));
+            } else if (strcmp(state->exec_target, "/system/bin/qemu-props") == 0) {
+                printf("GUEST EMULATOR SERVICE EXIT: guest-pid=%d service=qemu-props signal=%d\n",
+                       state->guest_pid, WTERMSIG(status));
+            }
             if (waited == pid) { *exit_code = -1; *exit_signal = WTERMSIG(status); }
             remove_tracee(waited);
             continue;
@@ -3357,14 +3621,17 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             pid_t child_guest_pid = child_is_thread ? state->guest_pid : next_guest_pid++;
             pid_t child_guest_tid = child_is_thread ? next_guest_tid++ : child_guest_pid;
             pid_t child_parent_guest_pid = child_is_thread ? state->guest_parent_pid : state->guest_pid;
-            struct tracee_state *child_state = tracee_count >= MAX_TRACEES ? NULL :
-                add_tracee(child_pid, 1, child_guest_pid, child_guest_tid,
-                           child_parent_guest_pid, child_is_thread);
+            struct tracee_state *child_state = add_tracee(child_pid, 1,
+                child_guest_pid, child_guest_tid, child_parent_guest_pid,
+                child_is_thread);
             if (!child_state) {
-                    process_limit_hit = 1;
+                process_limit_hit = 1;
                 blocked_process_count++;
-                fprintf(stderr, "PROCESS TREE LIMIT: refusing guest child pid=%d at cap=%d\n",
-                        child_pid, MAX_TRACEES);
+                fprintf(stderr, "PROCESS TREE LIMIT: refusing child host-pid=%d guest-pid=%d active=%zu maximum-active=%zu retained-unreaped=%zu slots=%zu/%d; no exited-unreaped record was recycled\n",
+                        child_pid, child_guest_pid, tracee_slot_pool.active_count,
+                        tracee_slot_pool.maximum_active,
+                        guest_tracee_slot_retained_count(&tracee_slot_pool),
+                        tracee_slot_pool.high_water, MAX_TRACEES);
                 kill_untracked_tracee(child_pid);
             } else {
                 int shares_files = event == PTRACE_EVENT_CLONE &&
@@ -3388,15 +3655,25 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 child_state->guest_euid = state->guest_euid;
                 child_state->guest_rgid = state->guest_rgid;
                 child_state->guest_egid = state->guest_egid;
+                child_state->process_compat = state->process_compat;
+                snprintf(child_state->exec_backing_path,
+                         sizeof(child_state->exec_backing_path), "%s",
+                         state->exec_backing_path);
+                child_state->target_elf_entry_valid = state->target_elf_entry_valid;
+                child_state->target_elf_type = state->target_elf_type;
+                child_state->target_elf_entry = state->target_elf_entry;
                 snprintf(child_state->exec_target, sizeof(child_state->exec_target), "%s",
                          state->exec_target[0] ? state->exec_target : "<unknown>");
                 snprintf(child_state->exec_script_path, sizeof(child_state->exec_script_path),
                          "%s", state->exec_script_path);
                 process_events++;
-                printf("GUEST PROCESS EVENT: parent=%d guest-pid=%d child=%d guest-pid=%d type=%s tracees=%zu/%d\n",
+                printf("GUEST PROCESS EVENT: parent=%d guest-pid=%d child=%d guest-pid=%d type=%s active=%zu/%d registry-high-water=%zu retained-unreaped=%zu reused-slots=%zu\n",
                        waited, state->guest_pid, child_pid, child_guest_pid,
                        event == PTRACE_EVENT_FORK ? "fork" : event == PTRACE_EVENT_VFORK ? "vfork" : "clone",
-                       active_tracee_count, MAX_TRACEES);
+                       tracee_slot_pool.active_count, MAX_TRACEES,
+                       tracee_slot_pool.high_water,
+                       guest_tracee_slot_retained_count(&tracee_slot_pool),
+                       tracee_slot_pool.reused_count);
             }
             if (resume_trace(waited, 0) != 0) { kill_all_tracees(); return -1; }
             if (process_limit_hit) {
@@ -3412,6 +3689,24 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                          state->pending_exec_target);
                 state->pending_exec_target[0] = '\0';
             }
+            if (state->pending_exec_backing_path[0]) {
+                snprintf(state->exec_backing_path,
+                         sizeof(state->exec_backing_path), "%s",
+                         state->pending_exec_backing_path);
+                state->pending_exec_backing_path[0] = '\0';
+            }
+            state->target_elf_entry_valid =
+                guest_elf32_arm_entrypoint(state->exec_backing_path,
+                    &state->target_elf_type, &state->target_elf_entry) == 0;
+            state->target_elf_entry_pc_seen = 0;
+            if (state->exec_target[0] == '/')
+                printf("GUEST TARGET ELF ENTRY METADATA: guest-pid=%d target=%s backing=%s ELF32-ARM type=%s e_entry=0x%08x; metadata only, execution at e_entry/C-main not inferred\n",
+                       state->guest_pid, state->exec_target,
+                       state->exec_backing_path[0] ? state->exec_backing_path : "<unknown>",
+                       state->target_elf_entry_valid
+                           ? (state->target_elf_type == ET_EXEC ? "ET_EXEC" : "ET_DYN")
+                           : "unavailable",
+                       state->target_elf_entry_valid ? state->target_elf_entry : 0u);
             if (script_launch) {
                 snprintf(state->exec_script_path, sizeof(state->exec_script_path), "%s",
                          state->pending_exec_script[0] ? state->pending_exec_script
@@ -3424,6 +3719,15 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             state->target_elf_text_seen = 0;
             state->target_elf_text_pc = 0;
             state->target_elf_text_file_offset = 0;
+            if (strcmp(state->exec_target, "/system/bin/qemud") == 0) {
+                guest_qemud_exec_count++;
+                printf("GUEST EMULATOR SERVICE EXEC: guest-pid=%d service=qemud target=%s linker-entry follows; Goldfish qemu_pipe backend remains explicitly unsupported\n",
+                       state->guest_pid, state->exec_target);
+            } else if (strcmp(state->exec_target, "/system/bin/qemu-props") == 0) {
+                guest_qemu_props_exec_count++;
+                printf("GUEST EMULATOR SERVICE EXEC: guest-pid=%d service=qemu-props target=%s linker-entry follows; boot-properties require the external emulator pipe protocol, not host substitution\n",
+                       state->guest_pid, state->exec_target);
+            }
             successful_guest_execs++;
             if (state->exec_was_dynamic) {
                 dynamic_exec_started_count++;
@@ -3582,6 +3886,7 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     log_broker_denial_detail(waited, state, ARM_NR_EXECVE, exec_result,
                         failed_exec_path, failed_exec_reason, 1);
                     state->pending_exec_target[0] = '\0';
+                    state->pending_exec_backing_path[0] = '\0';
                     state->pending_exec_script[0] = '\0';
                     state->exec_was_dynamic = 0;
                     state->exec_was_script = 0;
@@ -3648,6 +3953,14 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             continue;
         }
         if (sig == SIGCHLD) {
+            size_t unreaped = count_unreaped_guest_children(state->guest_pid);
+            guest_sigchld_deliveries++;
+            if (unreaped > guest_unreaped_child_peak)
+                guest_unreaped_child_peak = unreaped;
+            if (guest_sigchld_deliveries <= 128u)
+                printf("GUEST SIGCHLD FORWARDED: host-pid=%d guest-pid=%d direct-unreaped-children=%zu delivery=%lu; signal is forwarded to original guest handler\n",
+                       waited, state->guest_pid, unreaped,
+                       guest_sigchld_deliveries);
             if (resume_trace(waited, sig) != 0) { kill_all_tracees(); return -1; }
             continue;
         }
@@ -3742,7 +4055,7 @@ int main(int argc, char **argv) {
            GUEST_PROFILE_NET_IFACE, GUEST_PROFILE_NET_ADDRESS,
            GUEST_PROFILE_NET_NETMASK, GUEST_PROFILE_NET_GATEWAY,
            GUEST_PROFILE_NET_DNS1);
-    printf("PROCESS TREE: fork/clone/vfork followed with ptrace; cap=%d; verified static ARM32 execs and validated original-linker PT_INTERP aliases are admitted\n", MAX_TRACEES);
+    printf("PROCESS TREE: fork/clone/vfork followed with ptrace; active-and-unreaped registry cap=%d; process slots reusable after guest wait4 reap, non-waitable thread slots after ptrace terminal exit; verified ARM32 execs and confined original-linker aliases\n", MAX_TRACEES);
     puts("DYNAMIC ELF POLICY: original API10 linker is inherited as fd 198; unsupported PT_INTERP is denied before host-linker substitution");
     int child = start_guest(binary, &argv[5]);
     if (child < 0) return 2;
@@ -3750,14 +4063,22 @@ int main(int argc, char **argv) {
     int rc = run_trace((pid_t)child, &exit_code, &exit_signal);
     traced_pid = -1;
     printf("INITIAL /init POST-EXEC: %s\n", saw_exec ? "SIGTRAP observed" : "not observed");
-    printf("CONTINUOUS PROCESS TREE: fork/clone/vfork events=%lu; guest exec events=%lu; dynamic execs redirected=%lu; kernel entries into original guest linker=%lu; target ELF text entries=%lu (shell=%lu app_process=%lu; C main symbol unproven); maximum tracees=%d\n",
+    printf("CONTINUOUS PROCESS TREE: fork/clone/vfork events=%lu; guest exec events=%lu; dynamic execs redirected=%lu; kernel entries into original guest linker=%lu; target ELF code syscall-PCs=%lu (shell=%lu app_process=%lu); literal ET_EXEC e_entry syscall-PC hits=%lu; C main symbol unproven\n",
            process_events, successful_guest_execs, dynamic_exec_allowed_count,
            dynamic_exec_started_count, guest_target_elf_text_entry_count,
            guest_shell_elf_text_entry_count, guest_app_process_elf_text_entry_count,
-           MAX_TRACEES);
-    printf("GUEST STARTUP STAGE SUMMARY: original-init-post-exec=%s; original-linker-entry-events=%lu; target-ELF-executable-mapping entries=%lu; C-main symbol/Zygote/framework/system_server/desktop=unproven\n",
+           guest_target_elf_declared_entry_pc_count);
+    printf("TRACE REGISTRY: hard-cap=%d; active-at-stop=%zu; maximum-active=%zu; registry-high-water=%zu; safely-reused-slots=%zu; terminal-thread-releases=%lu; retained-unreaped=%zu; process-limit-hit=%d\n",
+           MAX_TRACEES, tracee_slot_pool.active_count,
+           tracee_slot_pool.maximum_active, tracee_slot_pool.high_water,
+           tracee_slot_pool.reused_count, guest_thread_ptrace_exits,
+           guest_tracee_slot_retained_count(&tracee_slot_pool), process_limit_hit);
+    printf("GUEST STARTUP STAGE SUMMARY: original-init-post-exec=%s; original-linker-entry-events=%lu; target-ELF-code-syscall-PCs=%lu; ET_EXEC-e_entry-PC-hits=%lu; qemud-execs=%lu exits=%lu last-exit=%d; qemu-props-execs=%lu; C-main/Zygote/framework/system_server/desktop=unproven\n",
            saw_exec ? "observed" : "not-observed", dynamic_exec_started_count,
-           guest_target_elf_text_entry_count);
+           guest_target_elf_text_entry_count,
+           guest_target_elf_declared_entry_pc_count,
+           guest_qemud_exec_count, guest_qemud_exit_count,
+           guest_qemud_last_exit_code, guest_qemu_props_exec_count);
     printf("GUEST SCRIPT LAUNCH SUMMARY: approved-routes=%lu; exec-events=%lu; guest-shell=%s; guest-script=%s; host-shell-exec=0; network-effects=guest-software-broker-only\n",
            guest_script_routes_approved, guest_script_exec_started_count,
            GUEST_API10_SHELL_PATH, GUEST_API10_GOLDFISH_SCRIPT);
@@ -3779,8 +4100,10 @@ int main(int argc, char **argv) {
            guest_sigprocmask_ptrace_failures == 0 ? "PTRACE_GETSIGMASK/SETSIGMASK" : "fail-closed");
     printf("LEGACY SIGACTION COMPAT: syscall=67 via rt_sigaction=174 calls=%lu failures=%lu; legacy mask low-word preserved; unmatched SIGSYS forwarding unchanged\n",
            guest_sigaction_compat_calls, guest_sigaction_compat_failures);
-    printf("GUEST PROCESS/TIME COMPAT: setpgid calls=%lu guest-pgid table only; settimeofday calls=%lu timezone-only; host process groups and wall clock unchanged\n",
-           guest_setpgid_calls, guest_timezone_calls);
+    printf("GUEST PROCESS/TIME COMPAT: setpgid=%lu guest-only; setrlimit=%lu RLIMIT_NICE only; ioprio_set=%lu process-only; getpgid=%lu guest PID table; wait4=%lu API10 ARM waitpid path; SIGCHLD forwarded=%lu direct-unreaped peak=%zu; settimeofday=%lu timezone-only; host process groups/IO priority/wall clock unchanged\n",
+           guest_setpgid_calls, guest_setrlimit_calls, guest_ioprio_set_calls,
+           guest_getpgid_calls, guest_wait4_calls, guest_sigchld_deliveries,
+           guest_unreaped_child_peak, guest_timezone_calls);
     printf("GUEST NETWORK CONTROL SUMMARY: virtual-af-inet-dgram-sockets=%lu ioctl=%lu rejected=%lu eth0-up=%d address-set=%d netmask-set=%d default-route-set=%d; host socket/ioctl/packet/network calls=0\n",
            virtual_network_socket_count, virtual_network_ioctl_count,
            virtual_network_ioctl_rejected_count,

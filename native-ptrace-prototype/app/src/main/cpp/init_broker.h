@@ -29,7 +29,7 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
     switch (nr) {
         /* Guest-local ordinary file operations on already-brokered descriptors. */
         case 1: case 3: case 4: case 6: case 19: case 41: case 42: case 63:
-        case 45: case 55: case 91: case 108: case 114: case 118:
+        case 45: case 55: case 91: case 108: case 118:
         case 119: case 125: case 126: case 140: case 141: case 145: case 146:
         case 148: case 162: case 163:
         case 173: case 175: case 176: case 177: case 179:
@@ -82,9 +82,14 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
             return GUEST_SYSCALL_VIRTUAL_DEVICE;
 
         /* Only the ptrace supervisor's bounded, explicitly attached guest tree
-         * may use these process-creation syscalls. */
-        case 2: case 120: case 190:
+         * may create children or wait for translated guest child statuses. */
+        case 2: case 114: case 120: case 190:
             return GUEST_SYSCALL_TRACE_PROCESS;
+
+        /* API10 init's waitpid, RLIMIT_NICE, process ioprio and getpgid
+         * operations are handled against the per-guest process table only. */
+        case 75: case 132: case 314:
+            return GUEST_SYSCALL_VIRTUALIZE;
 
         /* execve, ptrace, chroot, pivot_root, reboot, namespaces, unsupported
          * socket operations, and every unknown syscall remain denied by default. */

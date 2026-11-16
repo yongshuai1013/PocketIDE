@@ -14,6 +14,17 @@ static uint64_t load64le(const unsigned char *bytes, size_t offset) {
            ((uint64_t)load32le(bytes, offset + 4) << 32);
 }
 
+struct fake_entropy_state { size_t maximum_seen; int result; };
+static int fake_entropy_fill(void *context, unsigned char *out, size_t length) {
+    struct fake_entropy_state *state = (struct fake_entropy_state *)context;
+    state->maximum_seen = length;
+    if (state->result < 0) return state->result;
+    size_t amount = (size_t)state->result;
+    if (amount > length) amount = length;
+    for (size_t i = 0; i < amount; ++i) out[i] = (unsigned char)(i ^ 0x5au);
+    return (int)amount;
+}
+
 int main(void) {
     assert(guest_pseudo_device_kind_for_path("/dev/__null__") == VIRTUAL_FD_DEV_NULL);
     assert(guest_pseudo_device_kind_for_path("/dev/__kmsg__") == VIRTUAL_FD_DEV_KMSG);
@@ -52,6 +63,23 @@ int main(void) {
     assert(guest_pseudo_device_read(VIRTUAL_FD_DEV_ZERO, NULL, 1, 0) == -EFAULT);
     assert(guest_pseudo_device_read(VIRTUAL_FD_DEV_KMSG, bytes, sizeof(bytes), sizeof(bytes)) == -EAGAIN);
     assert(guest_pseudo_device_read(VIRTUAL_FD_DEV_RANDOM, bytes, sizeof(bytes), sizeof(bytes)) == -EOPNOTSUPP);
+    struct fake_entropy_state entropy = {.maximum_seen = 0u, .result = 12};
+    unsigned char random_bytes[GUEST_URANDOM_MAX_READ_BYTES];
+    assert(guest_pseudo_device_read_urandom(9u, random_bytes, 64u,
+        sizeof(random_bytes), fake_entropy_fill, &entropy) == 12);
+    assert(entropy.maximum_seen == 64u && random_bytes[0] == 0x5au &&
+           random_bytes[11] == (unsigned char)(11u ^ 0x5au));
+    assert(guest_pseudo_device_read_urandom(8u, random_bytes, 64u,
+        sizeof(random_bytes), fake_entropy_fill, &entropy) == -EOPNOTSUPP);
+    assert(guest_pseudo_device_read_urandom(10u, random_bytes, 64u,
+        sizeof(random_bytes), fake_entropy_fill, &entropy) == -ENODEV);
+    entropy.result = -EAGAIN;
+    assert(guest_pseudo_device_read_urandom(9u, random_bytes, 64u,
+        sizeof(random_bytes), fake_entropy_fill, &entropy) == -EAGAIN);
+    entropy.result = (int)sizeof(random_bytes);
+    assert(guest_pseudo_device_read_urandom(9u, random_bytes, 4096u,
+        sizeof(random_bytes), fake_entropy_fill, &entropy) == (int)sizeof(random_bytes));
+    assert(entropy.maximum_seen == GUEST_URANDOM_MAX_READ_BYTES);
     assert(guest_pseudo_device_write(VIRTUAL_FD_DEV_NULL, 17) == 17);
     assert(guest_pseudo_device_write(VIRTUAL_FD_DEV_ZERO, 17) == 17);
     assert(guest_pseudo_device_write(VIRTUAL_FD_DEV_KMSG, 17) == 17);

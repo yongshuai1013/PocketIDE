@@ -28,6 +28,11 @@ int main(void) {
     assert(guest_syscall_policy(120) == GUEST_SYSCALL_TRACE_PROCESS);
     assert(guest_syscall_policy(2) == GUEST_SYSCALL_TRACE_PROCESS);
     assert(guest_syscall_policy(190) == GUEST_SYSCALL_TRACE_PROCESS);
+    assert(guest_syscall_policy(7) == GUEST_SYSCALL_DENY); /* API10 ARM Bionic waitpid uses wait4, not raw nr 7 */
+    assert(guest_syscall_policy(114) == GUEST_SYSCALL_TRACE_PROCESS); /* wait4: API10 ARM waitpid wrapper */
+    assert(guest_syscall_policy(75) == GUEST_SYSCALL_VIRTUALIZE); /* guest RLIMIT_NICE */
+    assert(guest_syscall_policy(132) == GUEST_SYSCALL_VIRTUALIZE); /* guest getpgid */
+    assert(guest_syscall_policy(314) == GUEST_SYSCALL_VIRTUALIZE); /* guest ioprio_set */
     assert(guest_syscall_policy(11) == GUEST_SYSCALL_DENY); /* execve uses explicit ELF mediation */
     assert(guest_syscall_policy(102) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* software socketcall */
     assert(guest_syscall_policy(281) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* socket */

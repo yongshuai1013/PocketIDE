@@ -57,6 +57,7 @@ static inline int guest_diag_escape(const char *input, char *output, size_t capa
 static inline const char *guest_diag_syscall_name(int number) {
     switch (number) {
         case 2: return "fork";
+        case 7: return "waitpid";
         case 3: return "read";
         case 4: return "write";
         case 5: return "open";
@@ -69,11 +70,13 @@ static inline const char *guest_diag_syscall_name(int number) {
         case 57: return "setpgid";
         case 67: return "sigaction";
         case 79: return "settimeofday";
+        case 75: return "setrlimit";
         case 83: return "symlink";
         case 93: return "ftruncate";
         case 102: return "socketcall";
         case 114: return "wait4";
         case 120: return "clone";
+        case 132: return "getpgid";
         case 126: return "sigprocmask";
         case 133: return "fchdir";
         case 162: return "nanosleep";
@@ -92,6 +95,7 @@ static inline const char *guest_diag_syscall_name(int number) {
         case 285: return "accept";
         case 288: return "socketpair";
         case 297: return "recvmsg";
+        case 314: return "ioprio_set";
         case 322: return "openat";
         case 327: return "fstatat64";
         default: return "unknown";

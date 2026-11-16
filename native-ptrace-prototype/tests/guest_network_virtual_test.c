@@ -119,10 +119,34 @@ static void test_route_is_exact_and_guest_only(void) {
     assert(guest_net_add_route(&state, &route, GUEST_PROFILE_NET_IFACE) == -EINVAL);
 }
 
+static void test_api10_ifup_lo_flags_are_guest_only(void) {
+    struct guest_network_state state;
+    struct guest_arm32_ifreq ifr;
+    guest_net_state_init(&state);
+    set_ifreq_name(&ifr, "lo");
+    assert(guest_net_apply_ifreq(&state, GUEST_NET_SIOCGIFFLAGS, &ifr) == 0);
+    assert((ifr.value.flags & GUEST_NET_IFF_LOOPBACK) != 0u);
+    assert((ifr.value.flags & GUEST_NET_IFF_UP) == 0u);
+    assert((ifr.value.flags & (GUEST_NET_IFF_BROADCAST | GUEST_NET_IFF_MULTICAST |
+                               GUEST_NET_IFF_RUNNING)) == 0u);
+    ifr.value.flags |= GUEST_NET_IFF_UP;
+    assert(guest_net_apply_ifreq(&state, GUEST_NET_SIOCSIFFLAGS, &ifr) == 0);
+    set_ifreq_name(&ifr, "lo");
+    assert(guest_net_apply_ifreq(&state, GUEST_NET_SIOCGIFFLAGS, &ifr) == 0);
+    assert((ifr.value.flags & (GUEST_NET_IFF_UP | GUEST_NET_IFF_RUNNING |
+                               GUEST_NET_IFF_LOOPBACK)) ==
+           (GUEST_NET_IFF_UP | GUEST_NET_IFF_RUNNING | GUEST_NET_IFF_LOOPBACK));
+    set_ifreq_name(&ifr, "lo");
+    assert(guest_net_apply_ifreq(&state, GUEST_NET_SIOCSIFADDR, &ifr) == -EOPNOTSUPP);
+    ifr.value.flags &= (uint16_t)~GUEST_NET_IFF_LOOPBACK;
+    assert(guest_net_apply_ifreq(&state, GUEST_NET_SIOCSIFFLAGS, &ifr) == -EINVAL);
+}
+
 int main(void) {
     test_profile_socket_and_abi();
     test_ifconfig_guest_state();
     test_route_is_exact_and_guest_only();
-    puts("API10 guest hardware/network profile regression: PASS (Goldfish proc identity, synthetic RAM, ARM32 ifreq/rtentry, whitelisted eth0/IP/netmask/gateway; no host socket or packet path)");
+    test_api10_ifup_lo_flags_are_guest_only();
+    puts("API10 guest hardware/network profile regression: PASS (Goldfish identity, synthetic RAM, guest-only lo/eth0 and whitelisted route; no host socket or packet path)");
     return 0;
 }
