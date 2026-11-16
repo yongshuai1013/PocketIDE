@@ -7,6 +7,7 @@ import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.res.AssetManager;
 import android.net.Uri;
+import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Process;
@@ -18,6 +19,7 @@ import android.system.StructStat;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -69,6 +71,8 @@ public final class MainActivity extends Activity {
     private Button exportButton;
     private Button viewLogButton;
     private Button stopButton;
+    private FrameLayout guestDisplayFrame;
+    private TextView guestDisplayStatus;
     private File latestLogFile;
     private volatile boolean stopRequested;
     private volatile boolean explicitStopRequested;
@@ -86,25 +90,30 @@ public final class MainActivity extends Activity {
         latestLogFile = new File(getCacheDir(), LOG_FILE_NAME);
         exportButton.setEnabled(hasExportableLog());
         viewLogButton.setEnabled(hasExportableLog());
-        report.setText("GingerVM Android guest: continuous init process-tree trace\n\n"
-                + "Stages the original Google SDK API 10 / Android 2.3.7 ARMv7 ramdisk and complete matching /system tree. Starts the original static /init once and follows its fork/clone/exec descendants in the same bounded ptrace session. Dynamic ELF copies change only PT_INTERP to the original guest linker inherited as fd 198; the host Android linker is not substituted.\n"
-                + "This is not a claim of a complete boot or desktop. Guest mount/device/identity operations are software-only; no host root or host mount is used.\n\n"
+        report.setText(buildHistoricalSummary());
+    }
+
+    private String buildHistoricalSummary() {
+        return "GingerVM Android guest: continuous API10 init process-tree trace\n\n"
+                + "Stages the original Google SDK API 10 / Android 2.3.7 ARMv7 ramdisk and matching /system tree, then traces one original /init process tree. Guest mount/device/identity behavior stays software-only; no host root or host mount is used.\n\n"
                 + "Host ABI: " + Arrays.toString(Build.SUPPORTED_ABIS) + "\n"
                 + "64-bit app process: " + Process.is64Bit() + "\n"
-                + "Android API: " + Build.VERSION.SDK_INT + "\n"
-                + "Latest user-provided Android 12 screen (v0.6.7): staging failed before guest execution while deleting the previous app-private tree at /mnt/sdcard. Official API10 init.rc sets `mkdir /mnt/sdcard 0000 system system`; the old cleanup then got null from File.listFiles(). v0.6.8 repairs cleanup but is not yet device-tested. Earlier v0.6.6 trace: PID 1 passed coldboot wait and property-area ftruncate, then AF_UNIX socket(1,1,0) received -97 (EAFNOSUPPORT). The v0.6.7 software socket model has not yet been exercised on-device; no guest linker, Zygote, framework, or desktop boot has been reached.\n\n"
-                + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer shows a bounded tail; share/save exports the full latest file.\n"
-                + "No v0.6.8 trace has been recorded yet; the earlier device evidence above is historical context.");
+                + "Android API: " + Build.VERSION.SDK_INT + "\n\n"
+                + "HISTORICAL DEVICE TRACE (user-provided v0.6.8 Android 12 log; not this run): staging succeeded and original /init passed the coldboot wait. The continuous tree reported 14 fork/clone/vfork events, 13 exec events and 12 entries into the original guest linker, including /system/bin/app_process. Guest PID 13 execve returned brokered -13 (EACCES) and exited 127, but that log omitted the requested guest path and rejecting check; the cause cannot be identified from that trace. This build adds capped path/reason diagnostics without relaxing policy. Timeout cleanup was confirmed: tracked=4, reaped=4, unresolved=0; host privileged mounts=0.\n"
+                + "A dynamic-linker entry is not proof of target main, Zygote, framework, system_server or desktop. The guest display panel below has no framebuffer source yet and does not represent a running Android screen.\n\n"
+                + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer follows the latest output; share/save exports the complete log.\n"
+                + "No v0.6.9 device trace has been recorded yet; the v0.6.8 evidence above is historical context.";
     }
 
     private void buildUi() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(24, 24, 24, 24);
+        root.setPadding(dp(16), dp(12), dp(16), dp(12));
         root.setGravity(Gravity.CENTER_HORIZONTAL);
+        root.setBackgroundColor(0xFF0B0F14);
 
         guestButton = new Button(this);
-        guestButton.setText("Stage guest + trace continuous Android startup");
+        guestButton.setText("啟動 Android 2.3.7 guest 連續追蹤");
         root.addView(guestButton, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
@@ -131,11 +140,43 @@ public final class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
+        TextView guestDisplayTitle = new TextView(this);
+        guestDisplayTitle.setText("Guest display · 尚未啟動畫面輸出");
+        guestDisplayTitle.setTextColor(0xFFC7D2DE);
+        guestDisplayTitle.setTextSize(14);
+        guestDisplayTitle.setPadding(0, dp(12), 0, dp(6));
+        root.addView(guestDisplayTitle, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        guestDisplayFrame = new FrameLayout(this);
+        GradientDrawable displayBackground = new GradientDrawable();
+        displayBackground.setColor(0xFF05070A);
+        displayBackground.setCornerRadius(dp(14));
+        displayBackground.setStroke(dp(1), 0xFF2B3541);
+        guestDisplayFrame.setBackground(displayBackground);
+        guestDisplayFrame.setContentDescription("Guest display viewport; no guest framebuffer is available");
+        guestDisplayStatus = new TextView(this);
+        guestDisplayStatus.setText("尚無 guest 畫面\n目前沒有 guest framebuffer／Surface frame。\n此區不是正在執行的 Android 桌面。");
+        guestDisplayStatus.setTextColor(0xFF9AA8B6);
+        guestDisplayStatus.setTextSize(14);
+        guestDisplayStatus.setGravity(Gravity.CENTER);
+        guestDisplayStatus.setPadding(dp(18), dp(12), dp(18), dp(12));
+        guestDisplayFrame.addView(guestDisplayStatus, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER));
+        root.addView(guestDisplayFrame, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(176)));
+
         reportScrollView = new ScrollView(this);
+        reportScrollView.setFillViewport(true);
+        reportScrollView.setBackgroundColor(0xFF0B0F14);
         report = new TextView(this);
+        report.setTextColor(0xFFD7DEE7);
         report.setTextSize(14);
         report.setTextIsSelectable(true);
-        report.setPadding(0, 20, 0, 0);
+        report.setPadding(0, dp(12), 0, 0);
         reportScrollView.addView(report);
         root.addView(reportScrollView, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -155,6 +196,10 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
     private void startRun() {
         if (runActive) return;
         stopRequested = false;
@@ -167,8 +212,8 @@ public final class MainActivity extends Activity {
         exportButton.setEnabled(false);
         viewLogButton.setEnabled(true);
         stopButton.setEnabled(true);
-        setReportText("Preparing the complete Google API10 guest image; about 106 MiB of userland and linker aliases are staged across app-private storage and extracted ARM32 libraries…\n"
-                + "HISTORICAL DEVICE BASELINE (user-provided v0.6.7 Android 12 screenshot; not this run): staging failed before guest execution while deleting the previous app-private tree at /mnt/sdcard. Official API10 init.rc requests mkdir /mnt/sdcard 0000 system system; the old cleanup lstat'ed the directory then File.listFiles() returned null. v0.6.8 restores app-owner rwx only for lstat-confirmed real directories, uses O_NOFOLLOW before listing, unlinks symlinks without traversing targets, and treats missing paths as no-op. This cleanup fix and the v0.6.7 software AF_UNIX model are not yet confirmed on-device; no guest linker/Zygote/Framework has been reached. This run's Stop button requests a separate user cancellation.\n");
+        setReportText("Preparing the complete original Google API10 guest image; userland and linker aliases are staged in app-private storage and extracted ARM32 libraries…\n"
+                + "HISTORICAL DEVICE TRACE (user-provided v0.6.8 Android 12 log; not this run): staging and original /init ran; PID 1 passed coldboot wait, with 14 process events, 13 exec events and 12 linker entries. Guest PID 13 execve returned brokered -EACCES and exited 127, but its guest pathname/rejection branch was not logged. The trace ended at the supervisor timeout with tracked=4/reaped=4/unresolved=0. No target main, Zygote, framework or guest display frame was proven. This version adds bounded diagnostics only; the Stop button remains a separate user cancellation.\n");
         postProgress("RUN STARTED: one continuous original /init process-tree session; this app-private latest-log file will be replaced when the run ends.\n");
         Thread worker = new Thread(new Runnable() {
             @Override public void run() {
@@ -431,7 +476,7 @@ public final class MainActivity extends Activity {
         throwIfStopRequested();
         StringBuilder out = new StringBuilder();
         out.append("GingerVM continuous Android 2.3.7/API 10 init process-tree trace\n");
-        out.append("HISTORICAL DEVICE BASELINE (user-provided v0.6.7 Android 12 screenshot; not this run): staging failed before guest execution while deleting the previous app-private tree at /mnt/sdcard. Official API10 init.rc requests mkdir /mnt/sdcard 0000 system system; old cleanup lstat'ed it as a directory then File.listFiles() returned null. v0.6.8 restores app-owner rwx only on lstat-confirmed real directories, opens without following symlinks, and treats missing paths as no-op; this fix has not yet been confirmed on-device. Earlier v0.6.6 trace reached AF_UNIX socket(1,1,0), got -97 (EAFNOSUPPORT), and exited; thus the v0.6.7 software socket model remains unverified. No guest linker/Zygote/framework has been reached.\n\n");
+        out.append("HISTORICAL DEVICE TRACE (user-provided v0.6.8 Android 12 log; not this run): staging succeeded; original /init ran and PID 1 passed coldboot wait. The tree reported 14 fork/clone/vfork events, 13 exec events and 12 original-linker entries including /system/bin/app_process. Guest PID 13 execve returned brokered -13 (EACCES) and exited 127, but its guest pathname and rejection reason were not logged, so the exact cause is unknown. The supervisor timeout cleanup was confirmed (tracked=4, reaped=4, unresolved=0), with zero host privileged mounts. v0.6.9 adds bounded diagnostics without changing the deny policy.\n\n");
         out.append("Host ABI: ").append(Arrays.toString(Build.SUPPORTED_ABIS)).append('\n');
         out.append("64-bit app process: ").append(Process.is64Bit()).append('\n');
         out.append("Android API: ").append(Build.VERSION.SDK_INT).append('\n');
@@ -541,7 +586,7 @@ public final class MainActivity extends Activity {
         appendProgress(out, "Start original /init and follow its child processes in the same session");
         out.append(runNative("continuous /init process tree", supervisor, guestInit, guestRoot, 120,
                 guestLibraryDir, "/init"));
-        out.append("\nBOOT BOUNDARY: a dynamic-linker entry event is not proof that the guest target reached main, nor proof of Zygote, framework, system-server, or desktop boot. The first unsupported stage is reported explicitly.\n");
+        out.append("\nBOOT BOUNDARY: logs separately mark an observed original-linker entry and the target-main entry, which remains unobserved because no architecture-safe target-entry instrumentation is installed. Neither linker entry nor the dark display panel proves Zygote, framework, system-server, desktop, or framebuffer output.\n");
         return out.toString();
     }
 

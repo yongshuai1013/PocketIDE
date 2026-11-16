@@ -20,6 +20,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_socket_path_ops_test.c" -o "$TMP/guest_socket_path_ops_test"
 "$TMP/guest_socket_path_ops_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_diagnostics_test.c" -o "$TMP/guest_diagnostics_test"
+"$TMP/guest_diagnostics_test"
 mkdir -p "$TMP/java"
 javac -d "$TMP/java" \
   "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/AppPrivateTreeCleanup.java" \
@@ -63,6 +66,7 @@ trace = src.split("static int run_trace(", 1)[1].split("int main(", 1)[0]
 uevent = Path(sys.argv[1]).with_name('guest_uevent_virtual.h').read_text()
 socket_model = Path(sys.argv[1]).with_name('guest_socket_virtual.h').read_text()
 socket_path = Path(sys.argv[1]).with_name('guest_socket_path_ops.h').read_text()
+diagnostics = Path(sys.argv[1]).with_name('guest_diagnostics.h').read_text()
 activity = Path(sys.argv[2]).read_text()
 capture = Path(sys.argv[2]).with_name('TraceOutputCapture.java').read_text()
 tree_cleanup = Path(sys.argv[2]).with_name('AppPrivateTreeCleanup.java').read_text()
@@ -108,6 +112,19 @@ assert 'VIRTUAL SIGNAL SOCKETPAIR:' in src and 'VIRTUAL PROPERTY RECV:' in src
 assert 'guest_socket_marker_create_app_private(host_path, guest_root)' in src
 assert 'close_virtual_fds_on_exec(state)' in src and 'child_state->virtual_fd_table_id' in src
 assert 'tracee_owns_virtual_fd' in src and 'GUEST_VSOCKET_POLLNVAL' in src
+diagnostic_test = Path(sys.argv[1]).parents[4] / 'tests/guest_diagnostics_test.c'
+assert 'guest_diag_escape' in diagnostics and 'guest_diag_errno_name' in diagnostics
+assert 'MAX_BROKER_DENIAL_DIAGNOSTICS 24u' in src
+assert 'MAX_EXEC_FAILURE_DIAGNOSTICS 16u' in src
+assert 'GUEST EXEC FAILURE DETAIL' in src and 'BROKER DENIED DETAIL' in src
+assert 'guest-executable=' in src and 'errno=%d(%s) reason=%s' in src
+assert 'guest_diag_escape' in src and 'state->last_syscall_args' in src
+assert 'pending_exec_target' in src and 'child_state->exec_target' in src
+assert 'kernel-execve-returned-error-after-path-rewrite' in src
+assert 'GUEST STARTUP STAGE: linker-entry=observed' in src
+assert 'target-main-entry=not-observed (no target-entry instrumentation)' in src
+assert 'GUEST STARTUP STAGE SUMMARY' in src and 'BROKER DIAGNOSTIC SUMMARY' in src
+assert 'guest_diag_escape("bad\\n\\033\\\"path"' in diagnostic_test.read_text()
 assert 'GUEST_VSOCKET_MAX_FDS 32' in socket_model
 assert 'guest_vsocket_connect' in socket_model and 'guest_vsocket_accept' in socket_model
 assert 'guest_vsocket_peercred' in socket_model and 'guest_vsocket_poll_events' in socket_model
@@ -230,8 +247,9 @@ assert 'getAssets().open(assetPath)' in copy and 'catch (IOException openError)'
 assert 'throwIfStopRequested();' in copy
 assert 'collectGuestSystemTree' in activity
 assert 'deleteRecursively(guestRoot)' in activity
-assert 'complete matching /system tree' in activity
+assert 'matching /system tree' in activity
 assert 'full /system image tree' in activity
+assert 'verifyGuestSystemTree(systemRoot, manifest, guestLibraryDir)' in activity
 assert 'guestLibraryDir.getAbsolutePath()' in activity
 assert 'executeProbe' not in activity and 'probeButton' not in activity
 assert 'separate bounded probes' not in activity and 'isolated executable probe' not in activity
@@ -241,7 +259,7 @@ assert 'guestLibraryDir, "/init"' in continuous_run
 assert 'one original /init with its traced child tree' in continuous_run
 assert 'changing only PT_INTERP' in continuous_run and '/proc/self/fd/198' in continuous_run
 assert 'target main entry remains unproven' in src
-assert 'dynamic-linker entry event is not proof' in activity
+assert 'A dynamic-linker entry is not proof' in activity
 assert 'dynamic_executable_count' in activity and 'dynamic_sha256' in activity
 assert 'captured.size() > 192 * 1024' not in activity and 'reader.join(100L)' in activity
 assert 'writeLatestLog(completeLog)' in activity and 'out.getFD().sync()' in activity
@@ -264,19 +282,23 @@ assert 'scrollView.fullScroll(View.FOCUS_DOWN)' in activity
 assert 'scrollToLatest(reportScrollView)' in activity
 assert 'liveLogBody.setText(displayText)' in activity and 'scrollToLatest(liveLogScroll)' in activity
 assert 'dialog.setOnDismissListener' in activity
-assert 'Theme.Holo.Light.DarkActionBar' in theme
-assert '#33B5E5' in theme and '#FF303030' in theme
+assert 'Theme.Material' in theme
+assert '#38BDF8' in theme and '#FF0B0F14' in theme
+assert 'FrameLayout guestDisplayFrame' in activity
+assert 'Guest display · 尚未啟動畫面輸出' in activity
+assert 'no guest framebuffer is available' in activity
+assert '尚無 guest 畫面' in activity and '不是正在執行的 Android 桌面' in activity
 assert 'setTitle("GingerVM")' in activity
 assert 'supervisor.destroy()' in activity and 'USER STOP REQUESTED' in activity
 assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activity
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'HISTORICAL DEVICE BASELINE (user-provided v0.6.7 Android 12 screenshot; not this run)' in activity
-assert 'mkdir /mnt/sdcard 0000 system system' in activity and 'File.listFiles() returned null' in activity
-assert 'OsConstants.O_NOFOLLOW' in activity and 'app-owner rwx' in activity
-assert 'not yet confirmed on-device' in activity and 'no guest linker/Zygote/Framework' in activity
-assert 'No v0.6.8 trace has been recorded yet' in activity
+assert 'HISTORICAL DEVICE TRACE (user-provided v0.6.8 Android 12 log; not this run)' in activity
+assert 'Guest PID 13 execve returned brokered -13 (EACCES)' in activity
+assert 'tracked=4, reaped=4, unresolved=0' in activity
+assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
+assert 'No v0.6.9 device trace has been recorded yet' in activity
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
 assert 'android:grantUriPermissions="true"' in manifest and '${applicationId}.trace-logs' in manifest
@@ -305,11 +327,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.8-test-signed-apk' in upload
-assert 'gingervm-v0.6.8-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 17" in gradle and "versionName '0.6.8'" in gradle
+assert 'gingervm-continuous-trace-v0.6.9-test-signed-apk' in upload
+assert 'gingervm-v0.6.9-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 18" in gradle and "versionName '0.6.9'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.8' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.9' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
@@ -330,5 +352,5 @@ assert 'api10-system-manifest.json' in stager
 assert 'libgingervm_guest_linker.so' in stager
 assert 'patch_guest_interpreter' in stager and 'PATCHED_GUEST_INTERPRETER' in stager
 assert 'dynamic_interpreter_original' in stager and 'dynamic_interpreter_patched' in stager
-print('continuous API10 guest contract: PASS (one /init tree, bounded descendants, software PID/mount/uevent control plane, syscall-83 VFS symlink containment, in-memory AF_UNIX property endpoint and SIGCHLD socketpair, fail-closed socketcall allowlist, original API10 linker via fd 198, full verified Google /system, no host root/mount/socket APIs)')
+print('continuous API10 guest contract: PASS (one /init tree, bounded descendants, escaped/capped denial and exec-path diagnostics, distinct linker/main stage labels, dark no-frame guest viewport, software PID/mount/uevent and property socket models, original API10 linker via fd 198, full verified Google /system, no host root/mount/socket APIs)')
 PY

@@ -25,6 +25,7 @@
 #include "guest_symlink_ops.h"
 #include "guest_socket_virtual.h"
 #include "guest_socket_path_ops.h"
+#include "guest_diagnostics.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -194,6 +195,9 @@
 #define SCRATCH_BELOW_SP 8192u
 #define ARM_SYSCALL_STOP (SIGTRAP | 0x80)
 #define MAX_TRACE_LINES 160
+#define MAX_BROKER_DENIAL_DIAGNOSTICS 24u
+#define MAX_EXEC_FAILURE_DIAGNOSTICS 16u
+#define GUEST_DIAGNOSTIC_TEXT_CAPACITY 512u
 #define VIRTUAL_FD_BASE GUEST_VSOCKET_FD_BASE
 #define MAX_VIRTUAL_FDS GUEST_VSOCKET_MAX_FDS
 #define MAX_TRACEES 32
@@ -228,6 +232,7 @@ struct tracee_state {
     uint32_t last_syscall_args[6];
     char last_guest_path[PATH_MAX];
     char exec_target[PATH_MAX];
+    char pending_exec_target[PATH_MAX];
 };
 enum pending_kind { PENDING_NONE, PENDING_RESULT };
 
@@ -240,6 +245,10 @@ static struct guest_mount mounts[MAX_GUEST_MOUNTS];
 static size_t mount_count;
 static unsigned long syscall_stops;
 static unsigned long denied_count;
+static unsigned long broker_denial_diagnostics_emitted;
+static unsigned long broker_denial_diagnostics_suppressed;
+static unsigned long exec_failure_diagnostics_emitted;
+static unsigned long exec_failure_diagnostics_suppressed;
 static unsigned long path_rewrites;
 static unsigned long guest_target_path_opens;
 static unsigned long virtual_mount_count;
@@ -368,6 +377,48 @@ static int read_remote_string(pid_t pid, uint32_t address, char *out, size_t cap
     }
     out[capacity - 1] = '\0';
     return -1;
+}
+
+static void log_broker_denial_detail(pid_t host_pid, const struct tracee_state *state,
+                                    int nr, int32_t result, const char *guest_path,
+                                    const char *reason, int exec_failure) {
+    unsigned long *emitted = exec_failure ? &exec_failure_diagnostics_emitted
+                                          : &broker_denial_diagnostics_emitted;
+    unsigned long *suppressed = exec_failure ? &exec_failure_diagnostics_suppressed
+                                             : &broker_denial_diagnostics_suppressed;
+    unsigned long limit = exec_failure ? MAX_EXEC_FAILURE_DIAGNOSTICS
+                                       : MAX_BROKER_DENIAL_DIAGNOSTICS;
+    if (*emitted >= limit) {
+        (*suppressed)++;
+        return;
+    }
+    (*emitted)++;
+
+    const char *exe = state && state->exec_target[0] ? state->exec_target : "<unknown>";
+    const char *path = guest_path && guest_path[0] ? guest_path
+        : state && state->last_guest_path[0] ? state->last_guest_path : "<not-decoded>";
+    char safe_exe[GUEST_DIAGNOSTIC_TEXT_CAPACITY];
+    char safe_path[GUEST_DIAGNOSTIC_TEXT_CAPACITY];
+    int exe_truncated = guest_diag_escape(exe, safe_exe, sizeof(safe_exe));
+    int path_truncated = guest_diag_escape(path, safe_path, sizeof(safe_path));
+    uint32_t args[6] = {0, 0, 0, 0, 0, 0};
+    if (state) memcpy(args, state->last_syscall_args, sizeof(args));
+    int error_number = result < 0 ? -result : 0;
+
+    fprintf(stderr,
+            "%s: host-pid=%d guest-pid=%d guest-executable=\"%s\" syscall=%d(%s) "
+            "args=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x,0x%08x path=\"%s\" "
+            "result=%d errno=%d(%s) reason=%s truncated=%d,%d\n",
+            exec_failure ? "GUEST EXEC FAILURE DETAIL" : "BROKER DENIED DETAIL",
+            host_pid, state ? state->guest_pid : 0, safe_exe, nr,
+            guest_diag_syscall_name(nr), args[0], args[1], args[2], args[3], args[4], args[5],
+            safe_path, result, error_number, guest_diag_errno_name(error_number),
+            reason ? reason : "unspecified", exe_truncated, path_truncated);
+}
+
+static int guest_exec_failure(const char **failure_reason, const char *reason, int result) {
+    if (failure_reason) *failure_reason = reason;
+    return result;
 }
 
 static int mkdir_p(const char *path) {
@@ -1282,42 +1333,92 @@ static int patched_dynamic_native_path(const char *original, char *out, size_t c
     return n > 0 && (size_t)n < capacity ? 0 : -ENAMETOOLONG;
 }
 
-static int mediate_guest_execve(pid_t pid, struct compat_pt_regs *regs) {
+static int mediate_guest_execve(pid_t pid, struct tracee_state *state,
+                                struct compat_pt_regs *regs, char *diagnostic_path,
+                                size_t diagnostic_capacity, const char **failure_reason) {
     char guest[PATH_MAX], host[PATH_MAX], resolved[PATH_MAX], patched[PATH_MAX], patched_resolved[PATH_MAX];
-    if (read_remote_string(pid, regs->uregs[0], guest, sizeof(guest)) != 0) return -EFAULT;
-    if (guest[0] != '/' || guest_path_has_parent(guest)) return -EACCES;
+    if (diagnostic_path && diagnostic_capacity) diagnostic_path[0] = '\0';
+    if (failure_reason) *failure_reason = "unspecified";
+    if (read_remote_string(pid, regs->uregs[0], guest, sizeof(guest)) != 0) {
+        if (diagnostic_path && diagnostic_capacity)
+            snprintf(diagnostic_path, diagnostic_capacity, "<unreadable-or-too-long>");
+        return guest_exec_failure(failure_reason, "exec-path-unreadable-or-too-long", -EFAULT);
+    }
+    if (diagnostic_path && diagnostic_capacity)
+        snprintf(diagnostic_path, diagnostic_capacity, "%s", guest);
+    if (guest[0] != '/')
+        return guest_exec_failure(failure_reason, "guest-path-not-absolute", -EACCES);
+    if (guest_path_has_parent(guest))
+        return guest_exec_failure(failure_reason, "guest-path-contains-parent-traversal", -EACCES);
     int rc = map_guest_path(guest, host, sizeof(host));
-    if (rc != 0) return rc;
-    if (!realpath(host, resolved)) return -errno;
+    if (rc != 0)
+        return guest_exec_failure(failure_reason, "guest-vfs-path-mapping-failed", rc);
+    if (!realpath(host, resolved)) {
+        int saved_errno = errno;
+        return guest_exec_failure(failure_reason, "guest-vfs-path-resolution-failed", -saved_errno);
+    }
 
     char staged_init[PATH_MAX], resolved_init[PATH_MAX];
     int n = snprintf(staged_init, sizeof(staged_init), "%s/init", guest_root);
-    if (n <= 0 || (size_t)n >= sizeof(staged_init)) return -ENAMETOOLONG;
+    if (n <= 0 || (size_t)n >= sizeof(staged_init))
+        return guest_exec_failure(failure_reason, "guest-init-path-too-long", -ENAMETOOLONG);
     if (realpath(staged_init, resolved_init) && strcmp(resolved, resolved_init) == 0) {
         rc = original_init_native_path(host, sizeof(host));
-        if (rc != 0) return rc;
-        if (!realpath(host, resolved)) return -errno;
+        if (rc != 0)
+            return guest_exec_failure(failure_reason, "original-init-native-payload-invalid", rc);
+        if (!realpath(host, resolved)) {
+            int saved_errno = errno;
+            return guest_exec_failure(failure_reason, "original-init-payload-resolution-failed", -saved_errno);
+        }
     }
 
-    if (!path_is_within(resolved, native_guest_root)) return -EACCES;
+    if (!path_is_within(resolved, native_guest_root))
+        return guest_exec_failure(failure_reason, "resolved-executable-outside-approved-native-root", -EACCES);
     struct stat st;
-    if (stat(resolved, &st) != 0) return -errno;
-    if (!S_ISREG(st.st_mode) || !(st.st_mode & 0111)) return -EACCES;
+    if (stat(resolved, &st) != 0) {
+        int saved_errno = errno;
+        return guest_exec_failure(failure_reason, "resolved-executable-stat-failed", -saved_errno);
+    }
+    if (!S_ISREG(st.st_mode))
+        return guest_exec_failure(failure_reason, "resolved-executable-is-not-regular-file", -EACCES);
+    if (!(st.st_mode & 0111))
+        return guest_exec_failure(failure_reason, "resolved-executable-has-no-execute-bit", -EACCES);
 
     char interpreter[PATH_MAX];
     int elf_kind = guest_elf32_arm_interpreter(resolved, interpreter, sizeof(interpreter));
-    if (elf_kind < 0) return elf_kind;
+    if (elf_kind < 0)
+        return guest_exec_failure(failure_reason, "target-is-not-a-valid-ELF32-ARM-image", elf_kind);
     int dynamic_exec = 0;
     if (elf_kind > 0) {
-        if (strcmp(interpreter, "/system/bin/linker") != 0 ||
-            patched_dynamic_native_path(resolved, patched, sizeof(patched)) != 0 ||
-            !realpath(patched, patched_resolved) || !path_is_within(patched_resolved, native_guest_root)) {
+        const char *dynamic_failure = "dynamic-PT_INTERP-not-supported-or-alias-not-confined";
+        int patched_path_rc = -ENOEXEC;
+        int patched_resolved_ok = 0;
+        int patched_within_native = 0;
+        if (strcmp(interpreter, "/system/bin/linker") == 0) {
+            patched_path_rc = patched_dynamic_native_path(resolved, patched, sizeof(patched));
+            if (patched_path_rc == 0) {
+                if (realpath(patched, patched_resolved)) {
+                    patched_resolved_ok = 1;
+                    patched_within_native = path_is_within(patched_resolved, native_guest_root);
+                    if (!patched_within_native)
+                        dynamic_failure = "patched-executable-alias-outside-approved-native-root";
+                } else {
+                    dynamic_failure = "patched-executable-alias-not-found";
+                }
+            } else {
+                dynamic_failure = "patched-executable-alias-path-invalid";
+            }
+        } else {
+            dynamic_failure = "unsupported-dynamic-PT_INTERP";
+        }
+        if (strcmp(interpreter, "/system/bin/linker") != 0 || patched_path_rc != 0 ||
+            !patched_resolved_ok || !patched_within_native) {
             dynamic_exec_blocked = 1;
             snprintf(dynamic_exec_guest_path, sizeof(dynamic_exec_guest_path), "%s", guest);
             snprintf(dynamic_exec_interpreter, sizeof(dynamic_exec_interpreter), "%s", interpreter);
             fprintf(stderr, "CONTINUOUS CHAIN BLOCKER: guest exec %s has unsupported or unpatched PT_INTERP %s; denied before host linker substitution\n",
                     guest, interpreter);
-            return -ENOEXEC;
+            return guest_exec_failure(failure_reason, dynamic_failure, -ENOEXEC);
         }
         struct stat patched_st;
         char patched_interpreter[PATH_MAX];
@@ -1331,7 +1432,7 @@ static int mediate_guest_execve(pid_t pid, struct compat_pt_regs *regs) {
             snprintf(dynamic_exec_interpreter, sizeof(dynamic_exec_interpreter), "%s", interpreter);
             fprintf(stderr, "CONTINUOUS CHAIN BLOCKER: verified guest-linker alias missing or invalid for %s; denied before host linker substitution\n",
                     guest);
-            return -ENOEXEC;
+            return guest_exec_failure(failure_reason, "verified-guest-linker-alias-invalid", -ENOEXEC);
         }
         snprintf(resolved, sizeof(resolved), "%s", patched_resolved);
         dynamic_exec = 1;
@@ -1340,12 +1441,16 @@ static int mediate_guest_execve(pid_t pid, struct compat_pt_regs *regs) {
 
     uint32_t scratch = (regs->uregs[13] - SCRATCH_BELOW_SP) & ~((uint32_t)sizeof(long) - 1u);
     size_t bytes = strlen(resolved) + 1;
-    if (bytes >= 2048 || write_remote(pid, scratch, resolved, bytes) != 0) return -EFAULT;
+    if (bytes >= 2048)
+        return guest_exec_failure(failure_reason, "rewritten-exec-path-exceeds-scratch-limit", -EFAULT);
+    if (write_remote(pid, scratch, resolved, bytes) != 0)
+        return guest_exec_failure(failure_reason, "rewritten-exec-path-could-not-be-written", -EFAULT);
     regs->uregs[0] = scratch;
-    if (set_regs(pid, regs) != 0) return -EFAULT;
-    if (active_tracee) {
-        snprintf(active_tracee->exec_target, sizeof(active_tracee->exec_target), "%s", guest);
-        active_tracee->exec_was_dynamic = dynamic_exec;
+    if (set_regs(pid, regs) != 0)
+        return guest_exec_failure(failure_reason, "execve-path-register-update-failed", -EFAULT);
+    if (state) {
+        snprintf(state->pending_exec_target, sizeof(state->pending_exec_target), "%s", guest);
+        state->exec_was_dynamic = dynamic_exec;
     }
     path_rewrites++;
     if (dynamic_exec)
@@ -1356,7 +1461,6 @@ static int mediate_guest_execve(pid_t pid, struct compat_pt_regs *regs) {
                pid, guest);
     return 0;
 }
-
 static int prepare_guest_linker_fd(void) {
     char linker[PATH_MAX];
     int n = snprintf(linker, sizeof(linker), "%s/libgingervm_guest_linker.so", native_guest_root);
@@ -1618,14 +1722,19 @@ static int translate_guest_pid_result(pid_t pid, struct tracee_state *state,
     return 0;
 }
 
-static int dispatch_entry(pid_t pid, struct compat_pt_regs *regs, int nr,
+static int dispatch_entry(pid_t pid, struct tracee_state *state,
+                          struct compat_pt_regs *regs, int nr,
                           int32_t *pending_return, int *fake) {
     *fake = 0;
     enum guest_syscall_class policy = guest_syscall_policy(nr);
     if (nr == ARM_NR_EXECVE) {
-        int rc = mediate_guest_execve(pid, regs);
+        char guest_path[PATH_MAX];
+        const char *reason = "unspecified";
+        int rc = mediate_guest_execve(pid, state, regs, guest_path,
+                                      sizeof(guest_path), &reason);
         if (rc == 0) return 0;
         denied_count++;
+        log_broker_denial_detail(pid, state, nr, rc, guest_path, reason, 1);
         *pending_return = rc;
         *fake = 1;
         return 0;
@@ -1774,6 +1883,8 @@ static int dispatch_entry(pid_t pid, struct compat_pt_regs *regs, int nr,
     }
     if (policy == GUEST_SYSCALL_BLOCK_PROCESS) {
         blocked_process_count++;
+        log_broker_denial_detail(pid, state, nr, -EAGAIN, NULL,
+                                 "process-start-blocked-by-policy", 0);
         *pending_return = -EAGAIN; *fake = 1; return 0;
     }
     if (policy == GUEST_SYSCALL_TRACE_PROCESS) return 0;
@@ -1800,6 +1911,8 @@ static int dispatch_entry(pid_t pid, struct compat_pt_regs *regs, int nr,
     if (nr == ARM_NR_EXECVE || nr == ARM_NR_PTRACE ||
         nr == ARM_NR_PIVOT_ROOT || nr == ARM_NR_KILL) {
         denied_count++;
+        log_broker_denial_detail(pid, state, nr, -EPERM, NULL,
+                                 "privileged-or-process-control-syscall-denied", 0);
         *pending_return = -EPERM; *fake = 1; return 0;
     }
     if (policy == GUEST_SYSCALL_ALLOW_SAFE) {
@@ -1808,6 +1921,11 @@ static int dispatch_entry(pid_t pid, struct compat_pt_regs *regs, int nr,
         return 0;
     }
     denied_count++;
+    log_broker_denial_detail(pid, state, nr, -ENOSYS, NULL,
+                             policy == GUEST_SYSCALL_DENY
+                                 ? "explicit-syscall-deny-policy"
+                                 : "unknown-syscall-class-default-deny",
+                             0);
     *pending_return = -ENOSYS; *fake = 1;
     return 0;
 }
@@ -1928,6 +2046,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 child_state->guest_euid = state->guest_euid;
                 child_state->guest_rgid = state->guest_rgid;
                 child_state->guest_egid = state->guest_egid;
+                snprintf(child_state->exec_target, sizeof(child_state->exec_target), "%s",
+                         state->exec_target[0] ? state->exec_target : "<unknown>");
                 process_events++;
                 printf("GUEST PROCESS EVENT: parent=%d guest-pid=%d child=%d guest-pid=%d type=%s tracees=%zu/%d\n",
                        waited, state->guest_pid, child_pid, child_guest_pid,
@@ -1942,6 +2062,11 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
         }
         if (event == PTRACE_EVENT_EXEC) {
             broker_sigsys_clear(&state->broker_sigsys);
+            if (state->pending_exec_target[0]) {
+                snprintf(state->exec_target, sizeof(state->exec_target), "%s",
+                         state->pending_exec_target);
+                state->pending_exec_target[0] = '\0';
+            }
             close_virtual_fds_on_exec(state);
             successful_guest_execs++;
             if (state->exec_was_dynamic) {
@@ -1949,6 +2074,9 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 printf("GUEST DYNAMIC EXEC EVENT: pid=%d target=%s; kernel entered the original API10 linker via fd=%d; target main entry remains unproven\n",
                        waited, state->exec_target[0] ? state->exec_target : "unknown guest path",
                        GUEST_LINKER_FD);
+                printf("GUEST STARTUP STAGE: linker-entry=observed pid=%d guest-pid=%d target=%s; target-main-entry=not-observed (no target-entry instrumentation); Zygote/framework=unproven\n",
+                       waited, state->guest_pid,
+                       state->exec_target[0] ? state->exec_target : "unknown guest path");
             } else {
                 printf("GUEST EXEC EVENT: pid=%d target=%s (verified ELF32 ARM payload)\n",
                        waited, state->exec_target[0] ? state->exec_target : "unknown guest path");
@@ -1983,7 +2111,7 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 syscall_stops++;
                 int fake = 0;
                 int32_t result = 0;
-                int rc = dispatch_entry(waited, &regs, state->last_syscall, &result, &fake);
+                int rc = dispatch_entry(waited, state, &regs, state->last_syscall, &result, &fake);
                 if (rc != 0) { fprintf(stderr, "broker failure at ARM syscall %d pid=%d: errno=%d\n", state->last_syscall, waited, errno); kill_all_tracees(); return -1; }
                 if (fake) {
                     if (fake_entry(waited, &regs, result, &state->pending_return) != 0) { fprintf(stderr, "could not cancel syscall %d pid=%d: errno=%d\n", state->last_syscall, waited, errno); kill_all_tracees(); return -1; }
@@ -2040,7 +2168,14 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     kill_all_tracees(); return -1;
                 }
                 if (!state->pending && state->last_syscall == ARM_NR_EXECVE &&
-                    (int32_t)regs.uregs[0] < 0) state->exec_was_dynamic = 0;
+                    (int32_t)regs.uregs[0] < 0) {
+                    int32_t exec_result = (int32_t)regs.uregs[0];
+                    log_broker_denial_detail(waited, state, ARM_NR_EXECVE, exec_result,
+                        state->pending_exec_target[0] ? state->pending_exec_target : NULL,
+                        "kernel-execve-returned-error-after-path-rewrite", 1);
+                    state->pending_exec_target[0] = '\0';
+                    state->exec_was_dynamic = 0;
+                }
                 state->expect_exit = 0;
                 state->pending = 0;
             }
@@ -2191,10 +2326,16 @@ int main(int argc, char **argv) {
     printf("CONTINUOUS PROCESS TREE: fork/clone/vfork events=%lu; guest exec events=%lu; dynamic execs redirected=%lu; kernel entries into original guest linker=%lu; dynamic target main remains unproven; maximum tracees=%d\n",
            process_events, successful_guest_execs, dynamic_exec_allowed_count,
            dynamic_exec_started_count, MAX_TRACEES);
+    printf("GUEST STARTUP STAGE SUMMARY: original-init-post-exec=%s; original-linker-entry-events=%lu; target-main-entry=unobserved (target-entry instrumentation not installed); Zygote/framework/system_server/desktop=unproven\n",
+           saw_exec ? "observed" : "not-observed", dynamic_exec_started_count);
     printf("SYSCALL ENTRIES: %lu; PATH REWRITES: %lu; VIRTUAL MOUNTS: %lu; VIRTUAL DEVICE/MODE OPS: %lu; VIRTUAL ID OPS: %lu; VIRTUAL FILE OPS: %lu; VIRTUAL SYMLINK OPS: %lu; VIRTUAL SOCKET CALLS: %lu; VIRTUAL POLL WAITS: %lu; BROKERED SIGSYS SUPPRESSED: %lu; BLOCKED PROCESS STARTS: %lu; DENIED: %lu\n",
            syscall_stops, path_rewrites, virtual_mount_count, virtual_device_count,
            virtual_identity_count, virtual_file_ops, virtual_symlink_ops, virtual_socket_calls, virtual_poll_waits,
            brokered_sigsys_suppressed, blocked_process_count, denied_count);
+    printf("BROKER DIAGNOSTIC SUMMARY: denial-details=%lu suppressed=%lu (limit=%u); failed-exec-details=%lu suppressed=%lu (limit=%u)\n",
+           broker_denial_diagnostics_emitted, broker_denial_diagnostics_suppressed,
+           MAX_BROKER_DENIAL_DIAGNOSTICS, exec_failure_diagnostics_emitted,
+           exec_failure_diagnostics_suppressed, MAX_EXEC_FAILURE_DIAGNOSTICS);
     printf("VIRTUAL UEVENT SUMMARY: sockets=%lu binds=%lu setsockopt=%lu fd=%d bound=%d; /dev/.coldboot_done opened-by-ueventd=%d; /init wait released=%d; synthetic device events delivered=0\n",
            virtual_uevent_socket_count, virtual_uevent_bind_count,
            virtual_uevent_setsockopt_count, virtual_uevent_fd,
