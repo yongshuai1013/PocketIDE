@@ -16,6 +16,7 @@
 #include "guest_frame_channel.h"
 #include "guest_hardware_profile.h"
 #include "guest_identity_compat.h"
+#include "guest_safe_dir.h"
 
 #define GUEST_FB0_PATH "/dev/graphics/fb0"
 #define GUEST_FB0_SYSFS_DEVICE_PATH "/devices/virtual/graphics/fb0"
@@ -119,6 +120,59 @@ static inline const char *guest_fb0_mknod_rejection_reason(
     if (device != guest_fb0_makedev(GUEST_FB0_MAJOR, GUEST_FB0_MINOR))
         return "device-number-not-29-0";
     return NULL;
+}
+
+static inline const char *guest_fb0_mknod_path_rejection_reason(
+        const char *guest_path, uint32_t guest_euid, uint32_t guest_fsgid,
+        int graphics_uevent_received, uint32_t mode, uint32_t device) {
+    if (!guest_path || strcmp(guest_path, GUEST_FB0_PATH) != 0)
+        return "guest-path-not-exact-fb0";
+    return guest_fb0_mknod_rejection_reason(guest_euid, guest_fsgid,
+        graphics_uevent_received, mode, device);
+}
+
+static inline int guest_fb0_create_app_private_placeholder(
+        const char *guest_root, const char *guest_path,
+        uint32_t guest_euid, uint32_t guest_fsgid,
+        int graphics_uevent_received, uint32_t mode, uint32_t device) {
+    const char *reason = guest_fb0_mknod_path_rejection_reason(guest_path,
+        guest_euid, guest_fsgid, graphics_uevent_received, mode, device);
+    if (reason) return -EPERM;
+    if (!guest_root || guest_root[0] != '/') return -EINVAL;
+    char directory[PATH_MAX];
+    int n = snprintf(directory, sizeof(directory), "%s/dev/graphics", guest_root);
+    if (n <= 0 || (size_t)n >= sizeof(directory)) return -ENAMETOOLONG;
+    int directory_fd = guest_safe_dir_open_beneath_root(guest_root,
+        directory, 1, 0755);
+    if (directory_fd < 0) return directory_fd;
+    if (close(directory_fd) != 0) return -errno;
+    int fd = guest_safe_file_open_beneath_root(guest_root, directory,
+        "fb0", 0, 0600);
+    if (fd < 0) return fd;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int saved = errno;
+        close(fd);
+        return -saved;
+    }
+    if (!S_ISREG(st.st_mode) || st.st_uid != getuid() || st.st_nlink != 1 ||
+        st.st_size != 0 || (st.st_mode & 0777u) != 0600u) {
+        close(fd);
+        return -EACCES;
+    }
+    return close(fd) == 0 ? 0 : -errno;
+}
+
+/* mknod has no generic fallback: only the event-backed API10 Goldfish fb0
+ * request is modeled. Other device nodes require a separately sourced backend. */
+static inline int guest_mknod_create_app_private_device(
+        const char *guest_root, const char *guest_path,
+        uint32_t guest_euid, uint32_t guest_fsgid,
+        int graphics_uevent_received, uint32_t mode, uint32_t device) {
+    if (!guest_path) return -EINVAL;
+    if (strcmp(guest_path, GUEST_FB0_PATH) != 0) return -EOPNOTSUPP;
+    return guest_fb0_create_app_private_placeholder(guest_root, guest_path,
+        guest_euid, guest_fsgid, graphics_uevent_received, mode, device);
 }
 
 static inline int guest_fb0_mknod_args_valid(uint32_t guest_euid,

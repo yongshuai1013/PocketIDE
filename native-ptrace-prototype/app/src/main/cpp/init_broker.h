@@ -43,7 +43,7 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
             return GUEST_SYSCALL_ALLOW_SAFE;
 
         /* Absolute guest paths are translated and checked before host execution. */
-        case 5: case 8: case 9: case 10: case 12: case 15: case 16: case 33:
+        case 5: case 8: case 9: case 10: case 12: case 14: case 15: case 16: case 33:
         case 38: case 39: case 40: case 85: case 92: case 182: case 193:
         case 195: case 196: case 198: case 212: case 226: case 227: case 228:
         case 229: case 230:
@@ -77,9 +77,9 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
         case 21: case 52:
             return GUEST_SYSCALL_VIRTUAL_MOUNT;
 
-        /* Device operations are guest-only; ioctl is intercepted only for the
-         * whitelisted virtual eth0 control fd, and unknown ioctls fail closed. */
-        case 14: case 54: case 94: case 95: case 133:
+        /* Device operations are guest-only; mknod uses the path broker so its
+         * exact guest pathname and source-backed fb0 attributes are validated. */
+        case 54: case 94: case 95: case 133:
             return GUEST_SYSCALL_VIRTUAL_DEVICE;
 
         /* Only the ptrace supervisor's bounded, explicitly attached guest tree

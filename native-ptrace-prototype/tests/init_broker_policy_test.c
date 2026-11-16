@@ -24,7 +24,9 @@ int main(void) {
     assert(guest_syscall_policy(57) == GUEST_SYSCALL_VIRTUALIZE); /* guest-only setpgid */
     assert(guest_syscall_policy(67) == GUEST_SYSCALL_VIRTUALIZE); /* legacy sigaction adapter */
     assert(guest_syscall_policy(79) == GUEST_SYSCALL_VIRTUALIZE); /* timezone-only settimeofday */
-    assert(guest_syscall_policy(14) == GUEST_SYSCALL_VIRTUAL_DEVICE);
+    assert(guest_syscall_policy(14) == GUEST_SYSCALL_PATH_REWRITE); /* mknod path + exact fb0 gate */
+    assert(guest_syscall_policy(324) == GUEST_SYSCALL_PATH_REWRITE); /* mknodat dirfd/path mediation */
+    assert(guest_syscall_policy(54) == GUEST_SYSCALL_VIRTUAL_DEVICE); /* ioctl whitelist */
     assert(guest_syscall_policy(120) == GUEST_SYSCALL_TRACE_PROCESS);
     assert(guest_syscall_policy(2) == GUEST_SYSCALL_TRACE_PROCESS);
     assert(guest_syscall_policy(190) == GUEST_SYSCALL_TRACE_PROCESS);

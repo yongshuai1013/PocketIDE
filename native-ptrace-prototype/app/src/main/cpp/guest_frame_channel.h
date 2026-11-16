@@ -20,11 +20,18 @@
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 02000000
 #endif
+#ifndef O_PATH
+#define O_PATH 010000000
+#endif
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
 
 #define GUEST_FRAME_CHANNEL_DIRECTORY "gingervm-display"
 #define GUEST_FRAME_CHANNEL_FILE "latest.gvmf"
 #define GUEST_FRAME_CHANNEL_TEMP_FILE "latest.gvmf.tmp"
 #define GUEST_FRAME_CHANNEL_ENV "GINGERVM_GUEST_FRAME_DIR"
+#define GUEST_FRAME_CHANNEL_MAX_PATH_COMPONENTS 32u
 #define GUEST_FRAME_PROTOCOL_MAGIC "GVMF"
 #define GUEST_FRAME_PROTOCOL_VERSION 1u
 #define GUEST_FRAME_PROTOCOL_HEADER_BYTES 64u
@@ -45,17 +52,71 @@ enum guest_frame_channel_validation_reason {
     GUEST_FRAME_CHANNEL_FSTAT_FAILED,
     GUEST_FRAME_CHANNEL_NOT_DIRECTORY,
     GUEST_FRAME_CHANNEL_WRONG_OWNER,
-    GUEST_FRAME_CHANNEL_NOT_PRIVATE
+    GUEST_FRAME_CHANNEL_NOT_PRIVATE,
+    GUEST_FRAME_CHANNEL_PARENT_UNSAFE_WRITABLE,
+    GUEST_FRAME_CHANNEL_GUEST_ROOT_NOT_PRIVATE,
+    GUEST_FRAME_CHANNEL_PATH_COMPONENT_SYMLINK,
+    GUEST_FRAME_CHANNEL_PATH_COMPONENT_LIMIT
+};
+
+struct guest_frame_channel_component_audit {
+    char name[NAME_MAX + 1u];
+    uid_t owner;
+    gid_t group;
+    mode_t mode;
+    uint64_t device;
+    uint64_t inode;
+    int has_stat;
+    int opened;
+    int symlink;
+    int error_number;
+};
+
+struct guest_frame_channel_path_audit {
+    char path[PATH_MAX];
+    unsigned int component_count;
+    int error_number;
+    struct guest_frame_channel_component_audit components[GUEST_FRAME_CHANNEL_MAX_PATH_COMPONENTS];
+};
+
+enum guest_frame_channel_validation_scope {
+    GUEST_FRAME_CHANNEL_SCOPE_NONE = 0,
+    GUEST_FRAME_CHANNEL_SCOPE_ROOT_PARENT,
+    GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_PARENT,
+    GUEST_FRAME_CHANNEL_SCOPE_PARENT_IDENTITY,
+    GUEST_FRAME_CHANNEL_SCOPE_PARENT_OWNER,
+    GUEST_FRAME_CHANNEL_SCOPE_PARENT_MODE,
+    GUEST_FRAME_CHANNEL_SCOPE_GUEST_ROOT_LEAF,
+    GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_LEAF
 };
 
 struct guest_frame_channel_validation_detail {
     enum guest_frame_channel_validation_reason reason;
+    enum guest_frame_channel_validation_scope scope;
     int error_number;
     uid_t expected_owner;
     uid_t actual_owner;
     mode_t actual_mode;
     int has_stat;
     char expected_path[PATH_MAX];
+    char guest_root_path[PATH_MAX];
+    char channel_path[PATH_MAX];
+    struct guest_frame_channel_path_audit root_parent_audit;
+    struct guest_frame_channel_path_audit channel_parent_audit;
+    uid_t root_owner;
+    gid_t root_group;
+    mode_t root_mode;
+    uint64_t root_device;
+    uint64_t root_inode;
+    int root_has_stat;
+    int root_is_symlink;
+    uid_t channel_owner;
+    gid_t channel_group;
+    mode_t channel_mode;
+    uint64_t channel_device;
+    uint64_t channel_inode;
+    int channel_has_stat;
+    int channel_is_symlink;
 };
 
 static inline const char *guest_frame_channel_validation_reason_name(
@@ -69,7 +130,11 @@ static inline const char *guest_frame_channel_validation_reason_name(
         case GUEST_FRAME_CHANNEL_FSTAT_FAILED: return "fstat-failed";
         case GUEST_FRAME_CHANNEL_NOT_DIRECTORY: return "not-directory";
         case GUEST_FRAME_CHANNEL_WRONG_OWNER: return "wrong-owner";
-        case GUEST_FRAME_CHANNEL_NOT_PRIVATE: return "group-or-other-permission-present";
+        case GUEST_FRAME_CHANNEL_NOT_PRIVATE: return "leaf-group-or-other-permission-present";
+        case GUEST_FRAME_CHANNEL_PARENT_UNSAFE_WRITABLE: return "app-parent-writable-by-untrusted-group-or-world";
+        case GUEST_FRAME_CHANNEL_GUEST_ROOT_NOT_PRIVATE: return "guest-root-leaf-not-private";
+        case GUEST_FRAME_CHANNEL_PATH_COMPONENT_SYMLINK: return "symlink-path-component-rejected";
+        case GUEST_FRAME_CHANNEL_PATH_COMPONENT_LIMIT: return "path-component-audit-limit-exceeded";
         default: return "unknown-validation-reason";
     }
 }
@@ -206,6 +271,130 @@ static inline int guest_frame_channel_split_absolute_path(const char *path,
     return 0;
 }
 
+static inline void guest_frame_channel_audit_stat(
+        struct guest_frame_channel_component_audit *component,
+        const struct stat *st) {
+    if (!component || !st) return;
+    component->owner = st->st_uid;
+    component->group = st->st_gid;
+    component->mode = st->st_mode;
+    component->device = (uint64_t)st->st_dev;
+    component->inode = (uint64_t)st->st_ino;
+    component->has_stat = 1;
+}
+
+static inline int guest_frame_channel_parent_mode_safe(mode_t mode,
+        gid_t parent_group, gid_t app_group) {
+    return (mode & S_IWOTH) == 0 &&
+        ((mode & S_IWGRP) == 0 || parent_group == app_group);
+}
+
+/* Walk only a canonical absolute path, holding each opened directory FD.  Every
+ * component is checked with fstatat(AT_SYMLINK_NOFOLLOW), opened with O_NOFOLLOW,
+ * and compared by device/inode before the previous FD is released.  O_PATH lets
+ * us inspect/traverse platform ancestors such as /data/user without requiring
+ * their ownership or broad 0700 permissions; the app-private leaves are checked
+ * separately below. */
+static inline int guest_frame_channel_open_directory_path_nofollow(
+        const char *path, struct guest_frame_channel_path_audit *audit) {
+    if (!path || path[0] != '/' || !audit) return -EINVAL;
+    memset(audit, 0, sizeof(*audit));
+    size_t path_length = strlen(path);
+    if (path_length == 0 || path_length >= sizeof(audit->path)) return -ENAMETOOLONG;
+    memcpy(audit->path, path, path_length + 1u);
+    int fd = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) { audit->error_number = errno; return -errno; }
+    struct stat root_stat;
+    if (fstat(fd, &root_stat) != 0) {
+        int saved = errno;
+        close(fd);
+        audit->error_number = saved;
+        return -saved;
+    }
+    struct guest_frame_channel_component_audit *root = &audit->components[0];
+    memcpy(root->name, "/", 2u);
+    guest_frame_channel_audit_stat(root, &root_stat);
+    root->opened = 1;
+    audit->component_count = 1u;
+    const char *cursor = path + 1;
+    while (*cursor) {
+        const char *end = strchr(cursor, '/');
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        if (length == 0u || length > NAME_MAX ||
+            (length == 1u && cursor[0] == '.') ||
+            (length == 2u && cursor[0] == '.' && cursor[1] == '.')) {
+            close(fd);
+            audit->error_number = length > NAME_MAX ? ENAMETOOLONG : EACCES;
+            return -audit->error_number;
+        }
+        if (audit->component_count >= GUEST_FRAME_CHANNEL_MAX_PATH_COMPONENTS) {
+            close(fd);
+            audit->error_number = E2BIG;
+            return -E2BIG;
+        }
+        struct guest_frame_channel_component_audit *component =
+            &audit->components[audit->component_count++];
+        memcpy(component->name, cursor, length);
+        component->name[length] = '\0';
+        struct stat before_open;
+        if (fstatat(fd, component->name, &before_open, AT_SYMLINK_NOFOLLOW) != 0) {
+            int saved = errno;
+            component->error_number = saved;
+            audit->error_number = saved;
+            close(fd);
+            return -saved;
+        }
+        guest_frame_channel_audit_stat(component, &before_open);
+        if (S_ISLNK(before_open.st_mode)) {
+            component->symlink = 1;
+            component->error_number = ELOOP;
+            audit->error_number = ELOOP;
+            close(fd);
+            return -ELOOP;
+        }
+        int next_fd = openat(fd, component->name,
+            O_PATH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (next_fd < 0) {
+            int saved = errno;
+            component->error_number = saved;
+            audit->error_number = saved;
+            close(fd);
+            return -saved;
+        }
+        struct stat opened_stat;
+        if (fstat(next_fd, &opened_stat) != 0) {
+            int saved = errno;
+            component->error_number = saved;
+            audit->error_number = saved;
+            close(next_fd);
+            close(fd);
+            return -saved;
+        }
+        if (opened_stat.st_dev != before_open.st_dev ||
+            opened_stat.st_ino != before_open.st_ino) {
+            component->error_number = EAGAIN;
+            audit->error_number = EAGAIN;
+            close(next_fd);
+            close(fd);
+            return -EAGAIN;
+        }
+        guest_frame_channel_audit_stat(component, &opened_stat);
+        component->opened = 1;
+        if (!S_ISDIR(opened_stat.st_mode)) {
+            component->error_number = ENOTDIR;
+            audit->error_number = ENOTDIR;
+            close(next_fd);
+            close(fd);
+            return -ENOTDIR;
+        }
+        close(fd);
+        fd = next_fd;
+        if (!end) break;
+        cursor = end + 1;
+    }
+    return fd;
+}
+
 static inline int guest_frame_channel_open_app_private_sibling_ex(
         const char *directory, const char *guest_root, uid_t expected_owner,
         struct guest_frame_channel_validation_detail *detail) {
@@ -232,6 +421,8 @@ static inline int guest_frame_channel_open_app_private_sibling_ex(
         if (detail) *detail = value;
         return split_rc;
     }
+    memcpy(value.guest_root_path, guest_root, strlen(guest_root) + 1u);
+    memcpy(value.channel_path, directory, strlen(directory) + 1u);
     size_t root_len = strlen(root_parent);
     if (root_len >= sizeof(value.expected_path)) {
         value.reason = GUEST_FRAME_CHANNEL_PATH_TOO_LONG;
@@ -255,21 +446,34 @@ static inline int guest_frame_channel_open_app_private_sibling_ex(
         return -EACCES;
     }
 
-    int root_parent_fd = open(root_parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    int root_parent_fd = guest_frame_channel_open_directory_path_nofollow(
+        root_parent, &value.root_parent_audit);
     if (root_parent_fd < 0) {
-        value.reason = GUEST_FRAME_CHANNEL_OPEN_FAILED;
-        value.error_number = errno;
-        if (detail) *detail = value;
-        return -errno;
-    }
-    int channel_parent_fd = open(channel_parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (channel_parent_fd < 0) {
-        int saved = errno;
-        close(root_parent_fd);
-        value.reason = GUEST_FRAME_CHANNEL_OPEN_FAILED;
+        int saved = -root_parent_fd;
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_ROOT_PARENT;
+        value.reason = value.root_parent_audit.components[
+            value.root_parent_audit.component_count ? value.root_parent_audit.component_count - 1u : 0u].symlink
+                ? GUEST_FRAME_CHANNEL_PATH_COMPONENT_SYMLINK
+                : (saved == E2BIG ? GUEST_FRAME_CHANNEL_PATH_COMPONENT_LIMIT
+                                  : GUEST_FRAME_CHANNEL_OPEN_FAILED);
         value.error_number = saved;
         if (detail) *detail = value;
-        return -saved;
+        return root_parent_fd;
+    }
+    int channel_parent_fd = guest_frame_channel_open_directory_path_nofollow(
+        channel_parent, &value.channel_parent_audit);
+    if (channel_parent_fd < 0) {
+        int saved = -channel_parent_fd;
+        close(root_parent_fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_PARENT;
+        value.reason = value.channel_parent_audit.components[
+            value.channel_parent_audit.component_count ? value.channel_parent_audit.component_count - 1u : 0u].symlink
+                ? GUEST_FRAME_CHANNEL_PATH_COMPONENT_SYMLINK
+                : (saved == E2BIG ? GUEST_FRAME_CHANNEL_PATH_COMPONENT_LIMIT
+                                  : GUEST_FRAME_CHANNEL_OPEN_FAILED);
+        value.error_number = saved;
+        if (detail) *detail = value;
+        return channel_parent_fd;
     }
     struct stat root_parent_stat, channel_parent_stat;
     if (fstat(root_parent_fd, &root_parent_stat) != 0 ||
@@ -288,6 +492,7 @@ static inline int guest_frame_channel_open_app_private_sibling_ex(
         close(channel_parent_fd);
         close(root_parent_fd);
         value.reason = GUEST_FRAME_CHANNEL_NOT_EXACT_SIBLING;
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_PARENT_IDENTITY;
         value.error_number = EACCES;
         if (detail) *detail = value;
         return -EACCES;
@@ -296,19 +501,53 @@ static inline int guest_frame_channel_open_app_private_sibling_ex(
         close(channel_parent_fd);
         close(root_parent_fd);
         value.reason = GUEST_FRAME_CHANNEL_WRONG_OWNER;
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_PARENT_OWNER;
         value.error_number = EACCES;
         if (detail) *detail = value;
         return -EACCES;
     }
-    if ((root_parent_stat.st_mode & 0077) != 0 || (channel_parent_stat.st_mode & 0077) != 0) {
+    /* Parent ancestors may legitimately be searchable/readable by platform
+     * users.  Only reject writes available to world or to a non-app group;
+     * channel and guest-root leaves below remain strictly owner-private. */
+    if (!guest_frame_channel_parent_mode_safe(root_parent_stat.st_mode,
+            root_parent_stat.st_gid, getgid())) {
         close(channel_parent_fd);
         close(root_parent_fd);
-        value.reason = GUEST_FRAME_CHANNEL_NOT_PRIVATE;
+        value.reason = GUEST_FRAME_CHANNEL_PARENT_UNSAFE_WRITABLE;
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_PARENT_MODE;
         value.error_number = EACCES;
         if (detail) *detail = value;
         return -EACCES;
     }
 
+    struct stat root_link_stat;
+    if (fstatat(root_parent_fd, root_leaf, &root_link_stat,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        int saved = errno;
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_GUEST_ROOT_LEAF;
+        value.reason = GUEST_FRAME_CHANNEL_OPEN_FAILED;
+        value.error_number = saved;
+        if (detail) *detail = value;
+        return -saved;
+    }
+    value.root_owner = root_link_stat.st_uid;
+    value.root_group = root_link_stat.st_gid;
+    value.root_mode = root_link_stat.st_mode;
+    value.root_device = (uint64_t)root_link_stat.st_dev;
+    value.root_inode = (uint64_t)root_link_stat.st_ino;
+    value.root_has_stat = 1;
+    if (S_ISLNK(root_link_stat.st_mode)) {
+        value.root_is_symlink = 1;
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_GUEST_ROOT_LEAF;
+        value.reason = GUEST_FRAME_CHANNEL_PATH_COMPONENT_SYMLINK;
+        value.error_number = ELOOP;
+        if (detail) *detail = value;
+        return -ELOOP;
+    }
     int root_fd = openat(root_parent_fd, root_leaf,
                          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (root_fd < 0) {
@@ -331,18 +570,74 @@ static inline int guest_frame_channel_open_app_private_sibling_ex(
         if (detail) *detail = value;
         return -saved;
     }
+    if (root_stat.st_dev != root_link_stat.st_dev ||
+        root_stat.st_ino != root_link_stat.st_ino) {
+        close(root_fd);
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_GUEST_ROOT_LEAF;
+        value.reason = GUEST_FRAME_CHANNEL_FSTAT_FAILED;
+        value.error_number = EAGAIN;
+        if (detail) *detail = value;
+        return -EAGAIN;
+    }
+    value.root_owner = root_stat.st_uid;
+    value.root_group = root_stat.st_gid;
+    value.root_mode = root_stat.st_mode;
+    value.root_device = (uint64_t)root_stat.st_dev;
+    value.root_inode = (uint64_t)root_stat.st_ino;
+    value.root_has_stat = 1;
     if (!S_ISDIR(root_stat.st_mode) || root_stat.st_uid != expected_owner) {
         close(root_fd);
         close(channel_parent_fd);
         close(root_parent_fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_GUEST_ROOT_LEAF;
         value.reason = S_ISDIR(root_stat.st_mode) ? GUEST_FRAME_CHANNEL_WRONG_OWNER :
                        GUEST_FRAME_CHANNEL_NOT_DIRECTORY;
         value.error_number = S_ISDIR(root_stat.st_mode) ? EACCES : ENOTDIR;
         if (detail) *detail = value;
         return -value.error_number;
     }
+    if ((root_stat.st_mode & 0077) != 0) {
+        close(root_fd);
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_GUEST_ROOT_LEAF;
+        value.reason = GUEST_FRAME_CHANNEL_GUEST_ROOT_NOT_PRIVATE;
+        value.error_number = EACCES;
+        if (detail) *detail = value;
+        return -EACCES;
+    }
     close(root_fd);
 
+    struct stat channel_link_stat;
+    if (fstatat(channel_parent_fd, channel_leaf, &channel_link_stat,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        int saved = errno;
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_LEAF;
+        value.reason = GUEST_FRAME_CHANNEL_OPEN_FAILED;
+        value.error_number = saved;
+        if (detail) *detail = value;
+        return -saved;
+    }
+    value.channel_owner = channel_link_stat.st_uid;
+    value.channel_group = channel_link_stat.st_gid;
+    value.channel_mode = channel_link_stat.st_mode;
+    value.channel_device = (uint64_t)channel_link_stat.st_dev;
+    value.channel_inode = (uint64_t)channel_link_stat.st_ino;
+    value.channel_has_stat = 1;
+    if (S_ISLNK(channel_link_stat.st_mode)) {
+        value.channel_is_symlink = 1;
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_LEAF;
+        value.reason = GUEST_FRAME_CHANNEL_PATH_COMPONENT_SYMLINK;
+        value.error_number = ELOOP;
+        if (detail) *detail = value;
+        return -ELOOP;
+    }
     int fd = openat(channel_parent_fd, channel_leaf,
                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     close(channel_parent_fd);
@@ -362,11 +657,27 @@ static inline int guest_frame_channel_open_app_private_sibling_ex(
         if (detail) *detail = value;
         return -saved;
     }
+    if (st.st_dev != channel_link_stat.st_dev ||
+        st.st_ino != channel_link_stat.st_ino) {
+        close(fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_LEAF;
+        value.reason = GUEST_FRAME_CHANNEL_FSTAT_FAILED;
+        value.error_number = EAGAIN;
+        if (detail) *detail = value;
+        return -EAGAIN;
+    }
     value.actual_owner = st.st_uid;
     value.actual_mode = st.st_mode;
     value.has_stat = 1;
+    value.channel_owner = st.st_uid;
+    value.channel_group = st.st_gid;
+    value.channel_mode = st.st_mode;
+    value.channel_device = (uint64_t)st.st_dev;
+    value.channel_inode = (uint64_t)st.st_ino;
+    value.channel_has_stat = 1;
     if (!S_ISDIR(st.st_mode)) {
         close(fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_LEAF;
         value.reason = GUEST_FRAME_CHANNEL_NOT_DIRECTORY;
         value.error_number = ENOTDIR;
         if (detail) *detail = value;
@@ -374,6 +685,7 @@ static inline int guest_frame_channel_open_app_private_sibling_ex(
     }
     if (st.st_uid != expected_owner) {
         close(fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_LEAF;
         value.reason = GUEST_FRAME_CHANNEL_WRONG_OWNER;
         value.error_number = EACCES;
         if (detail) *detail = value;
@@ -381,12 +693,14 @@ static inline int guest_frame_channel_open_app_private_sibling_ex(
     }
     if ((st.st_mode & 0077) != 0) {
         close(fd);
+        value.scope = GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_LEAF;
         value.reason = GUEST_FRAME_CHANNEL_NOT_PRIVATE;
         value.error_number = EACCES;
         if (detail) *detail = value;
         return -EACCES;
     }
     value.reason = GUEST_FRAME_CHANNEL_VALID;
+    value.scope = GUEST_FRAME_CHANNEL_SCOPE_NONE;
     value.error_number = 0;
     if (detail) *detail = value;
     return fd;

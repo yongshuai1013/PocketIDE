@@ -57,14 +57,37 @@ int main(int argc, char **argv) {
         frame_dir, guest_root, getuid(), &detail) == 1);
     assert(detail.reason == GUEST_FRAME_CHANNEL_VALID && detail.has_stat);
     assert(detail.actual_owner == getuid() && (detail.actual_mode & 0077) == 0);
+    assert(detail.scope == GUEST_FRAME_CHANNEL_SCOPE_NONE);
+    assert(detail.root_has_stat && detail.channel_has_stat);
+    assert(detail.root_owner == getuid() && detail.channel_owner == getuid());
+    assert((detail.root_mode & 0077) == 0 && (detail.channel_mode & 0077) == 0);
+    assert(detail.root_parent_audit.component_count > 0);
+    gid_t foreign_group = getgid() == 0 ? (gid_t)1 : (gid_t)0;
+    assert(guest_frame_channel_parent_mode_safe(0755, getgid(), getgid()));
+    assert(guest_frame_channel_parent_mode_safe(0775, getgid(), getgid()));
+    assert(!guest_frame_channel_parent_mode_safe(0775, foreign_group, getgid()));
+    assert(!guest_frame_channel_parent_mode_safe(0777, getgid(), getgid()));
+    /* App-owned platform parents may be searchable but must not be writable by
+       world or a non-app group; the two app-private leaves stay mode 0700. */
+    assert(chmod(root, 0755) == 0);
+    assert(guest_frame_channel_validate_app_private_directory_ex(
+        frame_dir, guest_root, getuid(), &detail) == 1);
+    assert((detail.root_parent_audit.components[
+        detail.root_parent_audit.component_count - 1u].mode & 0077) == 0055);
+    assert(chmod(root, 0777) == 0);
+    assert(guest_frame_channel_validate_app_private_directory_ex(
+        frame_dir, guest_root, getuid(), &detail) == -EACCES);
+    assert(detail.reason == GUEST_FRAME_CHANNEL_PARENT_UNSAFE_WRITABLE);
+    assert(detail.scope == GUEST_FRAME_CHANNEL_SCOPE_PARENT_MODE);
+    assert(chmod(root, 0700) == 0);
     assert(strcmp(detail.expected_path, frame_dir) == 0);
     assert(guest_frame_channel_validate_app_private_directory_ex(
         wrong_dir, guest_root, getuid(), &detail) == -EACCES);
     assert(detail.reason == GUEST_FRAME_CHANNEL_NOT_EXACT_SIBLING);
     assert(strcmp(detail.expected_path, frame_dir) == 0);
 
-    /* Android may spell the same app-private files directory through /data/data
-       and /data/user/0. Accept only when opened parent directory identities match. */
+    /* Use one canonical app-private base for both leaves. A lexical alias via a
+       symlink is deliberately rejected even if it reaches the same inode. */
     join_path(alias_area, sizeof(alias_area), root, "alias-area");
     join_path(alias_shared, sizeof(alias_shared), alias_area, "shared");
     join_path(alias_link, sizeof(alias_link), root, "alias-parent");
@@ -82,11 +105,15 @@ int main(int argc, char **argv) {
               GUEST_FRAME_CHANNEL_DIRECTORY);
     assert(strcmp(alias_frame_alias, alias_frame_dir) != 0);
     assert(guest_frame_channel_validate_app_private_directory_ex(
-        alias_frame_alias, alias_guest_root, getuid(), &detail) == 1);
+        alias_frame_alias, alias_guest_root, getuid(), &detail) < 0);
+    assert(detail.reason == GUEST_FRAME_CHANNEL_PATH_COMPONENT_SYMLINK);
+    assert(detail.scope == GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_PARENT);
+    assert(guest_frame_channel_validate_app_private_directory_ex(
+        alias_frame_dir, alias_guest_root, getuid(), &detail) == 1);
     assert(detail.reason == GUEST_FRAME_CHANNEL_VALID && detail.has_stat);
     assert(strcmp(detail.expected_path, alias_frame_dir) == 0);
     int alias_frame_fd = guest_frame_channel_open_app_private_sibling_ex(
-        alias_frame_alias, alias_guest_root, getuid(), &detail);
+        alias_frame_dir, alias_guest_root, getuid(), &detail);
     assert(alias_frame_fd >= 0);
     struct stat alias_frame_stat;
     assert(fstat(alias_frame_fd, &alias_frame_stat) == 0 && S_ISDIR(alias_frame_stat.st_mode));
@@ -108,7 +135,8 @@ int main(int argc, char **argv) {
               GUEST_FRAME_CHANNEL_DIRECTORY);
     assert(guest_frame_channel_validate_app_private_directory_ex(
         outside_symlink_frame, alias_guest_root, getuid(), &detail) < 0);
-    assert(detail.reason == GUEST_FRAME_CHANNEL_OPEN_FAILED);
+    assert(detail.reason == GUEST_FRAME_CHANNEL_PATH_COMPONENT_SYMLINK);
+    assert(detail.scope == GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_PARENT);
 
     char traversal_frame[PATH_MAX];
     int traversal_length = snprintf(traversal_frame, sizeof(traversal_frame),
@@ -127,7 +155,9 @@ int main(int argc, char **argv) {
     assert(symlink(target_dir, symlink_guest_root) == 0);
     assert(guest_frame_channel_validate_app_private_directory_ex(
         symlink_root_frame, symlink_guest_root, getuid(), &detail) < 0);
-    assert(detail.reason == GUEST_FRAME_CHANNEL_OPEN_FAILED);
+    assert(detail.reason == GUEST_FRAME_CHANNEL_PATH_COMPONENT_SYMLINK);
+    assert(detail.scope == GUEST_FRAME_CHANNEL_SCOPE_GUEST_ROOT_LEAF);
+    assert(detail.root_is_symlink && detail.root_has_stat);
 
     uid_t wrong_owner = getuid() == 0 ? 1u : 0u;
     assert(guest_frame_channel_validate_app_private_directory_ex(
@@ -151,7 +181,9 @@ int main(int argc, char **argv) {
     assert(symlink(target_dir, linked_expected) == 0);
     assert(guest_frame_channel_validate_app_private_directory_ex(
         linked_expected, linked_guest_root, getuid(), &detail) < 0);
-    assert(detail.reason == GUEST_FRAME_CHANNEL_OPEN_FAILED);
+    assert(detail.reason == GUEST_FRAME_CHANNEL_PATH_COMPONENT_SYMLINK);
+    assert(detail.scope == GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_LEAF);
+    assert(detail.channel_is_symlink && detail.channel_has_stat);
     assert(detail.error_number != 0);
 
     static const unsigned char rgb565[] = {

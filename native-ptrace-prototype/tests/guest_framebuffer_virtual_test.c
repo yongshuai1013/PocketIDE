@@ -12,6 +12,7 @@
 
 #include "../app/src/main/cpp/guest_framebuffer_virtual.h"
 #include "../app/src/main/cpp/guest_pseudo_device.h"
+#include "../app/src/main/cpp/guest_uevent_virtual.h"
 
 static void join(char *out, size_t capacity, const char *parent, const char *leaf) {
     int n = snprintf(out, capacity, "%s/%s", parent, leaf);
@@ -25,6 +26,21 @@ static void read_exact(int fd, unsigned char *bytes, size_t length) {
         assert(n > 0);
         done += (size_t)n;
     }
+}
+
+static int event_has_field(const struct guest_uevent_event *event, const char *field) {
+    if (!event || !field) return 0;
+    size_t field_length = strlen(field);
+    size_t offset = 0;
+    while (offset < event->length) {
+        size_t remaining = event->length - offset;
+        size_t length = strnlen((const char *)event->data + offset, remaining);
+        if (length == field_length &&
+            memcmp(event->data + offset, field, field_length) == 0) return 1;
+        if (length == remaining) return 0;
+        offset += length + 1u;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -59,6 +75,67 @@ int main(int argc, char **argv) {
     assert(guest_fb0_device_minor(guest_fb0_makedev(29, 0)) == 0u);
     assert(guest_fb0_device_major(guest_fb0_makedev(1, 11)) == 1u);
     assert(guest_fb0_device_minor(guest_fb0_makedev(1, 11)) == 11u);
+    struct guest_uevent_queue graphics_queue;
+    guest_uevent_queue_init(&graphics_queue);
+    static const char add_request[] = "add\n";
+    assert(guest_uevent_enqueue_coldboot_add(&graphics_queue, 1,
+        GUEST_FB0_SYSFS_ATTRIBUTE_PATH, add_request, sizeof(add_request) - 1u) ==
+        (int)(sizeof(add_request) - 1u));
+    const struct guest_uevent_event *graphics_event =
+        guest_uevent_queue_front(&graphics_queue);
+    assert(graphics_event != NULL);
+    assert(event_has_field(graphics_event, "add@" GUEST_FB0_SYSFS_DEVICE_PATH));
+    assert(event_has_field(graphics_event, "SUBSYSTEM=graphics"));
+    assert(event_has_field(graphics_event,
+        "DEVPATH=" GUEST_FB0_SYSFS_DEVICE_PATH));
+    assert(event_has_field(graphics_event, "MAJOR=29"));
+    assert(event_has_field(graphics_event, "MINOR=0"));
+    assert(guest_uevent_queue_consume(&graphics_queue) == 0);
+    int graphics_event_consumed = graphics_queue.delivered == 1u &&
+        !guest_uevent_queue_readable(&graphics_queue);
+    assert(graphics_event_consumed);
+    assert(strcmp(guest_fb0_mknod_path_rejection_reason("/dev/fb0", 0,
+        GUEST_FB0_OWNER_GID, graphics_event_consumed, GUEST_FB0_MODE,
+        guest_fb0_makedev(29, 0)), "guest-path-not-exact-fb0") == 0);
+    assert(guest_fb0_mknod_path_rejection_reason(GUEST_FB0_PATH, 0,
+        GUEST_FB0_OWNER_GID, graphics_event_consumed, GUEST_FB0_MODE,
+        guest_fb0_makedev(29, 0)) == NULL);
+    assert(guest_fb0_mknod_path_rejection_reason(GUEST_FB0_PATH, 0,
+        GUEST_FB0_OWNER_GID, 0, GUEST_FB0_MODE,
+        guest_fb0_makedev(29, 0)) != NULL);
+    assert(guest_fb0_create_app_private_placeholder(guest_root, "/dev/fb0", 0,
+        GUEST_FB0_OWNER_GID, graphics_event_consumed, GUEST_FB0_MODE,
+        guest_fb0_makedev(29, 0)) == -EPERM);
+    assert(guest_mknod_create_app_private_device(guest_root, "/dev/fb0", 0,
+        GUEST_FB0_OWNER_GID, graphics_event_consumed, GUEST_FB0_MODE,
+        guest_fb0_makedev(29, 0)) == -EOPNOTSUPP);
+    assert(guest_mknod_create_app_private_device(guest_root, "/dev/graphics/fb1", 0,
+        GUEST_FB0_OWNER_GID, graphics_event_consumed, GUEST_FB0_MODE,
+        guest_fb0_makedev(29, 0)) == -EOPNOTSUPP);
+    assert(guest_mknod_create_app_private_device(guest_root, "/dev/null", 0,
+        GUEST_FB0_OWNER_GID, graphics_event_consumed, GUEST_FB0_MODE,
+        guest_fb0_makedev(1, 3)) == -EOPNOTSUPP);
+    assert(guest_mknod_create_app_private_device(guest_root, "/dev/binder", 0,
+        GUEST_FB0_OWNER_GID, graphics_event_consumed, GUEST_FB0_MODE,
+        guest_fb0_makedev(29, 0)) == -EOPNOTSUPP);
+    assert(guest_mknod_create_app_private_device(guest_root,
+        "/dev/graphics/../outside", 0, GUEST_FB0_OWNER_GID,
+        graphics_event_consumed, GUEST_FB0_MODE,
+        guest_fb0_makedev(29, 0)) == -EOPNOTSUPP);
+    char guest_dev[PATH_MAX], guest_graphics[PATH_MAX], fb0_placeholder[PATH_MAX];
+    join(guest_dev, sizeof(guest_dev), guest_root, "dev");
+    join(guest_graphics, sizeof(guest_graphics), guest_dev, "graphics");
+    join(fb0_placeholder, sizeof(fb0_placeholder), guest_graphics, "fb0");
+    assert(access(fb0_placeholder, F_OK) != 0 && errno == ENOENT);
+    assert(guest_mknod_create_app_private_device(guest_root, GUEST_FB0_PATH,
+        0, GUEST_FB0_OWNER_GID, graphics_event_consumed, GUEST_FB0_MODE,
+        guest_fb0_makedev(29, 0)) == 0);
+    struct stat placeholder_stat;
+    assert(lstat(fb0_placeholder, &placeholder_stat) == 0);
+    assert(S_ISREG(placeholder_stat.st_mode) && placeholder_stat.st_uid == getuid());
+    assert((placeholder_stat.st_mode & 0777) == 0600 && placeholder_stat.st_size == 0);
+    assert(unlink(fb0_placeholder) == 0);
+    assert(rmdir(guest_graphics) == 0 && rmdir(guest_dev) == 0);
     assert(strcmp(guest_fb0_mknod_rejection_reason(1000, GUEST_FB0_OWNER_GID,
         1, GUEST_FB0_MODE, guest_fb0_makedev(29, 0)), "guest-euid-not-root") == 0);
     assert(strcmp(guest_fb0_mknod_rejection_reason(0, 1000, 1,
@@ -229,6 +306,6 @@ int main(int argc, char **argv) {
         assert(unlink(linked_dir) == 0);
         assert(rmdir(guest_root) == 0);
     }
-    puts("guest framebuffer regression: PASS (ARM32 ABI, Goldfish WVGA800 RGB565 double-buffer model, no-follow app-private backing, MAP_SHARED bytes -> page-flip -> GVMF/1 packet)");
+    puts("guest framebuffer regression: PASS (graphics add event -> exact /dev/graphics/fb0 attributes -> app-private regular placeholder; unexpected/traversal mknod denied; ARM32 Goldfish WVGA800 RGB565 model; MAP_SHARED bytes -> page-flip -> GVMF/1 packet; no host device)");
     return 0;
 }

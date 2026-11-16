@@ -347,12 +347,74 @@ static unsigned long guest_fb0_pan_count;
 static int guest_fb0_graphics_uevent_received;
 static int guest_fb0_node_created;
 
+static const char *guest_frame_channel_scope_name(
+        enum guest_frame_channel_validation_scope scope) {
+    switch (scope) {
+        case GUEST_FRAME_CHANNEL_SCOPE_ROOT_PARENT: return "guest-root-parent";
+        case GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_PARENT: return "channel-parent";
+        case GUEST_FRAME_CHANNEL_SCOPE_PARENT_IDENTITY: return "parent-identity";
+        case GUEST_FRAME_CHANNEL_SCOPE_PARENT_OWNER: return "parent-owner";
+        case GUEST_FRAME_CHANNEL_SCOPE_PARENT_MODE: return "parent-write-mode";
+        case GUEST_FRAME_CHANNEL_SCOPE_GUEST_ROOT_LEAF: return "guest-root-leaf";
+        case GUEST_FRAME_CHANNEL_SCOPE_CHANNEL_LEAF: return "channel-leaf";
+        default: return "none";
+    }
+}
+
+static void print_guest_frame_path_components(const char *role,
+        const struct guest_frame_channel_path_audit *audit) {
+    if (!role || !audit || !audit->path[0]) return;
+    char component_path[PATH_MAX] = "/";
+    for (unsigned int i = 0; i < audit->component_count &&
+         i < GUEST_FRAME_CHANNEL_MAX_PATH_COMPONENTS; ++i) {
+        const struct guest_frame_channel_component_audit *component =
+            &audit->components[i];
+        if (i != 0) {
+            size_t used = strlen(component_path);
+            size_t name_length = strlen(component->name);
+            size_t separator = used > 1u ? 1u : 0u;
+            if (used + separator + name_length >= sizeof(component_path)) break;
+            if (separator) component_path[used++] = '/';
+            memcpy(component_path + used, component->name, name_length + 1u);
+        }
+        printf("GUEST FRAME CHANNEL PATH COMPONENT: role=%s path=%s stat=%d uid=%u gid=%u mode=0%o permissions=0%04o device=%llu inode=%llu opened=%d symlink=%d errno=%d\n",
+               role, component_path, component->has_stat,
+               (unsigned)component->owner, (unsigned)component->group,
+               (unsigned)component->mode,
+               (unsigned)(component->mode & 07777u),
+               (unsigned long long)component->device,
+               (unsigned long long)component->inode, component->opened,
+               component->symlink, component->error_number);
+    }
+}
+
+static void print_guest_frame_channel_audit(
+        const struct guest_frame_channel_validation_detail *detail) {
+    if (!detail) return;
+    print_guest_frame_path_components("guest-root-parent", &detail->root_parent_audit);
+    print_guest_frame_path_components("channel-parent", &detail->channel_parent_audit);
+    printf("GUEST FRAME CHANNEL LEAF AUDIT: role=guest-root path=%s stat=%d symlink=%d uid=%u gid=%u mode=0%o permissions=0%04o device=%llu inode=%llu\n",
+           detail->guest_root_path, detail->root_has_stat, detail->root_is_symlink,
+           (unsigned)detail->root_owner, (unsigned)detail->root_group,
+           (unsigned)detail->root_mode, (unsigned)(detail->root_mode & 07777u),
+           (unsigned long long)detail->root_device,
+           (unsigned long long)detail->root_inode);
+    printf("GUEST FRAME CHANNEL LEAF AUDIT: role=channel path=%s stat=%d symlink=%d uid=%u gid=%u mode=0%o permissions=0%04o device=%llu inode=%llu\n",
+           detail->channel_path, detail->channel_has_stat, detail->channel_is_symlink,
+           (unsigned)detail->channel_owner, (unsigned)detail->channel_group,
+           (unsigned)detail->channel_mode,
+           (unsigned)(detail->channel_mode & 07777u),
+           (unsigned long long)detail->channel_device,
+           (unsigned long long)detail->channel_inode);
+}
+
 static void configure_guest_frame_channel(void) {
     const char *configured = getenv(GUEST_FRAME_CHANNEL_ENV);
     if (configured && configured[0]) {
         struct guest_frame_channel_validation_detail validation;
         int rc = guest_frame_channel_open_app_private_sibling_ex(
             configured, guest_root, getuid(), &validation);
+        print_guest_frame_channel_audit(&validation);
         if (rc >= 0) {
             size_t length = strlen(configured);
             memcpy(guest_frame_directory, configured, length + 1);
@@ -379,10 +441,11 @@ static void configure_guest_frame_channel(void) {
                        -rc);
             }
         } else {
-            printf("GUEST FRAME CHANNEL CONFIG: ready=0 path=%s guest-root=%s expected-sibling=%s reason=%s errno=%d has-stat=%d owner=%u expected-owner=%u mode=0%o; exact path/owner/private-mode checks remain enforced; trace continues without frame output\n",
+            printf("GUEST FRAME CHANNEL CONFIG: ready=0 path=%s guest-root=%s expected-sibling=%s reason=%s scope=%s errno=%d has-stat=%d owner=%u expected-owner=%u mode=0%o; component-wise O_NOFOLLOW and owner/private leaf checks remain enforced; trace continues without frame output\n",
                    configured, guest_root,
                    validation.expected_path[0] ? validation.expected_path : "<unavailable>",
                    guest_frame_channel_validation_reason_name(validation.reason),
+                   guest_frame_channel_scope_name(validation.scope),
                    validation.error_number, validation.has_stat,
                    (unsigned)validation.actual_owner,
                    (unsigned)validation.expected_owner,
@@ -1247,27 +1310,6 @@ static int fake_syscall(pid_t pid, struct compat_pt_regs *regs) {
 static int resume_trace(pid_t pid, int signal_number) {
     return ptrace(PTRACE_SYSCALL, pid, NULL,
                   (void *)(uintptr_t)(unsigned int)signal_number) == 0 ? 0 : -1;
-}
-
-static int make_guest_device(const char *guest) {
-    char host[PATH_MAX];
-    int rc = map_guest_path(guest, host, sizeof(host));
-    if (rc != 0) return rc;
-    if (!path_is_within(host, guest_root)) return -EACCES;
-    char parent[PATH_MAX];
-    if (strlen(host) >= sizeof(parent)) return -ENAMETOOLONG;
-    strcpy(parent, host);
-    char *slash = strrchr(parent, '/');
-    if (!slash || slash == parent) return -EACCES;
-    char *leaf = slash + 1;
-    if (!*leaf) return -EACCES;
-    *slash = '\0';
-    int directory_fd = guest_safe_dir_open_beneath_root(guest_root, parent, 1, 0755);
-    if (directory_fd < 0) return directory_fd;
-    close(directory_fd);
-    int fd = guest_safe_file_open_beneath_root(guest_root, parent, leaf, 0, 0600);
-    if (fd < 0) return fd;
-    return close(fd) == 0 ? 0 : -errno;
 }
 
 static int seed_regular_file(const char *dir, const char *name, const char *contents) {
@@ -3390,24 +3432,19 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
         case ARM_NR_FCHOWNAT: case ARM_NR_FCHMODAT: case ARM_NR_CHOWN32: case ARM_NR_LCHOWN32:
             *is_virtual = 1; *pending_return = 0; return 0;
         case ARM_NR_MKNOD: case ARM_NR_MKNODAT:
-            if (strcmp(guest, "/dev/binder") == 0) {
-                *is_virtual = 1;
-                *pending_return = -EOPNOTSUPP;
-                return 0;
-            }
-            if (strcmp(guest, GUEST_FB0_PATH) == 0) {
+            {
                 unsigned mode_arg = nr == ARM_NR_MKNOD ? 1u : 2u;
                 unsigned dev_arg = nr == ARM_NR_MKNOD ? 2u : 3u;
                 uint32_t requested_mode = regs->uregs[mode_arg];
                 uint32_t requested_device = regs->uregs[dev_arg];
-                if (!active_tracee || !guest_fb0_mknod_args_valid(
+                if (!active_tracee) {
+                    rc = -EPERM;
+                } else {
+                    rc = guest_mknod_create_app_private_device(guest_root, guest,
                         active_tracee->identity.euid,
                         active_tracee->identity.fsgid,
                         guest_fb0_graphics_uevent_received,
-                        requested_mode, requested_device)) {
-                    rc = -EPERM;
-                } else {
-                    rc = make_guest_device(guest);
+                        requested_mode, requested_device);
                     if (rc == 0) {
                         guest_fb0_node_created = 1;
                         printf("GUEST FB0 NODE CREATED: guest-pid=%d path=%s mode=0%o major=%u minor=%u fsgid=%u source=consumed Goldfish graphics add event; regular app-private placeholder only, no host mknod\n",
@@ -3417,8 +3454,6 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
                                active_tracee->identity.fsgid);
                     }
                 }
-            } else {
-                rc = make_guest_device(guest);
             }
             *is_virtual = 1; *pending_return = rc; return 0;
         default:
@@ -4315,6 +4350,8 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
                     ? "exact-source-backed-fb0" : "private-node-create-failed";
             } else if (strcmp(path, "/dev/binder") == 0) {
                 reason = "binder-misc-minor-is-dynamic; no-transaction-node-event-modeled";
+            } else if (effective_result == -EOPNOTSUPP) {
+                reason = "guest-device-mknod-backend-not-implemented";
             } else if (effective_result < 0) {
                 reason = "app-private-node-creation-failed";
             }
@@ -4369,11 +4406,10 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
     if (policy == GUEST_SYSCALL_VIRTUAL_DEVICE) {
         int32_t value = -ENOTTY;
         if (nr == ARM_NR_MKNOD || nr == ARM_NR_MKNODAT) {
-            char guest[PATH_MAX];
-            unsigned arg = nr == ARM_NR_MKNODAT ? 1u : 0u;
-            int rc = read_remote_string(pid, regs->uregs[arg], guest, sizeof(guest)) == 0
-                ? make_guest_device(guest) : -EFAULT;
-            value = rc;
+            value = -EOPNOTSUPP;
+            denied_count++;
+            log_broker_denial_detail(pid, state, nr, value, NULL,
+                                     "mknod-must-use-path-containment-broker", 0);
         } else if (nr == ARM_NR_FCHMOD || nr == ARM_NR_FCHOWN) {
             value = 0;
         }
@@ -5132,6 +5168,30 @@ int main(int argc, char **argv) {
         fprintf(stderr, "cannot install user-cancel signal handlers: errno=%d\n", errno);
         return 2;
     }
+    struct guest_frame_channel_path_audit root_path_audit;
+    int guest_root_fd = guest_frame_channel_open_directory_path_nofollow(
+        argv[2], &root_path_audit);
+    print_guest_frame_path_components("guest-root", &root_path_audit);
+    if (guest_root_fd < 0) {
+        fprintf(stderr, "GUEST ROOT REJECTED: path=%s reason=component-wise no-follow walk failed errno=%d\n",
+                argv[2], -guest_root_fd);
+        return 2;
+    }
+    struct stat guest_root_stat;
+    memset(&guest_root_stat, 0, sizeof(guest_root_stat));
+    int guest_root_stat_rc = fstat(guest_root_fd, &guest_root_stat);
+    int guest_root_reject_errno = guest_root_stat_rc != 0 ? errno : 0;
+    if (guest_root_stat_rc != 0 || !S_ISDIR(guest_root_stat.st_mode) ||
+        guest_root_stat.st_uid != getuid() ||
+        (guest_root_stat.st_mode & 0077) != 0) {
+        if (guest_root_reject_errno == 0) guest_root_reject_errno = EACCES;
+        close(guest_root_fd);
+        fprintf(stderr, "GUEST ROOT REJECTED: path=%s reason=leaf-not-app-owned-private-directory uid=%u mode=0%o errno=%d\n",
+                argv[2], (unsigned)guest_root_stat.st_uid,
+                (unsigned)(guest_root_stat.st_mode & 07777u), guest_root_reject_errno);
+        return 2;
+    }
+    close(guest_root_fd);
     if (!realpath(argv[2], guest_root)) {
         fprintf(stderr, "guest root is not accessible: errno=%d\n", errno); return 2;
     }
@@ -5188,6 +5248,12 @@ int main(int argc, char **argv) {
            guest_fb0_backend_ready, GUEST_FB0_PATH, GUEST_PROFILE_DISPLAY_SKIN,
            GUEST_PROFILE_DISPLAY_WIDTH, GUEST_PROFILE_DISPLAY_HEIGHT,
            guest_fb0_graphics_uevent_received, guest_fb0_node_created);
+    printf("PROCESS TREE: fork/clone/vfork followed with ptrace; active-and-unreaped registry cap=%d; process slots reusable after guest wait4 reap, non-waitable thread slots after ptrace terminal exit; verified ARM32 execs and confined original-linker aliases\n", MAX_TRACEES);
+    puts("DYNAMIC ELF POLICY: original API10 linker is inherited as fd 198; unsupported PT_INTERP is denied before host-linker substitution");
+    int child = start_guest(binary, &argv[5]);
+    if (child < 0) return 2;
+    int exit_code = -1, exit_signal = 0;
+    int rc = run_trace((pid_t)child, &exit_code, &exit_signal);
     printf("GUEST BINDER BOOTSTRAP SUMMARY: opens=%lu ioctls=%lu version-queries=%lu anonymous-mappings=%lu context-manager-claims=%lu conflicts=%lu loop-commands=%lu parked-empty-reads=%lu unsupported-commands=%lu unsupported-transactions=%lu owner-guest-pid=%d; transaction delivery/service registration unsupported; host Binder calls=0\n",
            guest_binder_state.opens, guest_binder_state.ioctl_calls,
            guest_binder_state.version_queries, guest_binder_state.mapping_successes,
@@ -5197,12 +5263,6 @@ int main(int argc, char **argv) {
            guest_binder_state.unsupported_commands,
            guest_binder_state.unsupported_transactions,
            guest_binder_state.context_manager_guest_pid);
-    printf("PROCESS TREE: fork/clone/vfork followed with ptrace; active-and-unreaped registry cap=%d; process slots reusable after guest wait4 reap, non-waitable thread slots after ptrace terminal exit; verified ARM32 execs and confined original-linker aliases\n", MAX_TRACEES);
-    puts("DYNAMIC ELF POLICY: original API10 linker is inherited as fd 198; unsupported PT_INTERP is denied before host-linker substitution");
-    int child = start_guest(binary, &argv[5]);
-    if (child < 0) return 2;
-    int exit_code = -1, exit_signal = 0;
-    int rc = run_trace((pid_t)child, &exit_code, &exit_signal);
     traced_pid = -1;
     printf("INITIAL /init POST-EXEC: %s\n", saw_exec ? "SIGTRAP observed" : "not observed");
     printf("CONTINUOUS PROCESS TREE: fork/clone/vfork events=%lu; guest exec events=%lu; dynamic execs redirected=%lu; kernel entries into original guest linker=%lu; target ELF code syscall-PCs=%lu (shell=%lu app_process=%lu); literal ET_EXEC e_entry syscall-PC hits=%lu (app_process=%lu ueventd=%lu other=%lu); C main symbol unproven\n",

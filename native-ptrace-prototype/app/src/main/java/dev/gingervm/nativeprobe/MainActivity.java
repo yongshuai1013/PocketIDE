@@ -59,6 +59,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 public final class MainActivity extends Activity {
     private static final String GUEST_ROOT_NAME = "google-api10-full-root";
+    // Linux O_DIRECTORY is omitted from Android's OsConstants wrapper.
+    private static final int O_DIRECTORY_FLAG = 0x00010000;
     private static final int REQUEST_SAVE_LOG = 2301;
     private static final String LOG_FILE_NAME = "gingervm-guest-trace.txt";
     private static final String INIT_SHA256 = "2d9cbb198d8367f434c5fd7bada245c9e7618dc910253190f5d4dd3d0f6d1a00";
@@ -229,9 +231,19 @@ public final class MainActivity extends Activity {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
+    private File canonicalPrivateFilesDirectory() {
+        try {
+            File files = getFilesDir().getCanonicalFile();
+            if (!files.isDirectory()) throw new IOException("app files directory is not a directory");
+            return files;
+        } catch (IOException e) {
+            throw new IllegalStateException("cannot resolve the app-private files directory", e);
+        }
+    }
+
     private void initializeGuestFrameReceiver() {
         try {
-            File frameGuestRoot = new File(getFilesDir(), GUEST_ROOT_NAME).getAbsoluteFile();
+            File frameGuestRoot = new File(canonicalPrivateFilesDirectory(), GUEST_ROOT_NAME);
             File frameParent = frameGuestRoot.getParentFile();
             if (frameParent == null) throw new IOException("guest root has no app-private parent");
             guestFrameDirectory = new File(frameParent, GuestFramePacket.CHANNEL_DIRECTORY);
@@ -754,7 +766,7 @@ public final class MainActivity extends Activity {
             return out.append("SETUP FAILED: system manifest digest is missing or malformed.\n").toString();
         }
 
-        File guestRoot = new File(getFilesDir(), GUEST_ROOT_NAME);
+        File guestRoot = new File(canonicalPrivateFilesDirectory(), GUEST_ROOT_NAME);
         File systemRoot = new File(new File(guestRoot, ".images"), "system");
         String readyMarker = "GINGERVM-API10-CONTINUOUS-v0.4.0\n" + manifestHash + "\n"
                 + guestLibraryDir.getAbsolutePath() + "\n" + INIT_SHA256 + "\n";
@@ -807,6 +819,7 @@ public final class MainActivity extends Activity {
                         .append(" PT_INTERP-only linker aliases in APK-extracted armeabi-v7a\n");
                 postProgress("Full API10 system tree staged. Starting one /init process-tree trace…\n");
             }
+            ensurePrivateGuestRootDirectory(guestRoot);
         } catch (RunCancelledException e) {
             return out.append("USER CANCELLED DURING STAGING: ").append(e.getMessage()).append('\n')
                     .append("No guest program was executed. Partial app-private staging is incomplete and will be safely rechecked or removed on the next run.\n").toString();
@@ -1444,6 +1457,31 @@ public final class MainActivity extends Activity {
     private void ensureDirectory(File directory) throws IOException {
         if (directory == null || (!directory.mkdirs() && !directory.isDirectory()))
             throw new IOException("cannot create app-private directory " + directory);
+    }
+
+    private void ensurePrivateGuestRootDirectory(File directory) throws IOException {
+        if (directory == null || (!directory.mkdirs() && !directory.isDirectory()))
+            throw new IOException("cannot create app-private guest root " + directory);
+        FileDescriptor fd = null;
+        try {
+            fd = Os.open(directory.getAbsolutePath(),
+                    OsConstants.O_RDONLY | O_DIRECTORY_FLAG |
+                            OsConstants.O_CLOEXEC | OsConstants.O_NOFOLLOW, 0);
+            StructStat before = Os.fstat(fd);
+            if (!OsConstants.S_ISDIR(before.st_mode) || before.st_uid != Process.myUid())
+                throw new IOException("guest root is not an app-owned real directory");
+            Os.fchmod(fd, 0700);
+            StructStat after = Os.fstat(fd);
+            if (!OsConstants.S_ISDIR(after.st_mode) || after.st_uid != Process.myUid() ||
+                    (after.st_mode & 0077) != 0)
+                throw new IOException("guest root could not be restricted to app-private 0700");
+        } catch (ErrnoException e) {
+            throw new IOException("cannot securely validate/chmod app-private guest root", e);
+        } finally {
+            if (fd != null) {
+                try { Os.close(fd); } catch (ErrnoException ignored) { }
+            }
+        }
     }
 
     private File findExtractedAbiLibraryDir(File primaryNativeLibraryDir, String libraryName) {

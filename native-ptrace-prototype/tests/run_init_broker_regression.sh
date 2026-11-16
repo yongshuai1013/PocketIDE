@@ -161,8 +161,10 @@ sigmask_ptrace = Path(sys.argv[1]).with_name('guest_sigprocmask_ptrace.h').read_
 frame_channel = Path(sys.argv[1]).with_name('guest_frame_channel.h').read_text()
 repo_root = Path(sys.argv[1]).parents[4]
 network_test = (repo_root / 'tests/guest_network_virtual_test.c').read_text()
+policy_test = (repo_root / 'tests/init_broker_policy_test.c').read_text()
 network_test_runner = (repo_root / 'tests/run_init_broker_regression.sh').read_text()
 frame_native_test = (repo_root / 'tests/guest_frame_channel_test.c').read_text()
+framebuffer_test = (repo_root / 'tests/guest_framebuffer_virtual_test.c').read_text()
 frame_java_test = (repo_root / 'tests/GuestFramePacketTest.java').read_text()
 framebuffer_model = Path(sys.argv[1]).with_name('guest_framebuffer_virtual.h').read_text()
 identity_model = Path(sys.argv[1]).with_name('guest_identity_compat.h').read_text()
@@ -454,6 +456,12 @@ assert 'root_parent_stat.st_ino != channel_parent_stat.st_ino' in frame_channel
 assert 'openat(root_parent_fd, root_leaf' in frame_channel and 'openat(channel_parent_fd, channel_leaf' in frame_channel
 assert 'guest_frame_channel_publish_file_at' in frame_channel
 assert 'O_NOFOLLOW' in frame_channel and 'renameat(dirfd' in frame_channel
+assert 'guest_frame_channel_open_directory_path_nofollow' in frame_channel
+assert 'fstatat(fd, component->name, &before_open, AT_SYMLINK_NOFOLLOW)' in frame_channel
+assert 'GUEST_FRAME_CHANNEL_PARENT_UNSAFE_WRITABLE' in frame_channel
+assert 'guest_frame_channel_parent_mode_safe(root_parent_stat.st_mode' in frame_channel
+assert 'foreign_group, getgid()' in frame_native_test
+assert 'GUEST_FRAME_CHANNEL_GUEST_ROOT_NOT_PRIVATE' in frame_channel
 assert 'guest_frame_channel_test.c' in network_test_runner and 'GuestFramePacketTest.java' in network_test_runner
 assert 'GUEST_FRAME_SOURCE_GUEST_FRAMEBUFFER' in frame_native_test and 'symlink(target_dir, link_dir)' in frame_native_test
 assert 'test-only frame source must never be accepted' in frame_java_test and 'checksum' in frame_java_test
@@ -464,25 +472,46 @@ assert 'source is not a guest framebuffer' in frame_packet
 assert 'payload checksum mismatch' in frame_packet and 'unsupported guest framebuffer bits-per-pixel' in frame_packet
 assert 'GUEST FRAME CHANNEL CONFIG:' in src and 'unsetenv(GUEST_FRAME_CHANNEL_ENV)' in src
 assert 'expected-sibling=%s reason=%s' in src and 'guest_frame_channel_validation_reason_name(validation.reason)' in src
+assert 'GUEST FRAME CHANNEL PATH COMPONENT:' in src and 'GUEST FRAME CHANNEL LEAF AUDIT:' in src
+assert 'scope=%s errno=%d' in src and 'guest_frame_channel_scope_name' in src
+assert 'guest_frame_channel_open_directory_path_nofollow' in src and 'GUEST ROOT REJECTED:' in src
 assert 'frameGuestRoot.getParentFile()' in activity and 'new File(frameParent, GuestFramePacket.CHANNEL_DIRECTORY)' in activity
 assert 'GUEST MKNOD MEDIATION: guest-pid=%d executable=%s path=\\"%s\\" path-truncated=%d syscall=%s' in src
 assert 'mode=0%o type=%s permissions=0%04o device=0x%08x major=%u minor=%u' in src
 assert 'GUEST MKNOD DIAGNOSTICS: emitted=%lu suppressed=%lu' in src
+assert 'mknod-must-use-path-containment-broker' in src
+assert 'guest_syscall_policy(14) == GUEST_SYSCALL_PATH_REWRITE' in policy_test
+assert 'guest_syscall_policy(324) == GUEST_SYSCALL_PATH_REWRITE' in policy_test
+assert 'guest_syscall_policy(54) == GUEST_SYSCALL_VIRTUAL_DEVICE' in policy_test
 assert 'gingervm_publish_guest_frame_from_fb' in src and 'guest_frame_channel_publish_file_at' in src
 assert 'guest_fb0_backing_fd, guest_frame_directory_fd' in src
 assert 'BuildConfig.VERSION_NAME' in activity and 'BuildConfig.VERSION_CODE' in activity
 assert 'BuildConfig.GINGER_SOURCE_COMMIT' in activity
 main_source = src.split('int main(', 1)[1]
 assert main_source.index('configure_guest_frame_channel();') < main_source.index('start_guest(')
+assert 'GUEST BINDER BOOTSTRAP SUMMARY:' in src
+assert main_source.index('int rc = run_trace(') < main_source.index('GUEST BINDER BOOTSTRAP SUMMARY:')
 assert 'GUEST FB0 OUTPUT SUMMARY:' in src and 'GUEST FB0 PAGE FLIP FRAME:' in src
 assert 'GUEST FB0 SOFTWARE BASE-UPDATE ACK:' in src and 'software-base-update-acks=%lu' in src
 assert 'mediate_guest_fb0_ioctl' in src and 'mediate_guest_fb0_mmap' in src
 assert 'ARM_NR_MMAP2' in src and 'GUEST FB0 MMAP2:' in src
-assert 'guest_fb0_open_authorized' in src and 'guest_fb0_mknod_args_valid' in src
+assert 'guest_fb0_open_authorized' in src and 'guest_fb0_mknod_rejection_reason' in src
+assert 'guest_mknod_create_app_private_device' in src
+assert 'guest-device-mknod-backend-not-implemented' in src
+assert 'make_guest_device(' not in src
 assert 'GUEST FB0 GRAPHICS UEVENT RECEIVED:' in src and 'GUEST FB0 NODE CREATED:' in src
 assert 'GUEST_FB0_IOCTL_GET_VSCREENINFO' in framebuffer_model
 assert 'GUEST_FB0_IOCTL_GET_FSCREENINFO' in framebuffer_model
 assert 'GUEST_FB0_IOCTL_PAN_DISPLAY' in framebuffer_model and 'guest_fb0_capture_publish' in framebuffer_model
+assert 'guest_fb0_mknod_path_rejection_reason' in framebuffer_model
+assert 'guest_fb0_create_app_private_placeholder' in framebuffer_model
+assert 'guest_mknod_create_app_private_device' in framebuffer_model
+assert 'guest_uevent_enqueue_coldboot_add' in framebuffer_test
+assert 'graphics_event_consumed' in framebuffer_test and 'GUEST_FB0_PATH' in framebuffer_test
+assert 'guest_mknod_create_app_private_device' in framebuffer_test
+assert '"/dev/graphics/fb1"' in framebuffer_test and '"/dev/binder"' in framebuffer_test
+assert 'guest_syscall_policy(14) == GUEST_SYSCALL_PATH_REWRITE' in policy_test
+assert 'guest_syscall_policy(324) == GUEST_SYSCALL_PATH_REWRITE' in policy_test
 assert 'guest_frame_channel_publish_file_at(frame_directory_fd, &packet)' in framebuffer_model
 assert 'guest_fsgid != GUEST_FB0_OWNER_GID' in framebuffer_model
 assert 'GUEST_FB0_OWNER_GID GUEST_ID_AID_GRAPHICS' in framebuffer_model
@@ -493,6 +522,9 @@ assert 'guest_identity_compat_test.c' in network_test_runner
 assert 'guest_framebuffer_virtual_test.c' in network_test_runner
 assert 'GuestFramebufferPacketTest.java' in network_test_runner
 assert 'FileObserver.MOVED_TO' in activity and 'OsConstants.O_NOFOLLOW' in activity
+assert 'ensurePrivateGuestRootDirectory(guestRoot)' in activity
+assert 'Os.fchmod(fd, 0700)' in activity and 'Process.myUid()' in activity
+assert 'O_DIRECTORY_FLAG = 0x00010000' in activity and 'guest root could not be restricted' in activity
 assert 'GuestFramePacket.decodeGuestFramebuffer(bytes)' in activity
 assert 'Bitmap.createBitmap(frame.argb, frame.width, frame.height' in activity
 assert 'builder.environment().put(GuestFramePacket.CHANNEL_ENVIRONMENT' in activity
@@ -735,14 +767,14 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.21-test-signed-apk' in upload
-assert 'gingervm-v0.6.21-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 30" in gradle and "versionName '0.6.21'" in gradle
+assert 'gingervm-continuous-trace-v0.6.22-test-signed-apk' in upload
+assert 'gingervm-v0.6.22-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 31" in gradle and "versionName '0.6.22'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.21' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.22' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
