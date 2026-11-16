@@ -37,6 +37,7 @@ int main(int argc, char **argv) {
     assert(mkdir(root, 0700) == 0);
     char guest_root[PATH_MAX], frame_dir[PATH_MAX], wrong_dir[PATH_MAX];
     char link_dir[PATH_MAX], target_dir[PATH_MAX], frame_file[PATH_MAX];
+    char linked_parent[PATH_MAX], linked_guest_root[PATH_MAX], linked_expected[PATH_MAX];
     join_path(guest_root, sizeof(guest_root), root, "guest-root");
     join_path(frame_dir, sizeof(frame_dir), root, GUEST_FRAME_CHANNEL_DIRECTORY);
     join_path(wrong_dir, sizeof(wrong_dir), root, "wrong");
@@ -47,12 +48,40 @@ int main(int argc, char **argv) {
     assert(mkdir(wrong_dir, 0700) == 0);
     assert(mkdir(target_dir, 0700) == 0);
     assert(guest_frame_channel_validate_app_private_directory(frame_dir, guest_root) == 1);
-    assert(guest_frame_channel_validate_app_private_directory(wrong_dir, guest_root) == -EACCES);
+    struct guest_frame_channel_validation_detail detail;
+    assert(guest_frame_channel_validate_app_private_directory_ex(
+        frame_dir, guest_root, getuid(), &detail) == 1);
+    assert(detail.reason == GUEST_FRAME_CHANNEL_VALID && detail.has_stat);
+    assert(detail.actual_owner == getuid() && (detail.actual_mode & 0077) == 0);
+    assert(strcmp(detail.expected_path, frame_dir) == 0);
+    assert(guest_frame_channel_validate_app_private_directory_ex(
+        wrong_dir, guest_root, getuid(), &detail) == -EACCES);
+    assert(detail.reason == GUEST_FRAME_CHANNEL_NOT_EXACT_SIBLING);
+    assert(strcmp(detail.expected_path, frame_dir) == 0);
+    uid_t wrong_owner = getuid() == 0 ? 1u : 0u;
+    assert(guest_frame_channel_validate_app_private_directory_ex(
+        frame_dir, guest_root, wrong_owner, &detail) == -EACCES);
+    assert(detail.reason == GUEST_FRAME_CHANNEL_WRONG_OWNER);
+    assert(detail.actual_owner == getuid() && detail.expected_owner == wrong_owner);
     assert(chmod(frame_dir, 0755) == 0);
-    assert(guest_frame_channel_validate_app_private_directory(frame_dir, guest_root) == -EACCES);
+    assert(guest_frame_channel_validate_app_private_directory_ex(
+        frame_dir, guest_root, getuid(), &detail) == -EACCES);
+    assert(detail.reason == GUEST_FRAME_CHANNEL_NOT_PRIVATE);
+    assert((detail.actual_mode & 0077) == 0055);
     assert(chmod(frame_dir, 0700) == 0);
     assert(symlink(target_dir, link_dir) == 0);
     assert(guest_frame_channel_open_private_directory(link_dir) < 0);
+    join_path(linked_parent, sizeof(linked_parent), root, "linked-root");
+    join_path(linked_guest_root, sizeof(linked_guest_root), linked_parent, "guest-root");
+    join_path(linked_expected, sizeof(linked_expected), linked_parent,
+              GUEST_FRAME_CHANNEL_DIRECTORY);
+    assert(mkdir(linked_parent, 0700) == 0);
+    assert(mkdir(linked_guest_root, 0700) == 0);
+    assert(symlink(target_dir, linked_expected) == 0);
+    assert(guest_frame_channel_validate_app_private_directory_ex(
+        linked_expected, linked_guest_root, getuid(), &detail) < 0);
+    assert(detail.reason == GUEST_FRAME_CHANNEL_OPEN_FAILED);
+    assert(detail.error_number != 0);
 
     static const unsigned char rgb565[] = {
         0x00, 0xf8, /* red */ 0xe0, 0x07, /* green */

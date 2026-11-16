@@ -46,6 +46,7 @@
 #include "guest_frame_channel.h"
 #include "guest_framebuffer_virtual.h"
 #include "guest_identity_compat.h"
+#include "guest_binder_virtual.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -115,6 +116,12 @@
 #define ARM_NR_MKDIR 39
 #define ARM_NR_RMDIR 40
 #define ARM_NR_DUP2 63
+#define ARM_NR_DUP 41
+#define ARM_NR_FSTAT 108
+#define ARM_NR_FSYNC 118
+#define ARM_NR_FDATASYNC 148
+#define ARM_NR_PREAD64 180
+#define ARM_NR_PWRITE64 181
 #define ARM_NR_FCNTL 55
 #define ARM_NR_FCNTL64 221
 #define ARM_NR_GETPPID 64
@@ -271,6 +278,11 @@ struct tracee_state {
     uint32_t guest_rgid;
     uint32_t guest_egid;
     struct guest_identity_state identity;
+    struct guest_binder_process_state binder;
+    int binder_waiting;
+    int binder_mmap_pending;
+    int binder_munmap_pending;
+    uint32_t binder_pending_map_length;
     int fb_mmap_pending;
     int fb_munmap_pending;
     uint32_t fb_pending_map_length;
@@ -322,6 +334,7 @@ static char guest_frame_directory[PATH_MAX];
 static int guest_frame_channel_ready;
 static unsigned long guest_frame_published_count;
 static struct guest_framebuffer_model guest_fb0_model;
+static struct guest_binder_global_state guest_binder_state;
 static int guest_fb0_backing_fd = -1;
 static struct stat guest_fb0_backing_stat;
 static int guest_fb0_backend_ready;
@@ -335,12 +348,15 @@ static int guest_fb0_node_created;
 static void configure_guest_frame_channel(void) {
     const char *configured = getenv(GUEST_FRAME_CHANNEL_ENV);
     if (configured && configured[0]) {
-        int rc = guest_frame_channel_validate_app_private_directory(configured, guest_root);
+        struct guest_frame_channel_validation_detail validation;
+        int rc = guest_frame_channel_validate_app_private_directory_ex(
+            configured, guest_root, getuid(), &validation);
         if (rc == 1) {
             size_t length = strlen(configured);
             memcpy(guest_frame_directory, configured, length + 1);
             guest_frame_channel_ready = 1;
-            puts("GUEST FRAME CHANNEL CONFIG: ready=1; exact app-private guest-root sibling; atomic GVMF/1 packets; no pixels claimed");
+            printf("GUEST FRAME CHANNEL CONFIG: ready=1 path=%s guest-root=%s owner=%u mode=0700; exact app-private sibling; atomic GVMF/1 packets; no pixels claimed\n",
+                   configured, guest_root, (unsigned)getuid());
             guest_framebuffer_model_init(&guest_fb0_model);
             char backing_path[PATH_MAX];
             rc = guest_fb0_prepare_app_private_backing(guest_frame_directory,
@@ -359,8 +375,14 @@ static void configure_guest_frame_channel(void) {
                        -rc);
             }
         } else {
-            printf("GUEST FRAME CHANNEL CONFIG: ready=0; app-private sibling/owner/mode validation failed errno=%d; trace continues without frame output\n",
-                   -rc);
+            printf("GUEST FRAME CHANNEL CONFIG: ready=0 path=%s guest-root=%s expected-sibling=%s reason=%s errno=%d has-stat=%d owner=%u expected-owner=%u mode=0%o; exact path/owner/private-mode checks remain enforced; trace continues without frame output\n",
+                   configured, guest_root,
+                   validation.expected_path[0] ? validation.expected_path : "<unavailable>",
+                   guest_frame_channel_validation_reason_name(validation.reason),
+                   validation.error_number, validation.has_stat,
+                   (unsigned)validation.actual_owner,
+                   (unsigned)validation.expected_owner,
+                   (unsigned)(validation.actual_mode & 07777u));
         }
     } else {
         puts("GUEST FRAME CHANNEL CONFIG: ready=0; app frame directory not supplied; trace continues without frame output");
@@ -414,6 +436,8 @@ static unsigned long virtual_network_ioctl_rejected_count;
 static unsigned long virtual_pseudo_device_open_count;
 static unsigned long virtual_pseudo_device_io_count;
 static unsigned long unsupported_guest_device_open_count;
+static unsigned long guest_mknod_diagnostics_emitted;
+static unsigned long guest_mknod_diagnostics_suppressed;
 static unsigned long blocked_process_count;
 static unsigned long process_events;
 static unsigned long successful_guest_execs;
@@ -567,6 +591,22 @@ static int write_remote(pid_t pid, uint32_t address, const void *data, size_t le
         copied += take;
     }
     return 0;
+}
+
+struct guest_binder_trace_memory { pid_t pid; };
+
+static int guest_binder_trace_copyin(void *opaque, uint32_t address,
+                                     void *destination, size_t length) {
+    struct guest_binder_trace_memory *memory = opaque;
+    if (!memory || !guest_binder_u32_range_valid(address, length)) return -EFAULT;
+    return read_remote(memory->pid, address, destination, length) == 0 ? 0 : -EFAULT;
+}
+
+static int guest_binder_trace_copyout(void *opaque, uint32_t address,
+                                      const void *source, size_t length) {
+    struct guest_binder_trace_memory *memory = opaque;
+    if (!memory || !guest_binder_u32_range_valid(address, length)) return -EFAULT;
+    return write_remote(memory->pid, address, source, length) == 0 ? 0 : -EFAULT;
 }
 
 struct guest_sigmask_trace_context { pid_t pid; };
@@ -1651,6 +1691,7 @@ static const char *virtual_fd_source(int fd) {
         case VIRTUAL_FD_DEV_ZERO: return "guest /dev/zero software stream; no host device";
         case VIRTUAL_FD_DEV_KMSG: return "guest kmsg software sink; no host device";
         case VIRTUAL_FD_DEV_RANDOM: return "unsupported guest random source; no host device";
+        case VIRTUAL_FD_DEV_BINDER: return "guest-only API10 Binder bootstrap descriptor; no host Binder fd; transactions unsupported";
         default: return "other software virtual fd; no host fd";
     }
 }
@@ -2565,6 +2606,16 @@ static void remove_tracee(pid_t pid) {
     }
 }
 
+static void guest_binder_release_context_manager_if_dead(int32_t guest_pid) {
+    if (guest_pid <= 0 ||
+        guest_binder_state.context_manager_guest_pid != guest_pid) return;
+    for (size_t i = 0; i < tracee_count; ++i)
+        if (tracees[i].alive && tracees[i].guest_pid == guest_pid) return;
+    guest_binder_state.context_manager_guest_pid = 0;
+    printf("GUEST BINDER CONTEXT MANAGER RELEASED: guest-pid=%d; all traced guest threads exited, software owner cleared\n",
+           guest_pid);
+}
+
 static int original_init_native_path(char *out, size_t capacity) {
     int n = snprintf(out, capacity, "%s/libgingervm_guest_init.so", native_guest_root);
     if (n <= 0 || (size_t)n >= capacity) return -ENAMETOOLONG;
@@ -3191,6 +3242,26 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
         }
     }
     if ((nr == ARM_NR_OPEN || nr == ARM_NR_OPENAT) &&
+        strcmp(guest, "/dev/binder") == 0) {
+        unsigned flags_arg = nr == ARM_NR_OPEN ? 1u : 2u;
+        unsigned flags = regs->uregs[flags_arg];
+        if (!active_tracee || active_tracee->pid != pid) return -EPERM;
+        rc = guest_binder_validate_open_flags(flags);
+        if (rc != 0) return rc;
+        int fd = alloc_virtual_fd(VIRTUAL_FD_DEV_BINDER);
+        if (fd < 0) return fd;
+        set_virtual_fd_open_flags(active_tracee, fd, flags);
+        guest_binder_state.opens++;
+        virtual_pseudo_device_open_count++;
+        virtual_device_count++;
+        *is_virtual = 1;
+        *pending_return = fd;
+        printf("GUEST BINDER OPEN: guest-pid=%d executable=%s path=/dev/binder flags=0x%x virtual-fd=%d source=API10 ueventd.rc mode=0666 root:root; guest-only software bootstrap endpoint, kernel misc minor unresolved, no host Binder/device opened\n",
+               active_tracee->guest_pid, active_tracee->exec_target,
+               flags, fd);
+        return 0;
+    }
+    if ((nr == ARM_NR_OPEN || nr == ARM_NR_OPENAT) &&
         strcmp(guest, GUEST_FB0_PATH) == 0) {
         unsigned flags_arg = nr == ARM_NR_OPEN ? 1u : 2u;
         unsigned flags = regs->uregs[flags_arg];
@@ -3302,6 +3373,11 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
         case ARM_NR_FCHOWNAT: case ARM_NR_FCHMODAT: case ARM_NR_CHOWN32: case ARM_NR_LCHOWN32:
             *is_virtual = 1; *pending_return = 0; return 0;
         case ARM_NR_MKNOD: case ARM_NR_MKNODAT:
+            if (strcmp(guest, "/dev/binder") == 0) {
+                *is_virtual = 1;
+                *pending_return = -EOPNOTSUPP;
+                return 0;
+            }
             if (strcmp(guest, GUEST_FB0_PATH) == 0) {
                 unsigned mode_arg = nr == ARM_NR_MKNOD ? 1u : 2u;
                 unsigned dev_arg = nr == ARM_NR_MKNOD ? 2u : 3u;
@@ -3600,6 +3676,88 @@ static int mediate_guest_identity_syscall(pid_t pid, struct tracee_state *state,
     return 0;
 }
 
+static int mediate_guest_binder_ioctl(pid_t pid, struct tracee_state *state,
+                                      struct compat_pt_regs *regs,
+                                      int *park_read, int32_t *result) {
+    *park_read = 0;
+    int fd = (int32_t)regs->uregs[0];
+    if (!is_virtual_fd_number(fd)) return 1;
+    struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
+    if (!entry || entry->kind != VIRTUAL_FD_DEV_BINDER) return 1;
+    if (!state || !tracee_owns_virtual_fd(state, fd)) {
+        *result = -EBADF;
+        return 0;
+    }
+    struct guest_binder_trace_memory memory = { .pid = pid };
+    int rc = guest_binder_ioctl_bootstrap(&state->binder, &guest_binder_state,
+        state->guest_pid, regs->uregs[1], regs->uregs[2],
+        guest_binder_trace_copyin, guest_binder_trace_copyout, &memory,
+        park_read);
+    *result = rc;
+    if (rc < 0) {
+        if (state->binder.ioctl_count <= 64u)
+            printf("GUEST BINDER IOCTL DENIED: guest-pid=%d executable=%s fd=%d cmd=0x%08x argument=0x%08x result=%d errno=%s transactions-supported=0; no host ioctl called\n",
+                   state->guest_pid, state->exec_target, fd,
+                   regs->uregs[1], regs->uregs[2], rc,
+                   guest_diag_errno_name(-rc));
+        return 0;
+    }
+    if (*park_read) {
+        state->binder_waiting = 1;
+        guest_arm32_binder_write_read request = {0};
+        (void)guest_binder_trace_copyin(&memory, regs->uregs[2],
+            &request, sizeof(request));
+        printf("GUEST BINDER BLOCKED READ: guest-pid=%d executable=%s fd=%d mapped-bytes=%u loop-entered=%d read-buffer=0x%08x read-size=%u; no guest transaction queue exists, remains parked until bounded timeout/cancel; no host Binder or busy-loop\n",
+               state->guest_pid, state->exec_target, fd,
+               state->binder.mapping_length, state->binder.loop_entered,
+               request.read_buffer, (unsigned)(request.read_size < 0 ? 0 : request.read_size));
+    } else if (regs->uregs[1] == GUEST_BINDER_IOCTL_VERSION) {
+        printf("GUEST BINDER VERSION: guest-pid=%d protocol=%d result=0 source=Goldfish-2.6.29-API10-UAPI\n",
+               state->guest_pid, GUEST_BINDER_PROTOCOL_VERSION);
+    } else if (regs->uregs[1] == GUEST_BINDER_IOCTL_SET_CONTEXT_MGR) {
+        printf("GUEST BINDER CONTEXT MANAGER: guest-pid=%d ioctl-argument=0 result=0 guest-only-owner=%d; scalar-zero API10 call, no host Binder context manager registered\n",
+               state->guest_pid, guest_binder_state.context_manager_guest_pid);
+    } else if (regs->uregs[1] == GUEST_BINDER_IOCTL_WRITE_READ) {
+        printf("GUEST BINDER WRITE_READ: guest-pid=%d fd=%d loop-entered=%d commands-consumed=%lu blocked-reads=%lu transactions-supported=0\n",
+               state->guest_pid, fd, state->binder.loop_entered,
+               state->binder.loop_commands, state->binder.empty_reads_parked);
+    }
+    return 0;
+}
+
+static int mediate_guest_binder_mmap(struct tracee_state *state,
+                                     struct compat_pt_regs *regs) {
+    int fd = (int32_t)regs->uregs[4];
+    if (!is_virtual_fd_number(fd)) return 1;
+    struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
+    if (!entry || entry->kind != VIRTUAL_FD_DEV_BINDER) return 1;
+    if (!state || !tracee_owns_virtual_fd(state, fd)) return -EBADF;
+    uint32_t length = regs->uregs[1];
+    uint32_t prot = regs->uregs[2];
+    uint32_t flags = regs->uregs[3];
+    uint32_t offset_pages = regs->uregs[5];
+    int rc = guest_binder_validate_mmap(length, prot, flags, fd,
+                                        offset_pages, 1);
+    if (rc == 0 && state->binder.mapping_valid) rc = -EBUSY;
+    if (rc == 0 && regs->uregs[0] != 0) rc = -EINVAL;
+    if (rc != 0) {
+        printf("GUEST BINDER MMAP DENIED: guest-pid=%d fd=%d address-hint=0x%08x length=%u prot=0x%x flags=0x%x offset-pages=%u result=%d errno=%s; only API10 read-only receive sizes are supported\n",
+               state->guest_pid, fd, regs->uregs[0], length, prot, flags,
+               offset_pages, rc, guest_diag_errno_name(-rc));
+        return rc;
+    }
+    state->binder_mmap_pending = 1;
+    state->binder_pending_map_length = length;
+    regs->uregs[0] = 0;
+    regs->uregs[2] = (uint32_t)PROT_READ;
+    regs->uregs[3] = flags | (uint32_t)MAP_ANONYMOUS;
+    regs->uregs[4] = UINT32_MAX;
+    regs->uregs[5] = 0;
+    printf("GUEST BINDER MMAP ROUTE: guest-pid=%d fd=%d bytes=%u prot=READ guest-flags=0x%x; forwarded only as anonymous app-process memory, not host Binder mapping\n",
+           state->guest_pid, fd, length, flags);
+    return 0;
+}
+
 static int dispatch_entry(pid_t pid, struct tracee_state *state,
                           struct compat_pt_regs *regs, int nr,
                           int32_t *pending_return, int *fake) {
@@ -3619,7 +3777,60 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
                    state->identity.group_count, identity_result);
         return 0;
     }
+    int binder_candidate_fd = -1;
+    switch (nr) {
+        case ARM_NR_READ: case ARM_NR_WRITE: case ARM_NR_LSEEK:
+        case ARM_NR_FSTAT: case ARM_NR_FSTAT64: case ARM_NR_FCHMOD:
+        case ARM_NR_FCHOWN: case ARM_NR_FCHOWN32: case ARM_NR_FTRUNCATE:
+        case ARM_NR_FTRUNCATE64: case ARM_NR_FSYNC: case ARM_NR_FDATASYNC:
+        case ARM_NR_PREAD64: case ARM_NR_PWRITE64: case ARM_NR_DUP:
+            binder_candidate_fd = (int32_t)regs->uregs[0];
+            break;
+        case ARM_NR_DUP2: {
+            int source_fd = (int32_t)regs->uregs[0];
+            int target_fd = (int32_t)regs->uregs[1];
+            struct guest_vsocket_fd *source = guest_vsocket_fd_get(
+                &guest_sockets, source_fd);
+            struct guest_vsocket_fd *target = guest_vsocket_fd_get(
+                &guest_sockets, target_fd);
+            if ((source && source->kind == VIRTUAL_FD_DEV_BINDER) ||
+                (target && target->kind == VIRTUAL_FD_DEV_BINDER))
+                binder_candidate_fd = source &&
+                    source->kind == VIRTUAL_FD_DEV_BINDER ? source_fd : target_fd;
+            break;
+        }
+        default:
+            break;
+    }
+    if (is_virtual_fd_number(binder_candidate_fd)) {
+        struct guest_vsocket_fd *binder_entry = guest_vsocket_fd_get(
+            &guest_sockets, binder_candidate_fd);
+        if (binder_entry && binder_entry->kind == VIRTUAL_FD_DEV_BINDER) {
+            *pending_return = tracee_owns_virtual_fd(state, binder_candidate_fd)
+                ? (nr == ARM_NR_LSEEK ? -ESPIPE :
+                   (nr == ARM_NR_FTRUNCATE || nr == ARM_NR_FTRUNCATE64)
+                       ? -EINVAL : -EOPNOTSUPP)
+                : -EBADF;
+            *fake = 1;
+            virtual_device_count++;
+            printf("GUEST BINDER FD OP DENIED: guest-pid=%d executable=%s syscall=%s fd=%d result=%d; only explicit Binder version/map/context/looper ioctl subset is modeled; no host fd operation\n",
+                   state->guest_pid, state->exec_target,
+                   guest_diag_syscall_name(nr), binder_candidate_fd,
+                   *pending_return);
+            return 0;
+        }
+    }
     if (nr == ARM_NR_IOCTL) {
+        int binder_park_read = 0;
+        int32_t binder_result = 0;
+        int binder_rc = mediate_guest_binder_ioctl(pid, state, regs,
+            &binder_park_read, &binder_result);
+        if (binder_rc != 1) {
+            *pending_return = binder_result;
+            *fake = binder_park_read ? 2 : 1;
+            if (!binder_park_read) virtual_device_count++;
+            return 0;
+        }
         int32_t ioctl_result = 0;
         int fb_result = mediate_guest_fb0_ioctl(pid, state, regs, &ioctl_result);
         if (fb_result != 1) {
@@ -3630,6 +3841,15 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         }
     }
     if (nr == ARM_NR_MMAP2) {
+        int binder_map_result = mediate_guest_binder_mmap(state, regs);
+        if (binder_map_result != 1) {
+            if (binder_map_result < 0) {
+                *pending_return = binder_map_result;
+                *fake = 1;
+                virtual_device_count++;
+            }
+            return 0;
+        }
         int fb_result = mediate_guest_fb0_mmap(pid, state, regs);
         if (fb_result != 1) {
             if (fb_result < 0) {
@@ -3643,6 +3863,54 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
                 guest_fb0_mmap_count++;
             }
             return 0;
+        }
+    }
+    if (state->binder.mapping_valid && nr == ARM_NR_MPROTECT) {
+        uint32_t address = regs->uregs[0], length = regs->uregs[1];
+        uint64_t request_end = (uint64_t)address + length;
+        uint64_t mapping_end = (uint64_t)state->binder.mapping_start +
+            state->binder.mapping_length;
+        if (length != 0 && (uint64_t)address < mapping_end &&
+            (uint64_t)state->binder.mapping_start < request_end &&
+            (regs->uregs[2] & (uint32_t)PROT_WRITE) != 0) {
+            *pending_return = -EACCES;
+            *fake = 1;
+            printf("GUEST BINDER MPROTECT DENIED: guest-pid=%d range=0x%08x+%u prot=0x%x; Binder receive mapping remains read-only\n",
+                   state->guest_pid, address, length, regs->uregs[2]);
+            return 0;
+        }
+    }
+    if (state->binder.mapping_valid && nr == ARM_NR_MREMAP) {
+        uint32_t address = regs->uregs[0], length = regs->uregs[1];
+        uint64_t request_end = (uint64_t)address + length;
+        uint64_t mapping_end = (uint64_t)state->binder.mapping_start +
+            state->binder.mapping_length;
+        if (length != 0 && (uint64_t)address < mapping_end &&
+            (uint64_t)state->binder.mapping_start < request_end) {
+            *pending_return = -EOPNOTSUPP;
+            *fake = 1;
+            printf("GUEST BINDER MREMAP DENIED: guest-pid=%d range=0x%08x+%u; receive-map relocation is unsupported\n",
+                   state->guest_pid, address, length);
+            return 0;
+        }
+    }
+    if (state->binder.mapping_valid && nr == ARM_NR_MUNMAP) {
+        uint32_t address = regs->uregs[0], length = regs->uregs[1];
+        uint64_t request_end = (uint64_t)address + length;
+        uint64_t mapping_end = (uint64_t)state->binder.mapping_start +
+            state->binder.mapping_length;
+        if (length != 0 && (uint64_t)address < mapping_end &&
+            (uint64_t)state->binder.mapping_start < request_end) {
+            if (address != state->binder.mapping_start ||
+                length != state->binder.mapping_length) {
+                *pending_return = -EINVAL;
+                *fake = 1;
+                printf("GUEST BINDER MUNMAP DENIED: guest-pid=%d range=0x%08x+%u expected-exact=0x%08x+%u\n",
+                       state->guest_pid, address, length,
+                       state->binder.mapping_start, state->binder.mapping_length);
+                return 0;
+            }
+            state->binder_munmap_pending = 1;
         }
     }
     if (nr == ARM_NR_MUNMAP && state->fb_mapping_valid &&
@@ -3958,7 +4226,11 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         is_virtual_fd_number((int32_t)regs->uregs[0])) {
         int fd = (int32_t)regs->uregs[0];
         struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
-        if (entry && entry->kind >= VIRTUAL_FD_DEV_NULL &&
+        if (entry && entry->kind == VIRTUAL_FD_DEV_BINDER) {
+            *pending_return = -EOPNOTSUPP;
+            printf("GUEST BINDER STREAM IO DENIED: guest-pid=%d fd=%d syscall=%s result=-EOPNOTSUPP; API10 backend accepts only version/context-manager/loop ioctls, no raw stream or host fd\n",
+                   state->guest_pid, fd, guest_diag_syscall_name(nr));
+        } else if (entry && entry->kind >= VIRTUAL_FD_DEV_NULL &&
             entry->kind <= VIRTUAL_FD_DEV_RANDOM)
             *pending_return = virtual_guest_pseudo_device_io(pid, fd,
                 regs->uregs[1], regs->uregs[2], nr == ARM_NR_READ);
@@ -4004,6 +4276,43 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         int is_virtual = 0;
         int32_t result = 0;
         int rc = path_syscall(pid, regs, nr, &result, &is_virtual);
+        if ((nr == ARM_NR_MKNOD || nr == ARM_NR_MKNODAT) && rc != 1) {
+            uint32_t requested_mode = regs->uregs[nr == ARM_NR_MKNOD ? 1u : 2u];
+            uint32_t requested_device = regs->uregs[nr == ARM_NR_MKNOD ? 2u : 3u];
+            int32_t effective_result = rc == 0 ? result : rc;
+            const char *path = state && state->last_guest_path[0]
+                ? state->last_guest_path : "<path-unavailable>";
+            const char *reason = "app-private-placeholder";
+            if (strcmp(path, GUEST_FB0_PATH) == 0) {
+                reason = state ? guest_fb0_mknod_rejection_reason(
+                    state->identity.euid, state->identity.fsgid,
+                    guest_fb0_graphics_uevent_received,
+                    requested_mode, requested_device) : "tracee-state-unavailable";
+                if (!reason) reason = effective_result == 0
+                    ? "exact-source-backed-fb0" : "private-node-create-failed";
+            } else if (strcmp(path, "/dev/binder") == 0) {
+                reason = "binder-misc-minor-is-dynamic; no-transaction-node-event-modeled";
+            } else if (effective_result < 0) {
+                reason = "app-private-node-creation-failed";
+            }
+            if (guest_mknod_diagnostics_emitted < 64u) {
+                guest_mknod_diagnostics_emitted++;
+                printf("GUEST MKNOD MEDIATION: guest-pid=%d executable=%s path=%s syscall=%s dirfd=%d mode=0%o device=0x%x guest-euid=%u guest-fsgid=%u graphics-event=%d virtual=%d result=%d errno=%s reason=%s; device effects stay in app-private guest model\n",
+                       state ? state->guest_pid : -1,
+                       state && state->exec_target[0] ? state->exec_target : "<unknown>",
+                       path, guest_diag_syscall_name(nr),
+                       nr == ARM_NR_MKNODAT ? (int32_t)regs->uregs[0] : AT_FDCWD,
+                       requested_mode, requested_device,
+                       state ? state->identity.euid : 0u,
+                       state ? state->identity.fsgid : 0u,
+                       guest_fb0_graphics_uevent_received, is_virtual,
+                       effective_result,
+                       effective_result < 0 ? guest_diag_errno_name(-effective_result) : "none",
+                       reason ? reason : "accepted-source-backed-fb0");
+            } else {
+                guest_mknod_diagnostics_suppressed++;
+            }
+        }
         if (rc == 1) return set_regs(pid, regs);
         if (rc == 0 && is_virtual) {
             *pending_return = result; *fake = 1; virtual_device_count++; return 0;
@@ -4250,7 +4559,9 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                        state->guest_pid, WEXITSTATUS(status));
             }
             if (waited == pid) *exit_code = WEXITSTATUS(status);
+            int32_t exited_guest_pid = state->guest_pid;
             remove_tracee(waited);
+            guest_binder_release_context_manager_if_dead(exited_guest_pid);
             continue;
         }
         if (WIFSIGNALED(status)) {
@@ -4273,7 +4584,9 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                        state->guest_pid, WTERMSIG(status));
             }
             if (waited == pid) { *exit_code = -1; *exit_signal = WTERMSIG(status); }
+            int32_t exited_guest_pid = state->guest_pid;
             remove_tracee(waited);
+            guest_binder_release_context_manager_if_dead(exited_guest_pid);
             continue;
         }
         if (!WIFSTOPPED(status)) continue;
@@ -4344,6 +4657,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 child_state->fb_mapping_start = state->fb_mapping_start;
                 child_state->fb_mapping_length = state->fb_mapping_length;
                 child_state->fb_mapping_valid = state->fb_mapping_valid;
+                child_state->binder = state->binder;
+                child_state->binder_waiting = 0;
                 child_state->process_compat = state->process_compat;
                 snprintf(child_state->exec_backing_path,
                          sizeof(child_state->exec_backing_path), "%s",
@@ -4425,6 +4740,11 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             }
             state->pending_exec_script[0] = '\0';
             close_virtual_fds_on_exec(state);
+            guest_binder_process_exec_reset(&state->binder);
+            state->binder_waiting = 0;
+            state->binder_mmap_pending = 0;
+            state->binder_munmap_pending = 0;
+            state->binder_pending_map_length = 0;
             state->target_elf_text_seen = 0;
             state->target_elf_text_pc = 0;
             state->target_elf_text_file_offset = 0;
@@ -4498,6 +4818,16 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 int32_t result = 0;
                 int rc = dispatch_entry(waited, state, &regs, state->last_syscall, &result, &fake);
                 if (rc != 0) { fprintf(stderr, "broker failure at ARM syscall %d pid=%d: errno=%d\n", state->last_syscall, waited, errno); kill_all_tracees(); return -1; }
+                if (fake == 2) {
+                    state->pending = 0;
+                    state->expect_exit = 0;
+                    if (syscall_stops <= MAX_TRACE_LINES)
+                        printf("TRACE pid=%d entry #%lu: ARM syscall=%d class=%d guest-software-blocked-read (tracee remains ptrace-stopped; no syscall forwarded)\n",
+                               waited, syscall_stops, state->last_syscall,
+                               (int)guest_syscall_policy(state->last_syscall));
+                    stops++;
+                    continue;
+                }
                 if (fake) {
                     if (fake_entry(waited, &regs, result, &state->pending_return) != 0) { fprintf(stderr, "could not cancel syscall %d pid=%d: errno=%d\n", state->last_syscall, waited, errno); kill_all_tracees(); return -1; }
                     state->pending = 1;
@@ -4510,6 +4840,11 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                                waited, syscall_stops, state->last_syscall, (int)cls, result);
                 } else {
                     state->pending = 0;
+                    if (state->binder_mmap_pending && set_regs(waited, &regs) != 0) {
+                        fprintf(stderr, "cannot install guest Binder anonymous mmap arguments pid=%d errno=%d\n",
+                                waited, errno);
+                        kill_all_tracees(); return -1;
+                    }
                     if (syscall_stops <= MAX_TRACE_LINES)
                         printf("TRACE pid=%d entry #%lu: ARM syscall=%d class=%d forwarded-supervised\n",
                                waited, syscall_stops, state->last_syscall, (int)guest_syscall_policy(state->last_syscall));
@@ -4545,6 +4880,34 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                                state->guest_pid, syscall_result);
                     }
                     state->fb_mmap_pending = 0;
+                }
+                if (state->binder_mmap_pending) {
+                    if (state->last_syscall == ARM_NR_MMAP2 && syscall_result >= 0) {
+                        int map_rc = guest_binder_note_mapping(&state->binder,
+                            (uint32_t)syscall_result,
+                            state->binder_pending_map_length);
+                        if (map_rc == 0) guest_binder_state.mapping_successes++;
+                        printf("GUEST BINDER MAPPING: guest-pid=%d address=0x%08x length=%u read-only=%d registration=%d; anonymous guest receive memory only, no Binder transaction buffers delivered\n",
+                               state->guest_pid, (uint32_t)syscall_result,
+                               state->binder_pending_map_length,
+                               map_rc == 0, map_rc);
+                    } else {
+                        printf("GUEST BINDER MMAP FAILED: guest-pid=%d syscall=%d result=%d; Binder bootstrap cannot proceed\n",
+                               state->guest_pid, state->last_syscall,
+                               syscall_result);
+                    }
+                    state->binder_mmap_pending = 0;
+                    state->binder_pending_map_length = 0;
+                }
+                if (state->binder_munmap_pending) {
+                    if (state->last_syscall == ARM_NR_MUNMAP && syscall_result == 0) {
+                        int unmap_rc = guest_binder_note_unmap(&state->binder,
+                            state->binder.mapping_start,
+                            state->binder.mapping_length);
+                        printf("GUEST BINDER MUNMAP: guest-pid=%d result=0 state-clear=%d; guest-only mapping record cleared\n",
+                               state->guest_pid, unmap_rc);
+                    }
+                    state->binder_munmap_pending = 0;
                 }
                 if (state->fb_munmap_pending) {
                     if (state->last_syscall == ARM_NR_MUNMAP && syscall_result == 0) {
@@ -4793,10 +5156,19 @@ int main(int argc, char **argv) {
            GUEST_PROFILE_NET_DNS1);
     printf("GUEST FRAME CHANNEL: ready=%d; GVMF/1 app-private receiver; frames-published=%lu; only guest fb0 backing bytes may be published; host framebuffer/Binder=0\n",
            guest_frame_channel_ready, guest_frame_published_count);
-    printf("GUEST FB0 SOFTWARE MODEL: ready=%d; path=%s profile=%s %ux%u RGB565 double-buffered; graphics-uevent-received=%d node-created=%d; Binder/SurfaceFlinger still unimplemented until traced\n",
+    printf("GUEST FB0 SOFTWARE MODEL: ready=%d; path=%s profile=%s %ux%u RGB565 double-buffered; graphics-uevent-received=%d node-created=%d; viewport remains no-frame until guest bytes are published\n",
            guest_fb0_backend_ready, GUEST_FB0_PATH, GUEST_PROFILE_DISPLAY_SKIN,
            GUEST_PROFILE_DISPLAY_WIDTH, GUEST_PROFILE_DISPLAY_HEIGHT,
            guest_fb0_graphics_uevent_received, guest_fb0_node_created);
+    printf("GUEST BINDER BOOTSTRAP SUMMARY: opens=%lu ioctls=%lu version-queries=%lu anonymous-mappings=%lu context-manager-claims=%lu conflicts=%lu loop-commands=%lu parked-empty-reads=%lu unsupported-commands=%lu unsupported-transactions=%lu owner-guest-pid=%d; transaction delivery/service registration unsupported; host Binder calls=0\n",
+           guest_binder_state.opens, guest_binder_state.ioctl_calls,
+           guest_binder_state.version_queries, guest_binder_state.mapping_successes,
+           guest_binder_state.context_manager_claims,
+           guest_binder_state.context_manager_conflicts,
+           guest_binder_state.loop_commands, guest_binder_state.empty_reads_parked,
+           guest_binder_state.unsupported_commands,
+           guest_binder_state.unsupported_transactions,
+           guest_binder_state.context_manager_guest_pid);
     printf("PROCESS TREE: fork/clone/vfork followed with ptrace; active-and-unreaped registry cap=%d; process slots reusable after guest wait4 reap, non-waitable thread slots after ptrace terminal exit; verified ARM32 execs and confined original-linker aliases\n", MAX_TRACEES);
     puts("DYNAMIC ELF POLICY: original API10 linker is inherited as fd 198; unsupported PT_INTERP is denied before host-linker substitution");
     int child = start_guest(binary, &argv[5]);

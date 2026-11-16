@@ -16,7 +16,10 @@ int main(void) {
     assert(strcmp(guest_device_unimplemented_reason("/dev/log/main"),
                   "android-log-device-backend-not-implemented") == 0);
     assert(strcmp(guest_device_unimplemented_reason("/dev/binder"),
-                  "binder-kernel-backend-not-implemented") == 0);
+                  "binder-software-bootstrap-only-no-ipc-transactions") == 0);
+    assert(!guest_device_guest_file_path_is_allowed("/dev/binder/transaction"));
+    assert(strcmp(guest_device_unimplemented_reason("/dev/binder/transaction"),
+                  "binder-software-bootstrap-only-no-ipc-transactions") != 0);
     assert(strcmp(guest_device_unimplemented_reason("/dev/ashmem"),
                   "ashmem-kernel-backend-not-implemented") == 0);
     assert(strcmp(guest_device_unimplemented_reason("/dev/goldfish_pipe"),

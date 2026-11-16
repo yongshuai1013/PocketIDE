@@ -55,6 +55,18 @@ int main(int argc, char **argv) {
     assert(guest_fb0_open_ready(1, 0, 0) == -ENOENT);
     assert(guest_fb0_open_ready(1, 1, 0) == -ENOENT);
     assert(guest_fb0_open_ready(1, 1, 1) == 0);
+    assert(strcmp(guest_fb0_mknod_rejection_reason(1000, GUEST_FB0_OWNER_GID,
+        1, GUEST_FB0_MODE, guest_fb0_makedev(29, 0)), "guest-euid-not-root") == 0);
+    assert(strcmp(guest_fb0_mknod_rejection_reason(0, 1000, 1,
+        GUEST_FB0_MODE, guest_fb0_makedev(29, 0)), "guest-fsgid-not-graphics") == 0);
+    assert(strcmp(guest_fb0_mknod_rejection_reason(0, GUEST_FB0_OWNER_GID,
+        0, GUEST_FB0_MODE, guest_fb0_makedev(29, 0)), "graphics-add-event-not-consumed") == 0);
+    assert(strcmp(guest_fb0_mknod_rejection_reason(0, GUEST_FB0_OWNER_GID,
+        1, GUEST_FB0_MODE ^ 0001u, guest_fb0_makedev(29, 0)), "mode-not-root-graphics-0660-char") == 0);
+    assert(strcmp(guest_fb0_mknod_rejection_reason(0, GUEST_FB0_OWNER_GID,
+        1, GUEST_FB0_MODE, guest_fb0_makedev(29, 1)), "device-number-not-29-0") == 0);
+    assert(guest_fb0_mknod_rejection_reason(0, GUEST_FB0_OWNER_GID, 1,
+        GUEST_FB0_MODE, guest_fb0_makedev(29, 0)) == NULL);
     assert(!guest_fb0_mknod_args_valid(1000, GUEST_FB0_OWNER_GID, 1,
                                        GUEST_FB0_MODE, guest_fb0_makedev(29, 0)));
     assert(!guest_fb0_mknod_args_valid(0, 1000, 1, GUEST_FB0_MODE,

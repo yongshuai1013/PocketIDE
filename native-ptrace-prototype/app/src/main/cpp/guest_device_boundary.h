@@ -30,8 +30,8 @@ static inline int guest_device_guest_file_path_is_allowed(const char *path) {
 }
 
 /* These are app-private API10 guest nodes only. Unknown /dev paths are denied
- * before VFS open; no host /dev, Binder, ashmem, PTY, GPU, radio, audio, input,
- * or emulator pipe endpoint is ever substituted. */
+ * before VFS open; the one exact /dev/binder open is intercepted separately by
+ * a software bootstrap descriptor, never a host /dev or Binder endpoint. */
 static inline const char *guest_device_unimplemented_reason(const char *path) {
     if (!path || !guest_device_path_prefix(path, "/dev") ||
         guest_device_guest_file_path_is_allowed(path)) return NULL;
@@ -44,7 +44,7 @@ static inline const char *guest_device_unimplemented_reason(const char *path) {
     if (guest_device_path_prefix(path, "/dev/log"))
         return "android-log-device-backend-not-implemented";
     if (strcmp(path, "/dev/binder") == 0)
-        return "binder-kernel-backend-not-implemented";
+        return "binder-software-bootstrap-only-no-ipc-transactions";
     if (strcmp(path, "/dev/ashmem") == 0)
         return "ashmem-kernel-backend-not-implemented";
     if (strcmp(path, "/dev/goldfish_pipe") == 0 ||

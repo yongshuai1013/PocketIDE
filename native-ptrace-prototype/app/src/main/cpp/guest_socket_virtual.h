@@ -44,6 +44,7 @@ enum virtual_fd_kind {
     VIRTUAL_FD_DEV_RANDOM = 10,
     VIRTUAL_FD_DEV_FULL = 11,
     VIRTUAL_FD_DEV_FRAMEBUFFER = 12,
+    VIRTUAL_FD_DEV_BINDER = 13,
 };
 
 enum guest_vsocket_channel_kind {

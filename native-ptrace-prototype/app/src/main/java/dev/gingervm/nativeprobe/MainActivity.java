@@ -118,13 +118,13 @@ public final class MainActivity extends Activity {
                 + "Host ABI: " + Arrays.toString(Build.SUPPORTED_ABIS) + "\n"
                 + "64-bit app process: " + Process.is64Bit() + "\n"
                 + "Android API: " + Build.VERSION.SDK_INT + "\n\n"
-                + "LATEST DEVICE TRACE (owner-provided v0.6.16 Android 12 log): Goldfish uevent delivery, coldboot marker and PID 1 stat succeeded. The continuous tree recorded 42 fork/clone/vfork events, 32 guest execs and 31 original linker entries. app_process entered the linker, but its target-code entry was not observed; the only ET_EXEC entry hit identified was /sbin/ueventd. No target main, Zygote, framework, system_server or desktop was observed.\n"
-                + "The property listener bound/listened, but connect/accept/sendto/recvfrom were all 0, so v0.6.16's new property stream was not exercised. The old trace killed host PID 14912 as unregistered immediately before a later fork-event record identified the same child PID under guest PID 13; the old logger did not include that wait status or the child's exec path, so its exact stop signal and intended command remain unproven. The owner-reported eth0 route failure is not evidence that ifconfig ran. The supervisor ended by bounded timeout; cleanup tracked=12/reaped=12/unresolved=0.\n"
-                + "v0.6.17 defers only recognized ptrace child-initial-stop statuses until an exact parent event PID match, then registers, configures and resumes the child; pending children share the same hard 32-slot budget and timeout cleanup. Host tests pass, but a new device trace must show whether the child is adopted and which guest command runs.\n"
+                + "LATEST OWNER TRACE (submitted after v0.6.19; installed app version is not stated in the log): 3 deferred child stops were each adopted by the matching parent event; rejected/pending children=0. Coldboot marker and PID 1 stat succeeded. Guest eth0 was brought up as 10.0.2.15/24 with default gateway 10.0.2.2; host networking remains unused.\n"
+                + "Display evidence: frame-channel initialization reported ready=0/errno=13, while the software graphics add uevent was delivered. The trace did not record a pathname for the mknod returning 0, so that syscall cannot be identified as fb0. fb0 node/open/ioctl/mmap/page-flip/published-frame counts were all 0. This build aligns the app/native frame directory as the exact guest-root sibling and logs the failed no-follow owner/mode check. WVGA800 is the selected AOSP skin profile, not proof that a guest kernel produced that mode.\n"
+                + "Startup boundary: servicemanager code ran, but `/dev/binder` was denied with EOPNOTSUPP; app_process target-code entry, Zygote, framework, SurfaceFlinger and desktop were not observed. This build implements only Binder version/map/context-manager/looper bootstrap; Binder transactions and service registration remain unsupported, so no service-manager success is claimed.\n"
                 + "API10 SystemServer.java says init1 is called from Zygote and starts native services including SurfaceFlinger; its JNI init1 calls system_init(). The owner trace did not observe app_process target-code entry, Zygote or SystemServer, so that stage has not run. A linker entry is not proof of target main, Zygote, framework, desktop or display output.\n"
-                + "The viewport retains its app-private GVMF/1 receiver and checksum-verified renderer. This build adds a source-backed API10 Goldfish fb0 software path: ueventd graphics add -> validated root:graphics node -> fbdev info ioctls -> exact MAP_SHARED RGB565 double buffer -> page-flip capture -> GVMF/1. Host regression proves the producer and Java decoder interoperate using test-written bytes; it does not prove the original guest reached fb0. The real viewport stays no-frame until a device trace shows guest writes and page flips. Guest Binder/service-manager/SurfaceFlinger are still not implemented or observed, so no Android desktop is claimed. No host Binder, framebuffer or drawn screen is used.\n\n"
+                + "The viewport keeps its app-private GVMF/1 receiver and checksum-verified renderer. Host tests prove the software fb0 model can publish a test packet and the Java decoder can render it; only a device trace showing guest MAP_SHARED writes and page flips can prove real guest pixels. This build never draws a demo desktop and never substitutes host Binder, framebuffer, mount or network.\n\n"
                 + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer follows the latest output; share/save exports the complete log.\n"
-                + "The v0.6.16 owner-provided trace remains the latest verified device baseline. v0.6.17/v0.6.18 changes and this new fb0 path still require a fresh device trace; no target main, Zygote, framework, SurfaceFlinger or desktop is claimed.";
+                + "The latest owner trace ended by bounded supervisor timeout with cleanup tracked=17/reaped=13/already-gone=4/unresolved=0. A new device trace must confirm the frame channel now reaches ready=1, name the exact mknod path, then show `GUEST FB0 NODE CREATED`, `GUEST FB0 OPEN REDIRECT`, fb0 ioctl/mmap/page-flip and `GUEST FRAME PUBLISHED`; Binder bootstrap must be followed by real transaction/service-manager markers before any desktop claim.";
     }
 
     private void buildUi() {
@@ -186,7 +186,7 @@ public final class MainActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 Gravity.CENTER));
         guestDisplayStatus = new TextView(this);
-        guestDisplayStatus.setText("尚無真實 guest 畫面\n只顯示 guest fb0 mmap／page-flip 產生並驗證的像素。\nfb0 軟體 producer 已接上；仍需 guest Binder／SurfaceFlinger 實際輸出 frame。此區不是 Android 桌面。");
+        guestDisplayStatus.setText("尚無真實 guest 畫面\n只顯示 guest fb0 mmap／page-flip 產生並驗證的像素。\nBinder 目前僅有啟動握手，交易／服務註冊未實作；SurfaceFlinger 尚未觀測。此區不是 Android 桌面。");
         guestDisplayStatus.setTextColor(0xFF9AA8B6);
         guestDisplayStatus.setTextSize(14);
         guestDisplayStatus.setGravity(Gravity.CENTER);
@@ -231,7 +231,10 @@ public final class MainActivity extends Activity {
 
     private void initializeGuestFrameReceiver() {
         try {
-            guestFrameDirectory = new File(getFilesDir(), GuestFramePacket.CHANNEL_DIRECTORY);
+            File frameGuestRoot = new File(getFilesDir(), GUEST_ROOT_NAME).getAbsoluteFile();
+            File frameParent = frameGuestRoot.getParentFile();
+            if (frameParent == null) throw new IOException("guest root has no app-private parent");
+            guestFrameDirectory = new File(frameParent, GuestFramePacket.CHANNEL_DIRECTORY);
             ensurePrivateGuestFrameDirectory(guestFrameDirectory);
             guestFrameFile = new File(guestFrameDirectory, GuestFramePacket.CHANNEL_FILE);
             guestFrameExecutor = Executors.newSingleThreadExecutor(new java.util.concurrent.ThreadFactory() {
@@ -251,7 +254,7 @@ public final class MainActivity extends Activity {
             };
             guestFrameObserver.startWatching();
             guestFrameChannelAvailable = true;
-            guestDisplayStatus.setText("等待真實 guest framebuffer frame…\n僅接收 app-private GVMF/1 且驗證 checksum 的 guest 像素。\n目前尚未接通 guest fb0／Binder frame producer。");
+            guestDisplayStatus.setText("等待真實 guest framebuffer frame…\n僅接收 app-private GVMF/1 且驗證 checksum 的 guest 像素。\nBinder 僅有啟動握手，交易／服務註冊未實作；SurfaceFlinger 尚未觀測。");
             requestGuestFrameDecode();
         } catch (Exception e) {
             guestFrameChannelAvailable = false;
@@ -279,7 +282,10 @@ public final class MainActivity extends Activity {
         }
         if (!OsConstants.S_ISDIR(state.st_mode) || state.st_uid != Process.myUid() ||
                 (state.st_mode & 0077) != 0)
-            throw new IOException("guest frame directory is not an app-owned mode-0700 directory");
+            throw new IOException("guest frame directory validation failed: path=" + directory.getAbsolutePath() +
+                    " expectedOwner=" + Process.myUid() + " actualOwner=" + state.st_uid +
+                    " mode=" + Integer.toOctalString(state.st_mode & 07777) +
+                    " (must be an app-owned 0700 directory)");
     }
 
     private void requestGuestFrameDecode() {
@@ -445,8 +451,8 @@ public final class MainActivity extends Activity {
         viewLogButton.setEnabled(true);
         stopButton.setEnabled(true);
         setReportText("Preparing the complete original Google API10 guest image; userland and linker aliases are staged in app-private storage and extracted ARM32 libraries…\n"
-                + "LATEST OWNER DEVICE TRACE (v0.6.16, not this run): 42 process events, 32 guest execs and 31 original-linker entries; app_process reached linker entry but no target-code PC, Zygote, SystemServer, SurfaceFlinger or frame was observed. The shell launched route on eth0; route got ENETDOWN and the trace had no ifconfig exec/setup evidence. Supervisor timeout cleanup completed tracked=12/reaped=12/unresolved=0.\n"
-                + "This version adds only an app-private, checksummed guest-frame receiver/renderer. The Goldfish fb0 producer and guest Binder are still absent; this panel remains no-frame until genuine guest framebuffer bytes arrive. Stop is still an independent user cancellation.\n");
+                + "LATEST OWNER DEVICE TRACE (after v0.6.19 push; installed version unverified): child-stop adoption, coldboot and virtual eth0 setup succeeded; frame sink was ready=0/errno=13, graphics add was delivered, but no pathname proves the mknod was fb0 and all fb0/frame counters remained 0. No app_process target code, Zygote, framework, SurfaceFlinger or desktop was observed. Cleanup unresolved=0.\n"
+                + "This build fixes app-private frame-directory alignment and adds Binder bootstrap only; Binder transactions/service registration remain unavailable. The viewport stays blank until genuine guest framebuffer bytes arrive. Stop remains an independent user cancellation.\n");
         postProgress("RUN STARTED: one continuous original /init process-tree session; this app-private latest-log file will be replaced when the run ends.\n");
         Thread worker = new Thread(new Runnable() {
             @Override public void run() {
@@ -814,7 +820,7 @@ public final class MainActivity extends Activity {
         out.append("Supervisor: ").append(supervisor.getAbsolutePath()).append('\n');
         out.append("ARM32 executable directory: ").append(guestLibraryDir.getAbsolutePath()).append('\n');
         out.append("Source image hashes: original Google API10 ramdisk/system; no Samsung payloads\n");
-        out.append("Guest display transport: app-private GVMF/1 receiver plus source-backed Goldfish fb0 ioctl/mmap/page-flip producer; only guest-written backing bytes render; guest Binder/SurfaceFlinger remains unavailable until implemented and traced\n");
+        out.append("Guest display transport: app-private GVMF/1 receiver plus source-backed Goldfish fb0 model; only guest-written mapped bytes render. Binder currently supports a bootstrap subset only; transactions/service registration and SurfaceFlinger output are not proven.\n");
         out.append("Host root/mount calls: none\n\n");
 
         out.append("Continuous trace: one original /init with its traced child tree; maximum 32 tracees, bounded by the supervisor timeout.\n");
@@ -823,7 +829,7 @@ public final class MainActivity extends Activity {
         appendProgress(out, "Start original /init and follow its child processes in the same session");
         out.append(runNative("continuous /init process tree", supervisor, guestInit, guestRoot, 120,
                 guestLibraryDir, "/init"));
-        out.append("\nBOOT BOUNDARY: logs separately mark an observed original-linker entry and the target-main entry, which remains unobserved because no architecture-safe target-entry instrumentation is installed. The display sink is ready, but no guest framebuffer producer/frame is connected. Neither a linker entry nor this dark viewport proves Zygote, framework, system-server, desktop, or framebuffer output.\n");
+        out.append("\nBOOT BOUNDARY: logs distinguish original-linker entry from target ELF code entry. The software Goldfish fb0 model and GVMF/1 sink run only after exact app-private setup checks pass; the viewport stays blank until real guest MAP_SHARED pixels are page-flipped and published. Binder service transactions, Zygote, framework, system-server, SurfaceFlinger and desktop require their own observed markers; no linker entry or placeholder proves them.\n");
         return out.toString();
     }
 
@@ -846,9 +852,17 @@ public final class MainActivity extends Activity {
             command[4] = Integer.toString(traceMillis);
             System.arraycopy(guestArgv, 0, command, 5, guestArgv.length);
             ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
-            if (guestFrameChannelAvailable && guestFrameDirectory != null)
+            if (guestFrameChannelAvailable && guestFrameDirectory != null) {
+                File rootParent = guestRoot.getAbsoluteFile().getParentFile();
+                if (rootParent == null) throw new IOException("guest root has no app-private parent");
+                File expectedFrameDirectory = new File(rootParent, GuestFramePacket.CHANNEL_DIRECTORY);
+                if (!expectedFrameDirectory.getAbsolutePath().equals(guestFrameDirectory.getAbsolutePath()))
+                    throw new IOException("frame channel is not the exact guest-root sibling: configured=" +
+                            guestFrameDirectory.getAbsolutePath() + " expected=" +
+                            expectedFrameDirectory.getAbsolutePath());
                 builder.environment().put(GuestFramePacket.CHANNEL_ENVIRONMENT,
-                        guestFrameDirectory.getAbsolutePath());
+                        expectedFrameDirectory.getAbsolutePath());
+            }
             process = builder.start();
         } catch (Exception e) {
             if (stopRequested) return header.append("USER CANCELLED BEFORE SUPERVISOR START: ").append(e).append('\n').toString();

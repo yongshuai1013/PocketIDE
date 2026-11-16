@@ -100,15 +100,26 @@ static inline uint32_t guest_fb0_makedev(uint32_t major, uint32_t minor) {
            ((minor & ~0xffu) << 12);
 }
 
+static inline const char *guest_fb0_mknod_rejection_reason(
+        uint32_t guest_euid, uint32_t guest_fsgid,
+        int graphics_uevent_received, uint32_t mode, uint32_t device) {
+    if (guest_euid != GUEST_FB0_OWNER_UID) return "guest-euid-not-root";
+    if (guest_fsgid != GUEST_FB0_OWNER_GID) return "guest-fsgid-not-graphics";
+    if (!graphics_uevent_received) return "graphics-add-event-not-consumed";
+    if ((mode & (S_IFMT | 07777u)) !=
+        (GUEST_FB0_MODE & (S_IFMT | 07777u))) return "mode-not-root-graphics-0660-char";
+    if (device != guest_fb0_makedev(GUEST_FB0_MAJOR, GUEST_FB0_MINOR))
+        return "device-number-not-29-0";
+    return NULL;
+}
+
 static inline int guest_fb0_mknod_args_valid(uint32_t guest_euid,
                                              uint32_t guest_fsgid,
                                              int graphics_uevent_received,
                                              uint32_t mode,
                                              uint32_t device) {
-    return guest_euid == GUEST_FB0_OWNER_UID &&
-        guest_fsgid == GUEST_FB0_OWNER_GID && graphics_uevent_received &&
-        (mode & (S_IFMT | 07777u)) == (GUEST_FB0_MODE & (S_IFMT | 07777u)) &&
-        device == guest_fb0_makedev(GUEST_FB0_MAJOR, GUEST_FB0_MINOR);
+    return guest_fb0_mknod_rejection_reason(guest_euid, guest_fsgid,
+        graphics_uevent_received, mode, device) == NULL;
 }
 
 static inline int guest_fb0_open_ready(int backend_ready,

@@ -36,6 +36,44 @@
 #define GUEST_FRAME_MAX_STRIDE 65536u
 #define GUEST_FRAME_MAX_PAYLOAD_BYTES 8388608u
 
+enum guest_frame_channel_validation_reason {
+    GUEST_FRAME_CHANNEL_VALID = 0,
+    GUEST_FRAME_CHANNEL_INVALID_ARGUMENT,
+    GUEST_FRAME_CHANNEL_PATH_TOO_LONG,
+    GUEST_FRAME_CHANNEL_NOT_EXACT_SIBLING,
+    GUEST_FRAME_CHANNEL_OPEN_FAILED,
+    GUEST_FRAME_CHANNEL_FSTAT_FAILED,
+    GUEST_FRAME_CHANNEL_NOT_DIRECTORY,
+    GUEST_FRAME_CHANNEL_WRONG_OWNER,
+    GUEST_FRAME_CHANNEL_NOT_PRIVATE
+};
+
+struct guest_frame_channel_validation_detail {
+    enum guest_frame_channel_validation_reason reason;
+    int error_number;
+    uid_t expected_owner;
+    uid_t actual_owner;
+    mode_t actual_mode;
+    int has_stat;
+    char expected_path[PATH_MAX];
+};
+
+static inline const char *guest_frame_channel_validation_reason_name(
+        enum guest_frame_channel_validation_reason reason) {
+    switch (reason) {
+        case GUEST_FRAME_CHANNEL_VALID: return "valid";
+        case GUEST_FRAME_CHANNEL_INVALID_ARGUMENT: return "invalid-argument";
+        case GUEST_FRAME_CHANNEL_PATH_TOO_LONG: return "path-too-long";
+        case GUEST_FRAME_CHANNEL_NOT_EXACT_SIBLING: return "not-exact-guest-root-sibling";
+        case GUEST_FRAME_CHANNEL_OPEN_FAILED: return "open-no-follow-failed";
+        case GUEST_FRAME_CHANNEL_FSTAT_FAILED: return "fstat-failed";
+        case GUEST_FRAME_CHANNEL_NOT_DIRECTORY: return "not-directory";
+        case GUEST_FRAME_CHANNEL_WRONG_OWNER: return "wrong-owner";
+        case GUEST_FRAME_CHANNEL_NOT_PRIVATE: return "group-or-other-permission-present";
+        default: return "unknown-validation-reason";
+    }
+}
+
 typedef struct guest_frame_bitfield {
     uint8_t offset;
     uint8_t length;
@@ -140,27 +178,100 @@ static inline int guest_frame_channel_open_private_directory(const char *directo
     return fd;
 }
 
-static inline int guest_frame_channel_validate_app_private_directory(const char *directory,
-                                                                      const char *guest_root) {
-    if (!directory || !guest_root || !directory[0] || !guest_root[0]) return -EINVAL;
+static inline int guest_frame_channel_validate_app_private_directory_ex(
+        const char *directory, const char *guest_root, uid_t expected_owner,
+        struct guest_frame_channel_validation_detail *detail) {
+    struct guest_frame_channel_validation_detail value;
+    memset(&value, 0, sizeof(value));
+    value.reason = GUEST_FRAME_CHANNEL_INVALID_ARGUMENT;
+    value.error_number = EINVAL;
+    value.expected_owner = expected_owner;
+    if (!directory || !guest_root || !directory[0] || !guest_root[0]) {
+        if (detail) *detail = value;
+        return -EINVAL;
+    }
     char parent[PATH_MAX];
     size_t root_len = strlen(guest_root);
-    if (root_len == 0 || root_len >= sizeof(parent)) return -ENAMETOOLONG;
+    if (root_len == 0 || root_len >= sizeof(parent)) {
+        value.reason = GUEST_FRAME_CHANNEL_PATH_TOO_LONG;
+        value.error_number = ENAMETOOLONG;
+        if (detail) *detail = value;
+        return -ENAMETOOLONG;
+    }
     memcpy(parent, guest_root, root_len + 1);
     char *slash = strrchr(parent, '/');
-    if (!slash) return -EINVAL;
+    if (!slash) {
+        if (detail) *detail = value;
+        return -EINVAL;
+    }
     if (slash == parent) slash[1] = '\0';
     else *slash = '\0';
-    char expected[PATH_MAX];
-    int n = snprintf(expected, sizeof(expected), "%s%s%s", parent,
+    int n = snprintf(value.expected_path, sizeof(value.expected_path), "%s%s%s", parent,
                      strcmp(parent, "/") == 0 ? "" : "/",
                      GUEST_FRAME_CHANNEL_DIRECTORY);
-    if (n <= 0 || (size_t)n >= sizeof(expected)) return -ENAMETOOLONG;
-    if (strcmp(directory, expected) != 0) return -EACCES;
-    int fd = guest_frame_channel_open_private_directory(directory);
-    if (fd < 0) return fd;
+    if (n <= 0 || (size_t)n >= sizeof(value.expected_path)) {
+        value.reason = GUEST_FRAME_CHANNEL_PATH_TOO_LONG;
+        value.error_number = ENAMETOOLONG;
+        if (detail) *detail = value;
+        return -ENAMETOOLONG;
+    }
+    if (strcmp(directory, value.expected_path) != 0) {
+        value.reason = GUEST_FRAME_CHANNEL_NOT_EXACT_SIBLING;
+        value.error_number = EACCES;
+        if (detail) *detail = value;
+        return -EACCES;
+    }
+    int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        value.reason = GUEST_FRAME_CHANNEL_OPEN_FAILED;
+        value.error_number = errno;
+        if (detail) *detail = value;
+        return -errno;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        int saved = errno;
+        close(fd);
+        value.reason = GUEST_FRAME_CHANNEL_FSTAT_FAILED;
+        value.error_number = saved;
+        if (detail) *detail = value;
+        return -saved;
+    }
+    value.actual_owner = st.st_uid;
+    value.actual_mode = st.st_mode;
+    value.has_stat = 1;
+    if (!S_ISDIR(st.st_mode)) {
+        close(fd);
+        value.reason = GUEST_FRAME_CHANNEL_NOT_DIRECTORY;
+        value.error_number = ENOTDIR;
+        if (detail) *detail = value;
+        return -ENOTDIR;
+    }
+    if (st.st_uid != expected_owner) {
+        close(fd);
+        value.reason = GUEST_FRAME_CHANNEL_WRONG_OWNER;
+        value.error_number = EACCES;
+        if (detail) *detail = value;
+        return -EACCES;
+    }
+    if ((st.st_mode & 0077) != 0) {
+        close(fd);
+        value.reason = GUEST_FRAME_CHANNEL_NOT_PRIVATE;
+        value.error_number = EACCES;
+        if (detail) *detail = value;
+        return -EACCES;
+    }
     close(fd);
+    value.reason = GUEST_FRAME_CHANNEL_VALID;
+    value.error_number = 0;
+    if (detail) *detail = value;
     return 1;
+}
+
+static inline int guest_frame_channel_validate_app_private_directory(
+        const char *directory, const char *guest_root) {
+    return guest_frame_channel_validate_app_private_directory_ex(
+        directory, guest_root, getuid(), NULL);
 }
 
 static inline int guest_frame_write_all(int fd, const unsigned char *data, size_t size) {

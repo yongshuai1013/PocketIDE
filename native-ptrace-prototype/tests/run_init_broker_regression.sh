@@ -42,6 +42,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_device_boundary_test.c" -o "$TMP/guest_device_boundary_test"
 "$TMP/guest_device_boundary_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_binder_virtual_test.c" -o "$TMP/guest_binder_virtual_test"
+"$TMP/guest_binder_virtual_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_uevent_virtual_test.c" -o "$TMP/guest_uevent_virtual_test"
 "$TMP/guest_uevent_virtual_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -146,6 +149,8 @@ slots_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_tracee_slots_tes
 pending_child_stops = Path(sys.argv[1]).with_name('ptrace_child_stop_queue.h').read_text()
 pending_child_stop_test = Path(sys.argv[1]).parents[4].joinpath('tests/ptrace_child_stop_queue_test.c').read_text()
 device_boundary = Path(sys.argv[1]).with_name('guest_device_boundary.h').read_text()
+binder_model = Path(sys.argv[1]).with_name('guest_binder_virtual.h').read_text()
+binder_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_binder_virtual_test.c').read_text()
 sigmask_compat = Path(sys.argv[1]).with_name('guest_sigprocmask_compat.h').read_text()
 sigmask_ptrace = Path(sys.argv[1]).with_name('guest_sigprocmask_ptrace.h').read_text()
 frame_channel = Path(sys.argv[1]).with_name('guest_frame_channel.h').read_text()
@@ -344,7 +349,36 @@ assert 'test_trace_lifetime_pressure_requires_guest_reap' in Path(sys.argv[1]).p
 assert 'test_api10_ifup_lo_flags_are_guest_only' in Path(sys.argv[1]).parents[4].joinpath('tests/guest_network_virtual_test.c').read_text()
 assert 'GUEST DEVICE BACKEND DENIED:' in src and 'guest_device_unimplemented_reason(guest)' in src
 assert 'pty-kernel-backend-not-implemented' in device_boundary
-assert 'binder-kernel-backend-not-implemented' in device_boundary
+assert 'binder-software-bootstrap-only-no-ipc-transactions' in device_boundary
+assert 'GUEST BINDER OPEN:' in src and 'GUEST BINDER IOCTL DENIED:' in src
+assert 'GUEST BINDER MMAP ROUTE:' in src and 'GUEST BINDER MAPPING:' in src
+assert 'GUEST BINDER BLOCKED READ:' in src and 'guest-software-blocked-read' in src
+assert 'no guest transaction queue exists, remains parked until bounded timeout/cancel' in src
+assert 'GUEST BINDER FD OP DENIED:' in src and 'GUEST BINDER STREAM IO DENIED:' in src
+assert 'GUEST BINDER BOOTSTRAP SUMMARY:' in src and 'guest_binder_state.mapping_successes++' in src
+assert 'guest_binder_validate_open_flags(flags)' in src
+assert 'guest_binder_ioctl_bootstrap(&state->binder' in src
+assert 'scalar zero, not a user pointer' in binder_model
+context_mgr = binder_model.split('case GUEST_BINDER_IOCTL_SET_CONTEXT_MGR:', 1)[1].split('case GUEST_BINDER_IOCTL_WRITE_READ:', 1)[0]
+assert 'argument != 0' in context_mgr and 'copyin(' not in context_mgr
+assert 'GUEST_BINDER_IOCTL_SET_CONTEXT_MGR, 0' in binder_test
+assert 'regs->uregs[3] = flags | (uint32_t)MAP_ANONYMOUS' in src
+assert 'guest_binder_process_exec_reset(&state->binder)' in src
+assert 'child_state->binder = state->binder' in src
+assert 'guest_binder_release_context_manager_if_dead' in src
+assert 'transactions-supported=0' in src and 'no host ioctl called' in src
+assert 'GUEST_BINDER_IOCTL_WRITE_READ 0xc0186201u' in binder_model
+assert 'GUEST_BINDER_IOCTL_VERSION 0xc0046209u' in binder_model
+assert 'GUEST_BINDER_PROTOCOL_VERSION 7' in binder_model
+assert 'GUEST_BINDER_SERVICEMANAGER_MAP_BYTES (128u * 1024u)' in binder_model
+assert 'GUEST_BINDER_PROCESS_MAP_BYTES ((1024u * 1024u) - (2u * 4096u))' in binder_model
+assert 'GUEST_BINDER_BC_ENTER_LOOPER 0x0000630cu' in binder_model
+assert 'GUEST_BINDER_BC_TRANSACTION 0x40286300u' in binder_model
+assert 'GUEST_BINDER_READ_PARKED' in binder_model and 'return -EOPNOTSUPP' in binder_model
+assert 'test unsupported transaction' not in binder_test.lower()
+assert 'BC_TRANSACTION: not implemented' in binder_test
+assert '== -EOPNOTSUPP' in binder_test and '== GUEST_BINDER_READ_PARKED' in binder_test
+assert '== -EBUSY' in binder_test and '== -EFAULT' in binder_test
 assert 'ashmem-kernel-backend-not-implemented' in device_boundary
 assert 'goldfish-emulator-pipe-backend-not-implemented' in device_boundary
 assert 'GUEST URANDOM READ:' in src and 'syscall(SYS_getrandom' in src
@@ -414,6 +448,9 @@ assert 'MAX_PIXELS' in frame_packet and 'MAX_PAYLOAD_BYTES' in frame_packet
 assert 'source is not a guest framebuffer' in frame_packet
 assert 'payload checksum mismatch' in frame_packet and 'unsupported guest framebuffer bits-per-pixel' in frame_packet
 assert 'GUEST FRAME CHANNEL CONFIG:' in src and 'unsetenv(GUEST_FRAME_CHANNEL_ENV)' in src
+assert 'expected-sibling=%s reason=%s' in src and 'guest_frame_channel_validation_reason_name(validation.reason)' in src
+assert 'frameGuestRoot.getParentFile()' in activity and 'new File(frameParent, GuestFramePacket.CHANNEL_DIRECTORY)' in activity
+assert 'GUEST MKNOD MEDIATION: guest-pid=%d executable=%s path=%s syscall=%s' in src
 assert 'gingervm_publish_guest_frame_from_fb' in src and 'guest_frame_channel_publish_file' in src
 main_source = src.split('int main(', 1)[1]
 assert main_source.index('configure_guest_frame_channel();') < main_source.index('start_guest(')
@@ -426,7 +463,7 @@ assert 'GUEST FB0 GRAPHICS UEVENT RECEIVED:' in src and 'GUEST FB0 NODE CREATED:
 assert 'GUEST_FB0_IOCTL_GET_VSCREENINFO' in framebuffer_model
 assert 'GUEST_FB0_IOCTL_GET_FSCREENINFO' in framebuffer_model
 assert 'GUEST_FB0_IOCTL_PAN_DISPLAY' in framebuffer_model and 'guest_fb0_capture_publish' in framebuffer_model
-assert 'guest_fsgid == GUEST_FB0_OWNER_GID' in framebuffer_model
+assert 'guest_fsgid != GUEST_FB0_OWNER_GID' in framebuffer_model
 assert 'GUEST_FB0_OWNER_GID GUEST_ID_AID_GRAPHICS' in framebuffer_model
 assert 'software_base_update_acks++' in framebuffer_model
 assert 'sizeof(struct guest_arm32_fb_var_screeninfo) == 160u' in framebuffer_model
@@ -438,8 +475,8 @@ assert 'FileObserver.MOVED_TO' in activity and 'OsConstants.O_NOFOLLOW' in activ
 assert 'GuestFramePacket.decodeGuestFramebuffer(bytes)' in activity
 assert 'Bitmap.createBitmap(frame.argb, frame.width, frame.height' in activity
 assert 'builder.environment().put(GuestFramePacket.CHANNEL_ENVIRONMENT' in activity
-assert 'Guest display transport:' in activity and 'Goldfish fb0 ioctl/mmap/page-flip producer' in activity
-assert 'setImageBitmap(bitmap)' in activity and 'guest Binder/SurfaceFlinger remains unavailable' in activity
+assert '尚無真實 guest 畫面' in activity and 'guest fb0 mmap／page-flip 產生並驗證的像素' in activity
+assert 'setImageBitmap(bitmap)' in activity and 'Binder 僅有啟動握手' in activity
 for node in ('/dev/null', '/dev/zero', '/dev/full', '/dev/random', '/dev/urandom', '/dev/ashmem', '/dev/binder'):
     assert node in ueventd_rc, node
 assert 'GUEST_MODE_IFCHR 0020000u' in pseudo_device
@@ -617,21 +654,16 @@ assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activ
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'LATEST DEVICE TRACE (owner-provided v0.6.16 Android 12 log)' in activity
-assert 'Goldfish uevent delivery, coldboot marker and PID 1 stat succeeded' in activity
-assert '42 fork/clone/vfork events, 32 guest execs and 31 original linker entries' in activity
-assert 'only ET_EXEC entry hit identified was /sbin/ueventd' in activity
-assert 'app_process entered the linker, but its target-code entry was not observed' in activity
-assert 'property listener bound/listened, but connect/accept/sendto/recvfrom were all 0' in activity
-assert 'old trace killed host PID 14912 as unregistered immediately before a later fork-event record identified the same child PID under guest PID 13' in activity
-assert 'supervisor ended by bounded timeout; cleanup tracked=12/reaped=12/unresolved=0' in activity
-assert 'v0.6.17 defers only recognized ptrace child-initial-stop statuses until an exact parent event PID match' in activity
-assert 'pending children share the same hard 32-slot budget' in activity
-assert 'new device trace must show whether the child is adopted and which guest command runs' in activity
-assert 'real viewport stays no-frame until a device trace shows guest writes and page flips' in activity
-assert 'Guest Binder/service-manager/SurfaceFlinger are still not implemented or observed' in activity
-assert 'No host Binder, framebuffer or drawn screen is used' in activity
-assert 'The v0.6.16 owner-provided trace remains the latest verified device baseline' in activity
+assert 'LATEST OWNER TRACE (submitted after v0.6.19; installed app version is not stated in the log)' in activity
+assert '3 deferred child stops were each adopted by the matching parent event' in activity
+assert 'ready=0/errno=13' in activity and 'graphics add uevent was delivered' in activity
+assert 'The trace did not record a pathname for the mknod returning 0' in activity
+assert 'fb0 node/open/ioctl/mmap/page-flip/published-frame counts were all 0' in activity
+assert 'servicemanager code ran, but `/dev/binder` was denied with EOPNOTSUPP' in activity
+assert 'Binder transactions and service registration remain unsupported' in activity
+assert '只有 guest MAP_SHARED 寫入並 page-flip 的像素會送到 viewport；測試 packet 不會顯示。' in activity
+assert 'never substitutes host Binder, framebuffer, mount or network' in activity
+assert 'The latest owner trace ended by bounded supervisor timeout' in activity
 assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
 assert 'network-effects=guest-software-broker-only' in src
 assert 'guest_tracee_slot_allocate' in src and 'guest_tracee_slot_mark_ptrace_exit' in src
@@ -682,11 +714,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.19-test-signed-apk' in upload
-assert 'gingervm-v0.6.19-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 28" in gradle and "versionName '0.6.19'" in gradle
+assert 'gingervm-continuous-trace-v0.6.20-test-signed-apk' in upload
+assert 'gingervm-v0.6.20-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 29" in gradle and "versionName '0.6.20'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.19' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.20' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
