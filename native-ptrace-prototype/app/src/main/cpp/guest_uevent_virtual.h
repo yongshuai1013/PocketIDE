@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "guest_hardware_profile.h"
+#include "guest_framebuffer_virtual.h"
 
 #define GUEST_UEVENT_AF_NETLINK 16u
 #define GUEST_UEVENT_SOCK_DGRAM 2u
@@ -128,24 +129,33 @@ static inline int guest_uevent_queue_consume(struct guest_uevent_queue *queue) {
     return 0;
 }
 
-/*
- * API10 init.goldfish.sh configures eth0. Model only that source-backed virtual
- * network interface; do not invent block devices or host-derived hardware.
- * API10 parse_event() accepts the no-DEVNAME net event, and handle_device_event()
- * consequently creates no /dev node and performs no host-device operation.
- */
+/* API10 ueventd consumes source-backed Goldfish net and graphics events. */
 static inline int guest_uevent_enqueue_coldboot_add(
         struct guest_uevent_queue *queue, int authorized_ueventd,
         const char *guest_attribute_path, const void *bytes, size_t length) {
     static const char request[] = "add\n";
-    static const char header[] = "add@" GUEST_UEVENT_SYSFS_DEVICE_PATH;
+    static const char net_header[] = "add@" GUEST_UEVENT_SYSFS_DEVICE_PATH;
+    static const char graphics_header[] = "add@" GUEST_FB0_SYSFS_DEVICE_PATH;
     static const char action[] = "ACTION=add";
-    static const char devpath[] = "DEVPATH=" GUEST_UEVENT_SYSFS_DEVICE_PATH;
-    static const char subsystem[] = "SUBSYSTEM=net";
+    static const char net_devpath[] = "DEVPATH=" GUEST_UEVENT_SYSFS_DEVICE_PATH;
+    static const char graphics_devpath[] = "DEVPATH=" GUEST_FB0_SYSFS_DEVICE_PATH;
+    static const char net_subsystem[] = "SUBSYSTEM=net";
+    static const char graphics_subsystem[] = "SUBSYSTEM=graphics";
     static const char interface_name[] = "INTERFACE=" GUEST_PROFILE_NET_IFACE;
+    static const char graphics_major[] = "MAJOR=29";
+    static const char graphics_minor[] = "MINOR=0";
+    const char *header = NULL, *devpath = NULL, *subsystem = NULL;
+    const char *extra_one = NULL, *extra_two = NULL;
     if (!queue || !guest_attribute_path || (!bytes && length != 0)) return -EINVAL;
     if (!authorized_ueventd) { queue->rejected++; return -EPERM; }
-    if (strcmp(guest_attribute_path, GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH) != 0) {
+    if (strcmp(guest_attribute_path, GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH) == 0) {
+        header = net_header; devpath = net_devpath; subsystem = net_subsystem;
+        extra_one = interface_name;
+    } else if (strcmp(guest_attribute_path, GUEST_FB0_SYSFS_ATTRIBUTE_PATH) == 0) {
+        header = graphics_header; devpath = graphics_devpath;
+        subsystem = graphics_subsystem; extra_one = graphics_major;
+        extra_two = graphics_minor;
+    } else {
         queue->rejected++;
         return -ENOENT;
     }
@@ -161,7 +171,7 @@ static inline int guest_uevent_enqueue_coldboot_add(
     struct guest_uevent_event *event = &queue->events[slot];
     size_t offset = 0;
 #define GUEST_UEVENT_APPEND_FIELD(field) do { \
-        size_t field_bytes = sizeof(field); \
+        size_t field_bytes = strlen(field) + 1u; \
         if (field_bytes > sizeof(event->data) - offset) { \
             queue->rejected++; return -EMSGSIZE; \
         } \
@@ -172,7 +182,8 @@ static inline int guest_uevent_enqueue_coldboot_add(
     GUEST_UEVENT_APPEND_FIELD(action);
     GUEST_UEVENT_APPEND_FIELD(devpath);
     GUEST_UEVENT_APPEND_FIELD(subsystem);
-    GUEST_UEVENT_APPEND_FIELD(interface_name);
+    if (extra_one) GUEST_UEVENT_APPEND_FIELD(extra_one);
+    if (extra_two) GUEST_UEVENT_APPEND_FIELD(extra_two);
 #undef GUEST_UEVENT_APPEND_FIELD
     event->length = offset;
     queue->count++;

@@ -19,6 +19,7 @@ static inline int guest_device_guest_file_path_is_allowed(const char *path) {
     if (!path) return 0;
     if (strcmp(path, "/dev") == 0 || strcmp(path, "/dev/__properties__") == 0 ||
         strcmp(path, "/dev/.coldboot_done") == 0 ||
+        strcmp(path, "/dev/graphics/fb0") == 0 ||
         strcmp(path, "/dev/__null__") == 0 || strcmp(path, "/dev/__kmsg__") == 0 ||
         strcmp(path, "/dev/null") == 0 || strcmp(path, "/dev/zero") == 0 ||
         strcmp(path, "/dev/full") == 0 || strcmp(path, "/dev/random") == 0 ||
@@ -34,6 +35,7 @@ static inline int guest_device_guest_file_path_is_allowed(const char *path) {
 static inline const char *guest_device_unimplemented_reason(const char *path) {
     if (!path || !guest_device_path_prefix(path, "/dev") ||
         guest_device_guest_file_path_is_allowed(path)) return NULL;
+    if (strcmp(path, "/dev/graphics/fb0") == 0) return NULL;
 
     if (strcmp(path, "/dev/ptmx") == 0 || strcmp(path, "/dev/tty") == 0 ||
         strcmp(path, "/dev/tty0") == 0 || guest_device_path_prefix(path, "/dev/pts") ||

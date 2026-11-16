@@ -112,9 +112,41 @@ static void test_coldboot_event_drain_marker_and_pid1_stat(void) {
     assert(source_order.marker_stat_pair_observed);
 }
 
+static void test_graphics_fb0_add_event(void) {
+    struct guest_uevent_queue queue;
+    guest_uevent_queue_init(&queue);
+    static const char request[] = "add\n";
+    assert(guest_uevent_enqueue_coldboot_add(&queue, 0,
+        GUEST_FB0_SYSFS_ATTRIBUTE_PATH, request, sizeof(request) - 1) == -EPERM);
+    assert(guest_uevent_enqueue_coldboot_add(&queue, 1,
+        "/sys/devices/virtual/graphics/fb1/uevent", request,
+        sizeof(request) - 1) == -ENOENT);
+    assert(guest_uevent_enqueue_coldboot_add(&queue, 1,
+        GUEST_FB0_SYSFS_ATTRIBUTE_PATH, "remove\n", 7) == -EINVAL);
+    assert(guest_uevent_enqueue_coldboot_add(&queue, 1,
+        GUEST_FB0_SYSFS_ATTRIBUTE_PATH, request, sizeof(request) - 1) == 4);
+    assert(queue.count == 1);
+    const struct guest_uevent_event *event = guest_uevent_queue_front(&queue);
+    assert(event != NULL);
+    static const char expected[] =
+        "add@" GUEST_FB0_SYSFS_DEVICE_PATH "\0"
+        "ACTION=add\0"
+        "DEVPATH=" GUEST_FB0_SYSFS_DEVICE_PATH "\0"
+        "SUBSYSTEM=graphics\0"
+        "MAJOR=29\0"
+        "MINOR=0\0";
+    assert(event->length == sizeof(expected) - 1);
+    assert(memcmp(event->data, expected, sizeof(expected) - 1) == 0);
+    assert(memmem(event->data, event->length, "DEVNAME=", 8) == NULL);
+    assert(guest_uevent_queue_consume(&queue) == 0);
+    assert(!guest_uevent_queue_readable(&queue));
+    assert(queue.enqueued == 1 && queue.delivered == 1 && queue.rejected == 3);
+}
+
 int main(void) {
     test_socket_contract();
     test_coldboot_event_drain_marker_and_pid1_stat();
-    puts("API10 guest-only uevent/coldboot integration regression: PASS (sysfs add -> synchronous recvmsg -> marker -> PID1 stat; subsequent poll queue empty; no host netlink/device nodes)");
+    test_graphics_fb0_add_event();
+    puts("API10 guest-only uevent/coldboot integration regression: PASS (net and graphics sysfs add events remain app-private; graphics add carries MAJOR=29/MINOR=0; no host netlink/device nodes)");
     return 0;
 }

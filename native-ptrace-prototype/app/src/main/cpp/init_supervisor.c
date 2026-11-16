@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -43,6 +44,8 @@
 #include "guest_device_boundary.h"
 #include "ptrace_child_stop_queue.h"
 #include "guest_frame_channel.h"
+#include "guest_framebuffer_virtual.h"
+#include "guest_identity_compat.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -121,6 +124,10 @@
 #define ARM_NR_IOPRIO_SET 314
 #define ARM_NR_SETGID 46
 #define ARM_NR_GETGID 47
+#define ARM_NR_SETREUID 70
+#define ARM_NR_SETREGID 71
+#define ARM_NR_GETGROUPS 80
+#define ARM_NR_SETGROUPS 81
 #define ARM_NR_GETEUID 49
 #define ARM_NR_GETEGID 50
 #define ARM_NR_UMOUNT2 52
@@ -158,6 +165,8 @@
 #define ARM_NR_NANOSLEEP 162
 #define ARM_NR_SETRESUID 164
 #define ARM_NR_GETRESUID 165
+#define ARM_NR_SETFSUID 138
+#define ARM_NR_SETFSGID 139
 #define ARM_NR_SETRESGID 170
 #define ARM_NR_GETRESGID 171
 #define ARM_NR_PRCTL 172
@@ -261,6 +270,15 @@ struct tracee_state {
     uint32_t guest_euid;
     uint32_t guest_rgid;
     uint32_t guest_egid;
+    struct guest_identity_state identity;
+    int fb_mmap_pending;
+    int fb_munmap_pending;
+    uint32_t fb_pending_map_length;
+    uint32_t fb_pending_map_flags;
+    uint32_t fb_pending_map_offset_pages;
+    uint32_t fb_mapping_start;
+    uint32_t fb_mapping_length;
+    int fb_mapping_valid;
     struct guest_process_compat_state process_compat;
     int alive;
     int is_thread;
@@ -303,6 +321,16 @@ static const char *guest_program = "/init";
 static char guest_frame_directory[PATH_MAX];
 static int guest_frame_channel_ready;
 static unsigned long guest_frame_published_count;
+static struct guest_framebuffer_model guest_fb0_model;
+static int guest_fb0_backing_fd = -1;
+static struct stat guest_fb0_backing_stat;
+static int guest_fb0_backend_ready;
+static unsigned long guest_fb0_open_count;
+static unsigned long guest_fb0_ioctl_count;
+static unsigned long guest_fb0_mmap_count;
+static unsigned long guest_fb0_pan_count;
+static int guest_fb0_graphics_uevent_received;
+static int guest_fb0_node_created;
 
 static void configure_guest_frame_channel(void) {
     const char *configured = getenv(GUEST_FRAME_CHANNEL_ENV);
@@ -313,6 +341,23 @@ static void configure_guest_frame_channel(void) {
             memcpy(guest_frame_directory, configured, length + 1);
             guest_frame_channel_ready = 1;
             puts("GUEST FRAME CHANNEL CONFIG: ready=1; exact app-private guest-root sibling; atomic GVMF/1 packets; no pixels claimed");
+            guest_framebuffer_model_init(&guest_fb0_model);
+            char backing_path[PATH_MAX];
+            rc = guest_fb0_prepare_app_private_backing(guest_frame_directory,
+                guest_root, backing_path, sizeof(backing_path), &guest_fb0_backing_fd);
+            if (rc == 0 && fstat(guest_fb0_backing_fd, &guest_fb0_backing_stat) == 0) {
+                guest_fb0_backend_ready = 1;
+                printf("GUEST FB0 SOFTWARE BACKEND: ready=1 path=%s profile=%s %ux%u RGB565 double-buffer-bytes=%u source=Goldfish-fbdev-model; no host framebuffer/MMIO/IRQ/QEMU used\n",
+                       backing_path, GUEST_PROFILE_DISPLAY_SKIN,
+                       GUEST_PROFILE_DISPLAY_WIDTH, GUEST_PROFILE_DISPLAY_HEIGHT,
+                       guest_fb0_smem_len());
+            } else {
+                if (rc == 0) rc = -errno;
+                if (guest_fb0_backing_fd >= 0) close(guest_fb0_backing_fd);
+                guest_fb0_backing_fd = -1;
+                printf("GUEST FB0 SOFTWARE BACKEND: ready=0 private backing creation/validation failed errno=%d; guest fb0 open will fail closed\n",
+                       -rc);
+            }
         } else {
             printf("GUEST FRAME CHANNEL CONFIG: ready=0; app-private sibling/owner/mode validation failed errno=%d; trace continues without frame output\n",
                    -rc);
@@ -1019,6 +1064,123 @@ static int rewrite_path_arg(pid_t pid, struct compat_pt_regs *regs, unsigned arg
     return 0;
 }
 
+static int guest_fb0_fd_matches(pid_t pid, int fd) {
+    return guest_fb0_backend_ready &&
+        guest_fb0_fd_matches_proc(pid, fd, &guest_fb0_backing_stat);
+}
+
+static int rewrite_fb0_path_arg(pid_t pid, struct compat_pt_regs *regs,
+                                unsigned path_arg, unsigned flags_arg) {
+    if (!guest_fb0_backend_ready || !guest_frame_channel_ready ||
+        !guest_frame_directory[0]) return -ENODEV;
+    int valid = guest_frame_channel_validate_app_private_directory(
+        guest_frame_directory, guest_root);
+    if (valid != 1) return valid < 0 ? valid : -EACCES;
+    char backing_path[PATH_MAX];
+    int n = snprintf(backing_path, sizeof(backing_path), "%s/%s",
+                     guest_frame_directory, GUEST_FB0_BACKING_FILE);
+    if (n <= 0 || (size_t)n >= sizeof(backing_path)) return -ENAMETOOLONG;
+    struct stat st;
+    if (lstat(backing_path, &st) != 0) return -errno;
+    if (!S_ISREG(st.st_mode) || st.st_uid != getuid() || st.st_nlink != 1 ||
+        st.st_dev != guest_fb0_backing_stat.st_dev ||
+        st.st_ino != guest_fb0_backing_stat.st_ino || (st.st_mode & 077u) != 0)
+        return -EACCES;
+    unsigned flags = regs->uregs[flags_arg];
+    if ((flags & O_ACCMODE) == O_ACCMODE) return -EINVAL;
+    flags &= ~(uint32_t)(O_CREAT | O_EXCL | O_TRUNC | O_APPEND | O_DIRECTORY);
+    flags |= O_NOFOLLOW;
+    regs->uregs[flags_arg] = flags;
+    size_t bytes = strlen(backing_path) + 1u;
+    if (bytes >= 2048u) return -ENAMETOOLONG;
+    uint32_t scratch = (regs->uregs[13] - SCRATCH_BELOW_SP) &
+                       ~((uint32_t)sizeof(long) - 1u);
+    if (write_remote(pid, scratch, backing_path, bytes) != 0) return -EFAULT;
+    regs->uregs[path_arg] = scratch;
+    path_rewrites++;
+    return 0;
+}
+
+static int mediate_guest_fb0_ioctl(pid_t pid, struct tracee_state *state,
+                                  struct compat_pt_regs *regs, int32_t *result) {
+    int fd = (int32_t)regs->uregs[0];
+    if (!guest_fb0_fd_matches(pid, fd)) return 1;
+    uint32_t command = regs->uregs[1];
+    uint32_t argument = regs->uregs[2];
+    if (!argument) return -EFAULT;
+    guest_fb0_ioctl_count++;
+    if (command == GUEST_FB0_IOCTL_GET_VSCREENINFO) {
+        struct guest_arm32_fb_var_screeninfo info;
+        guest_fb0_make_var(&guest_fb0_model, &info);
+        *result = write_remote(pid, argument, &info, sizeof(info)) == 0 ? 0 : -EFAULT;
+    } else if (command == GUEST_FB0_IOCTL_PUT_VSCREENINFO) {
+        struct guest_arm32_fb_var_screeninfo requested;
+        if (read_remote(pid, argument, &requested, sizeof(requested)) != 0)
+            *result = -EFAULT;
+        else
+            *result = guest_fb0_commit_put(&guest_fb0_model, &requested);
+    } else if (command == GUEST_FB0_IOCTL_GET_FSCREENINFO) {
+        struct guest_arm32_fb_fix_screeninfo info;
+        guest_fb0_make_fix(&guest_fb0_model, &info);
+        *result = write_remote(pid, argument, &info, sizeof(info)) == 0 ? 0 : -EFAULT;
+    } else if (command == GUEST_FB0_IOCTL_PAN_DISPLAY) {
+        struct guest_arm32_fb_var_screeninfo requested;
+        if (read_remote(pid, argument, &requested, sizeof(requested)) != 0) {
+            *result = -EFAULT;
+        } else {
+            *result = guest_fb0_commit_pan(&guest_fb0_model, &requested);
+            if (*result == 0) {
+                guest_fb0_pan_count++;
+                printf("GUEST FB0 SOFTWARE BASE-UPDATE ACK: guest-pid=%d yoffset=%u count=%lu source=software model; no Goldfish MMIO write or IRQ was executed\n",
+                       state ? state->guest_pid : -1,
+                       guest_fb0_model.yoffset,
+                       guest_fb0_model.software_base_update_acks);
+                if (state && state->fb_mapping_valid) {
+                    int publish_rc = guest_fb0_capture_publish(
+                        guest_fb0_backing_fd, guest_frame_directory,
+                        &guest_fb0_model, guest_fb0_model.yoffset);
+                    if (publish_rc == 0) {
+                        guest_frame_published_count++;
+                        printf("GUEST FB0 PAGE FLIP FRAME: guest-pid=%d executable=%s yoffset=%u sequence=%llu bytes=%u publish=success; pixels copied only from guest MAP_SHARED fb0 backing, no host display device\n",
+                               state->guest_pid, state->exec_target,
+                               guest_fb0_model.yoffset,
+                               (unsigned long long)guest_fb0_model.sequence,
+                               guest_fb0_smem_len() / GUEST_FB0_DOUBLE_BUFFER_COUNT);
+                    } else {
+                        printf("GUEST FB0 PAGE FLIP: guest-pid=%d yoffset=%u model=committed frame-publish=failed errno=%d; ioctl remains successful and no substitute pixels are sent\n",
+                               state->guest_pid, guest_fb0_model.yoffset,
+                               -publish_rc);
+                    }
+                }
+            }
+        }
+    } else {
+        *result = -ENOTTY;
+    }
+    if (guest_fb0_ioctl_count <= 48u)
+        printf("GUEST FB0 IOCTL: guest-pid=%d executable=%s fd=%d request=0x%x yoffset=%u mapped=%d result=%d; API10 ARM32 fbdev state only, no Goldfish MMIO/IRQ or host ioctl\n",
+               state ? state->guest_pid : -1,
+               state ? state->exec_target : "<unknown>", fd, command,
+               guest_fb0_model.yoffset, state ? state->fb_mapping_valid : 0,
+               *result);
+    return 0;
+}
+
+static int mediate_guest_fb0_mmap(pid_t pid, struct tracee_state *state,
+                                  const struct compat_pt_regs *regs) {
+    int fd = (int32_t)regs->uregs[4];
+    if (!guest_fb0_fd_matches(pid, fd)) return 1;
+    int rc = guest_fb0_validate_mmap(regs->uregs[1], regs->uregs[2],
+                                    regs->uregs[3], regs->uregs[5]);
+    if (rc != 0) return rc;
+    if ((regs->uregs[3] & MAP_TYPE) != MAP_SHARED) return -EINVAL;
+    state->fb_mmap_pending = 1;
+    state->fb_pending_map_length = regs->uregs[1];
+    state->fb_pending_map_flags = regs->uregs[2];
+    state->fb_pending_map_offset_pages = regs->uregs[5];
+    return 0;
+}
+
 static int fake_syscall(pid_t pid, struct compat_pt_regs *regs) {
     regs->uregs[7] = UINT32_MAX;
     if (set_regs(pid, regs) != 0 || set_kernel_syscall(pid, -1) != 0) return -1;
@@ -1043,6 +1205,9 @@ static int make_guest_device(const char *guest) {
     char *leaf = slash + 1;
     if (!*leaf) return -EACCES;
     *slash = '\0';
+    int directory_fd = guest_safe_dir_open_beneath_root(guest_root, parent, 1, 0755);
+    if (directory_fd < 0) return directory_fd;
+    close(directory_fd);
     int fd = guest_safe_file_open_beneath_root(guest_root, parent, leaf, 0, 0600);
     if (fd < 0) return fd;
     return close(fd) == 0 ? 0 : -errno;
@@ -1056,8 +1221,9 @@ static int seed_regular_file(const char *dir, const char *name, const char *cont
 
 static int seed_virtual_sysfs_tree(const char *backing) {
     static const char *const suffixes[] = {
-        "class", "class/net", "block", "devices", "devices/virtual",
-        "devices/virtual/net", "devices/virtual/net/eth0", NULL,
+        "class", "class/net", "class/graphics", "block", "devices",
+        "devices/virtual", "devices/virtual/net", "devices/virtual/net/eth0",
+        "devices/virtual/graphics", "devices/virtual/graphics/fb0", NULL,
     };
     if (!backing) return -EACCES;
     int backing_fd = guest_safe_dir_open_beneath_root(guest_root, backing, 1, 0700);
@@ -1071,7 +1237,7 @@ static int seed_virtual_sysfs_tree(const char *backing) {
         if (directory_fd < 0) return directory_fd;
         close(directory_fd);
     }
-    char class_net[PATH_MAX], device[PATH_MAX];
+    char class_net[PATH_MAX], class_graphics[PATH_MAX], device[PATH_MAX];
     int n = snprintf(class_net, sizeof(class_net), "%s/class/net", backing);
     if (n <= 0 || (size_t)n >= sizeof(class_net)) return -ENAMETOOLONG;
     int rc = guest_safe_symlink_beneath_root(guest_root, class_net, "eth0",
@@ -1079,7 +1245,16 @@ static int seed_virtual_sysfs_tree(const char *backing) {
     if (rc != 0) return rc;
     n = snprintf(device, sizeof(device), "%s/devices/virtual/net/eth0", backing);
     if (n <= 0 || (size_t)n >= sizeof(device)) return -ENAMETOOLONG;
-    return seed_regular_file(device, "operstate", "down\n");
+    rc = seed_regular_file(device, "operstate", "down\n");
+    if (rc != 0) return rc;
+    n = snprintf(class_graphics, sizeof(class_graphics), "%s/class/graphics", backing);
+    if (n <= 0 || (size_t)n >= sizeof(class_graphics)) return -ENAMETOOLONG;
+    rc = guest_safe_symlink_beneath_root(guest_root, class_graphics, "fb0",
+        "../../devices/virtual/graphics/fb0");
+    if (rc != 0) return rc;
+    n = snprintf(device, sizeof(device), "%s/devices/virtual/graphics/fb0", backing);
+    if (n <= 0 || (size_t)n >= sizeof(device)) return -ENAMETOOLONG;
+    return seed_regular_file(device, "uevent", "");
 }
 
 static int seed_virtual_proc_tree(const char *backing) {
@@ -1868,6 +2043,9 @@ static int virtual_uevent_recvmsg(pid_t pid, const struct compat_pt_regs *regs) 
                pid, state->guest_pid, entry->nonblocking, flags);
         return -EAGAIN;
     }
+    int is_graphics_fb0_event =
+        memmem(event->data, event->length, "DEVPATH=" GUEST_FB0_SYSFS_DEVICE_PATH,
+               sizeof("DEVPATH=" GUEST_FB0_SYSFS_DEVICE_PATH) - 1u) != NULL;
     size_t copied = event->length;
     int32_t returned_flags = 0;
     if (capacity < copied) {
@@ -1901,6 +2079,10 @@ static int virtual_uevent_recvmsg(pid_t pid, const struct compat_pt_regs *regs) 
     message.flags = returned_flags;
     if (write_remote(pid, message_address, &message, sizeof(message)) != 0) return -EFAULT;
     if (guest_uevent_queue_consume(&guest_uevent_queue) != 0) return -EIO;
+    if (is_graphics_fb0_event) {
+        guest_fb0_graphics_uevent_received = 1;
+        puts("GUEST FB0 GRAPHICS UEVENT RECEIVED: ueventd consumed add event with DEVPATH=/devices/virtual/graphics/fb0 MAJOR=29 MINOR=0; node may now be created only through guest mknod mediation");
+    }
     virtual_uevent_recvmsg_count++;
     virtual_socket_calls++;
     printf("GUEST UEVENT RECVMSG: host-pid=%d guest-pid=%d fd=%d bytes=%zu source={nl_pid=0,nl_groups=1} SCM_CREDENTIALS={pid=0,uid=0,gid=0} flags=0x%x queue=%zu; app-private queue only\n",
@@ -1923,13 +2105,15 @@ static int virtual_guest_socket_stream_io(pid_t pid, int fd, uint32_t buffer_add
         if (length > sizeof(request) || (length != 0 && buffer_address == 0))
             return -EINVAL;
         if (length && read_remote(pid, buffer_address, request, length) != 0) return -EFAULT;
+        const char *attribute_path = entry->device_major == GUEST_FB0_MAJOR
+            ? GUEST_FB0_SYSFS_ATTRIBUTE_PATH : GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH;
         int result = guest_uevent_enqueue_coldboot_add(&guest_uevent_queue, 1,
-            GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH, request, length);
+            attribute_path, request, length);
         virtual_socket_calls++;
         if (result >= 0) {
             virtual_uevent_write_count++;
             printf("GUEST SYSFS UEVENT WRITE: guest-pid=%d path=%s bytes=%u result=%d queued=%zu; app-private event only, no host sysfs/netlink/device node\n",
-                   state->guest_pid, GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH, length,
+                   state->guest_pid, attribute_path, length,
                    result, guest_uevent_queue.count);
         }
         return result;
@@ -2304,6 +2488,7 @@ static struct tracee_state *add_tracee(pid_t pid, int needs_options,
     state->needs_options = needs_options;
     state->last_syscall = -1;
     guest_process_compat_init(&state->process_compat);
+    guest_identity_init(&state->identity);
     active_tracee_count++;
     return state;
 }
@@ -2985,11 +3170,13 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
         int recognized = guest_pseudo_device_metadata_for_path(guest, &metadata);
         if (recognized < 0) return recognized;
         if (recognized > 0) {
+            if (strcmp(guest, GUEST_FB0_PATH) == 0 && !guest_fb0_node_created)
+                return -ENOENT;
             rc = guest_pseudo_device_backing_present(guest);
             if (rc != 0) return rc;
             unsigned char stat64[GUEST_ARM32_STAT64_BYTES];
-            rc = guest_pseudo_device_stat64(metadata.mode, metadata.major,
-                                             metadata.minor, stat64);
+            rc = guest_pseudo_device_stat64_owner(metadata.mode, metadata.uid,
+                metadata.gid, metadata.major, metadata.minor, stat64);
             if (rc != 0) return rc;
             uint32_t output = regs->uregs[nr == ARM_NR_FSTATAT64 ? 2 : 1];
             if (output == 0 || write_remote(pid, output, stat64, sizeof(stat64)) != 0)
@@ -3002,6 +3189,35 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
                    metadata.mode & 07777u, metadata.major, metadata.minor);
             return 0;
         }
+    }
+    if ((nr == ARM_NR_OPEN || nr == ARM_NR_OPENAT) &&
+        strcmp(guest, GUEST_FB0_PATH) == 0) {
+        unsigned flags_arg = nr == ARM_NR_OPEN ? 1u : 2u;
+        unsigned flags = regs->uregs[flags_arg];
+        if (flags & O_DIRECTORY) return -ENOTDIR;
+        if (!active_tracee || active_tracee->pid != pid) return -EPERM;
+        rc = guest_fb0_open_authorized(guest_fb0_backend_ready,
+            guest_fb0_graphics_uevent_received, guest_fb0_node_created,
+            &active_tracee->identity, (int)flags);
+        if (rc != 0) return rc;
+        rc = guest_pseudo_device_backing_present(guest);
+        if (rc != 0) return rc;
+        rc = rewrite_fb0_path_arg(pid, regs, arg, flags_arg);
+        if (rc != 0) return rc;
+        guest_fb0_open_count++;
+        if (guest_fb0_open_count <= 48u)
+            printf("GUEST FB0 OPEN REDIRECT: guest-pid=%d executable=%s path=%s flags=0x%x euid=%u egid=%u fsuid=%u fsgid=%u graphics-member=%d node={major=%u,minor=%u,mode=0%o} backing=%s; no host device opened\n",
+                   active_tracee ? active_tracee->guest_pid : -1,
+                   active_tracee ? active_tracee->exec_target : "<unknown>",
+                   guest, flags, active_tracee ? active_tracee->identity.euid : 0,
+                   active_tracee ? active_tracee->identity.egid : 0,
+                   active_tracee ? active_tracee->identity.fsuid : 0,
+                   active_tracee ? active_tracee->identity.fsgid : 0,
+                   active_tracee ? guest_identity_has_group(&active_tracee->identity,
+                                                            GUEST_FB0_OWNER_GID) : 0,
+                   GUEST_FB0_MAJOR, GUEST_FB0_MINOR, GUEST_FB0_MODE & 07777u,
+                   GUEST_FB0_BACKING_FILE);
+        return 1;
     }
     if ((nr == ARM_NR_OPEN || nr == ARM_NR_OPENAT) &&
         (strcmp(guest, "/dev") == 0 || strncmp(guest, "/dev/", 5u) == 0)) {
@@ -3018,7 +3234,8 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
         }
     }
     if (nr == ARM_NR_OPENAT &&
-        strcmp(guest, GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH) == 0) {
+        (strcmp(guest, GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH) == 0 ||
+         strcmp(guest, GUEST_FB0_SYSFS_ATTRIBUTE_PATH) == 0)) {
         unsigned flags = regs->uregs[2];
         if (!is_guest_ueventd(pid)) return -EPERM;
         if ((flags & 3u) != O_WRONLY || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0)
@@ -3027,11 +3244,16 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
             !virtual_uevent_rcvbuf_configured) return -ENOTCONN;
         int fd = alloc_virtual_fd(VIRTUAL_FD_SYSFS_UEVENT);
         if (fd < 0) return fd;
+        struct guest_vsocket_fd *sysfs_fd = guest_vsocket_fd_get(&guest_sockets, fd);
+        if (sysfs_fd && strcmp(guest, GUEST_FB0_SYSFS_ATTRIBUTE_PATH) == 0)
+            sysfs_fd->device_major = GUEST_FB0_MAJOR;
         *is_virtual = 1;
         *pending_return = fd;
         virtual_file_ops++;
-        printf("GUEST SYSFS UEVENT OPEN: guest-pid=%d guest-path=%s dirfd=%d flags=0x%x virtual-fd=%d; no backing file/device accessed\n",
-               active_tracee->guest_pid, guest, (int32_t)regs->uregs[0], flags, fd);
+        printf("GUEST SYSFS UEVENT OPEN: guest-pid=%d guest-path=%s device=%s dirfd=%d flags=0x%x virtual-fd=%d; no backing file/device accessed\n",
+               active_tracee->guest_pid, guest,
+               sysfs_fd && sysfs_fd->device_major == GUEST_FB0_MAJOR ? "graphics-fb0" : "net-eth0",
+               (int32_t)regs->uregs[0], flags, fd);
         return 0;
     }
     if (nr == ARM_NR_OPEN || nr == ARM_NR_OPENAT) {
@@ -3080,7 +3302,31 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
         case ARM_NR_FCHOWNAT: case ARM_NR_FCHMODAT: case ARM_NR_CHOWN32: case ARM_NR_LCHOWN32:
             *is_virtual = 1; *pending_return = 0; return 0;
         case ARM_NR_MKNOD: case ARM_NR_MKNODAT:
-            rc = make_guest_device(guest);
+            if (strcmp(guest, GUEST_FB0_PATH) == 0) {
+                unsigned mode_arg = nr == ARM_NR_MKNOD ? 1u : 2u;
+                unsigned dev_arg = nr == ARM_NR_MKNOD ? 2u : 3u;
+                uint32_t requested_mode = regs->uregs[mode_arg];
+                uint32_t requested_device = regs->uregs[dev_arg];
+                if (!active_tracee || !guest_fb0_mknod_args_valid(
+                        active_tracee->identity.euid,
+                        active_tracee->identity.fsgid,
+                        guest_fb0_graphics_uevent_received,
+                        requested_mode, requested_device)) {
+                    rc = -EPERM;
+                } else {
+                    rc = make_guest_device(guest);
+                    if (rc == 0) {
+                        guest_fb0_node_created = 1;
+                        printf("GUEST FB0 NODE CREATED: guest-pid=%d path=%s mode=0%o major=%u minor=%u fsgid=%u source=consumed Goldfish graphics add event; regular app-private placeholder only, no host mknod\n",
+                               active_tracee->guest_pid, guest,
+                               GUEST_FB0_MODE & 07777u,
+                               GUEST_FB0_MAJOR, GUEST_FB0_MINOR,
+                               active_tracee->identity.fsgid);
+                    }
+                }
+            } else {
+                rc = make_guest_device(guest);
+            }
             *is_virtual = 1; *pending_return = rc; return 0;
         default:
             return 1; /* translated path; allow the ordinary app-private file call */
@@ -3197,10 +3443,232 @@ static int translate_guest_pid_result(pid_t pid, struct tracee_state *state,
     return 0;
 }
 
+static void sync_guest_identity_scalars(struct tracee_state *state) {
+    if (!state) return;
+    state->guest_ruid = state->identity.ruid;
+    state->guest_euid = state->identity.euid;
+    state->guest_rgid = state->identity.rgid;
+    state->guest_egid = state->identity.egid;
+}
+
+static int guest_identity_getgroups_remote(pid_t pid, struct tracee_state *state,
+                                           int size, uint32_t address, int legacy) {
+    if (size < 0) return -EINVAL;
+    int count = guest_identity_getgroups_count(&state->identity, (uint32_t)size);
+    if (count < 0) return count;
+    if (size == 0 || count == 0) return count;
+    if (address == 0) return -EFAULT;
+    if (legacy) {
+        uint16_t groups[GUEST_ID_MAX_SUPPLEMENTARY_GROUPS];
+        for (int i = 0; i < count; ++i) groups[i] = (uint16_t)state->identity.groups[i];
+        return write_remote(pid, address, groups, (size_t)count * sizeof(groups[0])) == 0
+            ? count : -EFAULT;
+    }
+    return write_remote(pid, address, state->identity.groups,
+                        (size_t)count * sizeof(state->identity.groups[0])) == 0
+        ? count : -EFAULT;
+}
+
+static int guest_identity_setgroups_remote(pid_t pid, struct tracee_state *state,
+                                           int count, uint32_t address, int legacy) {
+    if (count < 0 || (unsigned)count > GUEST_ID_MAX_SUPPLEMENTARY_GROUPS)
+        return -EINVAL;
+    if (count && address == 0) return -EFAULT;
+    uint32_t groups[GUEST_ID_MAX_SUPPLEMENTARY_GROUPS] = {0};
+    if (count && legacy) {
+        uint16_t old_groups[GUEST_ID_MAX_SUPPLEMENTARY_GROUPS];
+        if (read_remote(pid, address, old_groups, (size_t)count * sizeof(old_groups[0])) != 0)
+            return -EFAULT;
+        for (int i = 0; i < count; ++i) groups[i] = old_groups[i];
+    } else if (count && read_remote(pid, address, groups,
+                                    (size_t)count * sizeof(groups[0])) != 0) {
+        return -EFAULT;
+    }
+    return guest_identity_setgroups(&state->identity, state->identity.euid,
+                                    groups, (uint32_t)count);
+}
+
+static int guest_identity_getres_remote(pid_t pid, const struct guest_identity_state *identity,
+                                        uint32_t ruid_address, uint32_t euid_address,
+                                        uint32_t suid_address, int group, int legacy) {
+    uint32_t values[3] = {
+        group ? identity->rgid : identity->ruid,
+        group ? identity->egid : identity->euid,
+        group ? identity->sgid : identity->suid,
+    };
+    uint32_t addresses[3] = {ruid_address, euid_address, suid_address};
+    for (size_t i = 0; i < 3; ++i) {
+        if (!addresses[i]) continue;
+        if (legacy) {
+            uint16_t value = (uint16_t)values[i];
+            if (write_remote(pid, addresses[i], &value, sizeof(value)) != 0) return -EFAULT;
+        } else if (write_remote(pid, addresses[i], &values[i], sizeof(values[i])) != 0) {
+            return -EFAULT;
+        }
+    }
+    return 0;
+}
+
+static int guest_identity_setres_from_regs(struct tracee_state *state,
+                                           const struct compat_pt_regs *regs,
+                                           int group, int legacy) {
+    uint32_t values[3] = {regs->uregs[0], regs->uregs[1], regs->uregs[2]};
+    if (legacy) {
+        for (size_t i = 0; i < 3; ++i)
+            values[i] = values[i] == UINT32_MAX ? GUEST_ID_INVALID : values[i] & 0xffffu;
+    } else {
+        for (size_t i = 0; i < 3; ++i)
+            if (values[i] == UINT32_MAX) values[i] = GUEST_ID_INVALID;
+    }
+    return group ? guest_identity_setresgid(&state->identity, values[0], values[1], values[2])
+                 : guest_identity_setresuid(&state->identity, values[0], values[1], values[2]);
+}
+
+static int mediate_guest_identity_syscall(pid_t pid, struct tracee_state *state,
+                                          const struct compat_pt_regs *regs, int nr,
+                                          int32_t *result) {
+    int legacy = 0;
+    int handled = 1;
+    switch (nr) {
+        case ARM_NR_GETUID: case ARM_NR_GETGID: case ARM_NR_GETEUID: case ARM_NR_GETEGID:
+        case ARM_NR_SETUID: case ARM_NR_SETGID: case ARM_NR_SETREUID: case ARM_NR_SETREGID:
+        case ARM_NR_GETGROUPS: case ARM_NR_SETGROUPS: case ARM_NR_SETRESUID:
+        case ARM_NR_GETRESUID: case ARM_NR_SETRESGID: case ARM_NR_GETRESGID:
+        case ARM_NR_SETFSUID: case ARM_NR_SETFSGID:
+            legacy = 1;
+            break;
+        case ARM_NR_GETUID32: case ARM_NR_GETGID32: case ARM_NR_GETEUID32: case ARM_NR_GETEGID32:
+        case ARM_NR_SETREUID32: case ARM_NR_SETREGID32: case ARM_NR_GETGROUPS32:
+        case ARM_NR_SETGROUPS32: case ARM_NR_SETRESUID32:
+        case ARM_NR_GETRESUID32: case ARM_NR_SETRESGID32: case ARM_NR_GETRESGID32:
+        case ARM_NR_SETUID32: case ARM_NR_SETGID32: case ARM_NR_SETFSUID32: case ARM_NR_SETFSGID32:
+            break;
+        default:
+            handled = 0;
+            break;
+    }
+    if (!handled) return 1;
+    const uint32_t invalid = GUEST_ID_INVALID;
+    switch (nr) {
+        case ARM_NR_GETUID: case ARM_NR_GETUID32: *result = (int32_t)state->identity.ruid; break;
+        case ARM_NR_GETGID: case ARM_NR_GETGID32: *result = (int32_t)state->identity.rgid; break;
+        case ARM_NR_GETEUID: case ARM_NR_GETEUID32: *result = (int32_t)state->identity.euid; break;
+        case ARM_NR_GETEGID: case ARM_NR_GETEGID32: *result = (int32_t)state->identity.egid; break;
+        case ARM_NR_SETUID:
+            *result = guest_identity_setuid(&state->identity, regs->uregs[0] & 0xffffu); break;
+        case ARM_NR_SETUID32:
+            *result = guest_identity_setuid(&state->identity, regs->uregs[0]); break;
+        case ARM_NR_SETGID:
+            *result = guest_identity_setgid(&state->identity, regs->uregs[0] & 0xffffu); break;
+        case ARM_NR_SETGID32:
+            *result = guest_identity_setgid(&state->identity, regs->uregs[0]); break;
+        case ARM_NR_SETREUID: case ARM_NR_SETREUID32:
+            *result = guest_identity_setreuid(&state->identity,
+                regs->uregs[0] == UINT32_MAX ? invalid : legacy ? regs->uregs[0] & 0xffffu : regs->uregs[0],
+                regs->uregs[1] == UINT32_MAX ? invalid : legacy ? regs->uregs[1] & 0xffffu : regs->uregs[1]);
+            break;
+        case ARM_NR_SETREGID: case ARM_NR_SETREGID32:
+            *result = guest_identity_setregid(&state->identity,
+                regs->uregs[0] == UINT32_MAX ? invalid : legacy ? regs->uregs[0] & 0xffffu : regs->uregs[0],
+                regs->uregs[1] == UINT32_MAX ? invalid : legacy ? regs->uregs[1] & 0xffffu : regs->uregs[1]);
+            break;
+        case ARM_NR_SETRESUID: case ARM_NR_SETRESUID32:
+            *result = guest_identity_setres_from_regs(state, regs, 0, legacy); break;
+        case ARM_NR_SETRESGID: case ARM_NR_SETRESGID32:
+            *result = guest_identity_setres_from_regs(state, regs, 1, legacy); break;
+        case ARM_NR_GETRESUID: case ARM_NR_GETRESUID32:
+            *result = guest_identity_getres_remote(pid, &state->identity,
+                regs->uregs[0], regs->uregs[1], regs->uregs[2], 0, legacy); break;
+        case ARM_NR_GETRESGID: case ARM_NR_GETRESGID32:
+            *result = guest_identity_getres_remote(pid, &state->identity,
+                regs->uregs[0], regs->uregs[1], regs->uregs[2], 1, legacy); break;
+        case ARM_NR_GETGROUPS: case ARM_NR_GETGROUPS32:
+            *result = guest_identity_getgroups_remote(pid, state,
+                (int32_t)regs->uregs[0], regs->uregs[1], legacy); break;
+        case ARM_NR_SETGROUPS: case ARM_NR_SETGROUPS32:
+            *result = guest_identity_setgroups_remote(pid, state,
+                (int32_t)regs->uregs[0], regs->uregs[1], legacy); break;
+        case ARM_NR_SETFSUID: case ARM_NR_SETFSUID32:
+            *result = guest_identity_setfsuid(&state->identity,
+                legacy ? regs->uregs[0] & 0xffffu : regs->uregs[0]); break;
+        case ARM_NR_SETFSGID: case ARM_NR_SETFSGID32:
+            *result = guest_identity_setfsgid(&state->identity,
+                legacy ? regs->uregs[0] & 0xffffu : regs->uregs[0]); break;
+        default: *result = -ENOSYS; return 0;
+    }
+    sync_guest_identity_scalars(state);
+    return 0;
+}
+
 static int dispatch_entry(pid_t pid, struct tracee_state *state,
                           struct compat_pt_regs *regs, int nr,
                           int32_t *pending_return, int *fake) {
     *fake = 0;
+    int32_t identity_result = 0;
+    int identity_handled = mediate_guest_identity_syscall(
+        pid, state, regs, nr, &identity_result);
+    if (identity_handled == 0) {
+        *pending_return = identity_result;
+        *fake = 1;
+        virtual_identity_count++;
+        if (virtual_identity_count <= 96u)
+            printf("GUEST IDENTITY SYSCALL: guest-pid=%d executable=%s syscall=%d uid=%u:%u:%u gid=%u:%u:%u supplementary-groups=%u result=%d; tracee-only identity, host credentials unchanged\n",
+                   state->guest_pid, state->exec_target, nr,
+                   state->identity.ruid, state->identity.euid, state->identity.suid,
+                   state->identity.rgid, state->identity.egid, state->identity.sgid,
+                   state->identity.group_count, identity_result);
+        return 0;
+    }
+    if (nr == ARM_NR_IOCTL) {
+        int32_t ioctl_result = 0;
+        int fb_result = mediate_guest_fb0_ioctl(pid, state, regs, &ioctl_result);
+        if (fb_result != 1) {
+            *pending_return = fb_result == 0 ? ioctl_result : fb_result;
+            *fake = 1;
+            virtual_device_count++;
+            return 0;
+        }
+    }
+    if (nr == ARM_NR_MMAP2) {
+        int fb_result = mediate_guest_fb0_mmap(pid, state, regs);
+        if (fb_result != 1) {
+            if (fb_result < 0) {
+                *pending_return = fb_result;
+                *fake = 1;
+                printf("GUEST FB0 MMAP DENIED: guest-pid=%d fd=%d length=%u prot=0x%x flags=0x%x offset-pages=%u result=%d; unsupported framebuffer mappings fail closed\n",
+                       state->guest_pid, (int32_t)regs->uregs[4],
+                       regs->uregs[1], regs->uregs[2], regs->uregs[3],
+                       regs->uregs[5], fb_result);
+            } else {
+                guest_fb0_mmap_count++;
+            }
+            return 0;
+        }
+    }
+    if (nr == ARM_NR_MUNMAP && state->fb_mapping_valid &&
+        regs->uregs[0] == state->fb_mapping_start &&
+        regs->uregs[1] >= state->fb_mapping_length) {
+        state->fb_munmap_pending = 1;
+    }
+    if (nr == ARM_NR_FSTAT64 &&
+        guest_fb0_fd_matches(pid, (int32_t)regs->uregs[0])) {
+        struct guest_pseudo_device_metadata metadata = {0};
+        unsigned char stat64[GUEST_ARM32_STAT64_BYTES];
+        int recognized = guest_pseudo_device_metadata_for_path(GUEST_FB0_PATH, &metadata);
+        int rc = recognized == 1 ? guest_pseudo_device_stat64_owner(
+            metadata.mode, metadata.uid, metadata.gid, metadata.major,
+            metadata.minor, stat64) : -ENODEV;
+        if (rc == 0 && (regs->uregs[1] == 0 ||
+            write_remote(pid, regs->uregs[1], stat64, sizeof(stat64)) != 0))
+            rc = -EFAULT;
+        *pending_return = rc;
+        *fake = 1;
+        printf("GUEST FB0 FSTAT64: guest-pid=%d fd=%d mode=0%o uid=%u gid=%u rdev=%u:%u result=%d; descriptor reported as guest char node, backing inode hidden\n",
+               state->guest_pid, (int32_t)regs->uregs[0],
+               metadata.mode & 07777u, metadata.uid, metadata.gid,
+               metadata.major, metadata.minor, rc);
+        return 0;
+    }
     if (nr == ARM_NR_SIGACTION) {
         int forward = 0;
         int32_t guest_error = -EFAULT;
@@ -3476,6 +3944,15 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
     }
     if (nr == ARM_NR_POLL) {
         *pending_return = virtual_poll(pid, regs); *fake = 1; return 0;
+    }
+    if ((nr == ARM_NR_READ || nr == ARM_NR_WRITE) &&
+        guest_fb0_fd_matches(pid, (int32_t)regs->uregs[0])) {
+        *pending_return = -EOPNOTSUPP;
+        *fake = 1;
+        printf("GUEST FB0 STREAM IO DENIED: guest-pid=%d fd=%d syscall=%s result=-EOPNOTSUPP; only validated mmap2/page-flip framebuffer data is supported\n",
+               state->guest_pid, (int32_t)regs->uregs[0],
+               guest_diag_syscall_name(nr));
+        return 0;
     }
     if ((nr == ARM_NR_READ || nr == ARM_NR_WRITE) &&
         is_virtual_fd_number((int32_t)regs->uregs[0])) {
@@ -3863,6 +4340,10 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 child_state->guest_euid = state->guest_euid;
                 child_state->guest_rgid = state->guest_rgid;
                 child_state->guest_egid = state->guest_egid;
+                child_state->identity = state->identity;
+                child_state->fb_mapping_start = state->fb_mapping_start;
+                child_state->fb_mapping_length = state->fb_mapping_length;
+                child_state->fb_mapping_valid = state->fb_mapping_valid;
                 child_state->process_compat = state->process_compat;
                 snprintf(child_state->exec_backing_path,
                          sizeof(child_state->exec_backing_path), "%s",
@@ -4048,6 +4529,32 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     kill_all_tracees(); return -1;
                 }
                 record_guest_path_fd_result(state, &regs, syscall_result);
+                if (state->fb_mmap_pending) {
+                    if (state->last_syscall == ARM_NR_MMAP2 && syscall_result >= 0) {
+                        state->fb_mapping_start = (uint32_t)syscall_result;
+                        state->fb_mapping_length = state->fb_pending_map_length;
+                        state->fb_mapping_valid = 1;
+                        printf("GUEST FB0 MMAP2: guest-pid=%d executable=%s fd=%d address=0x%08x length=%u prot=0x%x offset-pages=%u; shared mapping is the app-private software framebuffer backing, not /dev/fb0 on host\n",
+                               state->guest_pid, state->exec_target,
+                               (int32_t)state->last_syscall_args[4],
+                               state->fb_mapping_start, state->fb_mapping_length,
+                               state->fb_pending_map_flags,
+                               state->fb_pending_map_offset_pages);
+                    } else {
+                        printf("GUEST FB0 MMAP2 FAILED: guest-pid=%d result=%d; no framebuffer mapping registered\n",
+                               state->guest_pid, syscall_result);
+                    }
+                    state->fb_mmap_pending = 0;
+                }
+                if (state->fb_munmap_pending) {
+                    if (state->last_syscall == ARM_NR_MUNMAP && syscall_result == 0) {
+                        state->fb_mapping_valid = 0;
+                        state->fb_mapping_start = 0;
+                        state->fb_mapping_length = 0;
+                        puts("GUEST FB0 MUNMAP: successful guest unmap cleared the tracee framebuffer mapping record");
+                    }
+                    state->fb_munmap_pending = 0;
+                }
                 int marker_release_observed = 0;
                 if (state->last_syscall == ARM_NR_OPEN &&
                     strcmp(state->last_guest_path, GUEST_COLD_BOOT_MARKER_PATH) == 0 &&
@@ -4284,8 +4791,12 @@ int main(int argc, char **argv) {
            GUEST_PROFILE_NET_IFACE, GUEST_PROFILE_NET_ADDRESS,
            GUEST_PROFILE_NET_NETMASK, GUEST_PROFILE_NET_GATEWAY,
            GUEST_PROFILE_NET_DNS1);
-    printf("GUEST FRAME CHANNEL: ready=%d; GVMF/1 app-private receiver; frames-published=%lu; producer=not-connected; fb ioctls/mmap/page-flip=not-implemented; host framebuffer/Binder=0\n",
+    printf("GUEST FRAME CHANNEL: ready=%d; GVMF/1 app-private receiver; frames-published=%lu; only guest fb0 backing bytes may be published; host framebuffer/Binder=0\n",
            guest_frame_channel_ready, guest_frame_published_count);
+    printf("GUEST FB0 SOFTWARE MODEL: ready=%d; path=%s profile=%s %ux%u RGB565 double-buffered; graphics-uevent-received=%d node-created=%d; Binder/SurfaceFlinger still unimplemented until traced\n",
+           guest_fb0_backend_ready, GUEST_FB0_PATH, GUEST_PROFILE_DISPLAY_SKIN,
+           GUEST_PROFILE_DISPLAY_WIDTH, GUEST_PROFILE_DISPLAY_HEIGHT,
+           guest_fb0_graphics_uevent_received, guest_fb0_node_created);
     printf("PROCESS TREE: fork/clone/vfork followed with ptrace; active-and-unreaped registry cap=%d; process slots reusable after guest wait4 reap, non-waitable thread slots after ptrace terminal exit; verified ARM32 execs and confined original-linker aliases\n", MAX_TRACEES);
     puts("DYNAMIC ELF POLICY: original API10 linker is inherited as fd 198; unsupported PT_INTERP is denied before host-linker substitution");
     int child = start_guest(binary, &argv[5]);
@@ -4366,7 +4877,11 @@ int main(int argc, char **argv) {
            virtual_property_sendto_count, virtual_property_sendto_bytes,
            virtual_property_recvfrom_count, virtual_property_recvfrom_bytes,
            virtual_property_stream_errors, virtual_property_stream_diagnostics);
-    printf("GUEST FRAME OUTPUT SUMMARY: channel-ready=%d frames-published=%lu; only source=guest-framebuffer packets are renderable; test-only frames rejected; no guest fb producer or Android desktop observed\n",
+    printf("GUEST FB0 OUTPUT SUMMARY: backend-ready=%d graphics-uevent-received=%d node-created=%d opens=%lu ioctls=%lu mmap2=%lu page-flips=%lu software-base-update-acks=%lu; channel-ready=%d frames-published=%lu; producer bytes come only from guest MAP_SHARED backing; Binder/SurfaceFlinger/framework/desktop remain unproven\n",
+           guest_fb0_backend_ready, guest_fb0_graphics_uevent_received,
+           guest_fb0_node_created, guest_fb0_open_count, guest_fb0_ioctl_count,
+           guest_fb0_mmap_count, guest_fb0_pan_count,
+           guest_fb0_model.software_base_update_acks,
            guest_frame_channel_ready, guest_frame_published_count);
     printf("VIRTUAL PROPERTY/SIGNAL SOCKET SUMMARY: created=%lu binds=%lu connects=%lu accepts=%lu signal-pairs=%lu; host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv/sendto/recvfrom calls=0\n",
            virtual_property_socket_count, virtual_property_bind_count,

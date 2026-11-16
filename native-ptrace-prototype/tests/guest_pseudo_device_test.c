@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "../app/src/main/cpp/guest_pseudo_device.h"
 
 #include <assert.h>

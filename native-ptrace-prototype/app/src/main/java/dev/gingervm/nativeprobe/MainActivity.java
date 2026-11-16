@@ -121,10 +121,10 @@ public final class MainActivity extends Activity {
                 + "LATEST DEVICE TRACE (owner-provided v0.6.16 Android 12 log): Goldfish uevent delivery, coldboot marker and PID 1 stat succeeded. The continuous tree recorded 42 fork/clone/vfork events, 32 guest execs and 31 original linker entries. app_process entered the linker, but its target-code entry was not observed; the only ET_EXEC entry hit identified was /sbin/ueventd. No target main, Zygote, framework, system_server or desktop was observed.\n"
                 + "The property listener bound/listened, but connect/accept/sendto/recvfrom were all 0, so v0.6.16's new property stream was not exercised. The old trace killed host PID 14912 as unregistered immediately before a later fork-event record identified the same child PID under guest PID 13; the old logger did not include that wait status or the child's exec path, so its exact stop signal and intended command remain unproven. The owner-reported eth0 route failure is not evidence that ifconfig ran. The supervisor ended by bounded timeout; cleanup tracked=12/reaped=12/unresolved=0.\n"
                 + "v0.6.17 defers only recognized ptrace child-initial-stop statuses until an exact parent event PID match, then registers, configures and resumes the child; pending children share the same hard 32-slot budget and timeout cleanup. Host tests pass, but a new device trace must show whether the child is adopted and which guest command runs.\n"
-                + "API10 SystemServer.java says init1 is called from Zygote and starts native services including SurfaceFlinger; its JNI init1 calls system_init(). The owner trace did not observe app_process target-code entry, Zygote or SystemServer, so that stage has not run.\n"
-                + "The viewport now has an app-private GVMF/1 receiver and Bitmap renderer. It accepts only bounded, checksum-verified source=guest-framebuffer packets and rejects TEST_ONLY/invalid packets. This is the display sink only: the guest Goldfish fb0 ioctl/mmap/page-flip producer and guest Binder service are not implemented, no real frame has been observed, and the panel remains explicitly no-frame. No host Binder/framebuffer or drawn Android screen is used. A linker entry is not proof of target main, Zygote, framework, desktop or display output.\n\n"
+                + "API10 SystemServer.java says init1 is called from Zygote and starts native services including SurfaceFlinger; its JNI init1 calls system_init(). The owner trace did not observe app_process target-code entry, Zygote or SystemServer, so that stage has not run. A linker entry is not proof of target main, Zygote, framework, desktop or display output.\n"
+                + "The viewport retains its app-private GVMF/1 receiver and checksum-verified renderer. This build adds a source-backed API10 Goldfish fb0 software path: ueventd graphics add -> validated root:graphics node -> fbdev info ioctls -> exact MAP_SHARED RGB565 double buffer -> page-flip capture -> GVMF/1. Host regression proves the producer and Java decoder interoperate using test-written bytes; it does not prove the original guest reached fb0. The real viewport stays no-frame until a device trace shows guest writes and page flips. Guest Binder/service-manager/SurfaceFlinger are still not implemented or observed, so no Android desktop is claimed. No host Binder, framebuffer or drawn screen is used.\n\n"
                 + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer follows the latest output; share/save exports the complete log.\n"
-                + "This v0.6.16 owner-provided device trace remains the latest verified device baseline. v0.6.17/v0.6.18 runtime changes and any real display pipeline require a new on-device trace; this build does not claim a booted desktop.";
+                + "The v0.6.16 owner-provided trace remains the latest verified device baseline. v0.6.17/v0.6.18 changes and this new fb0 path still require a fresh device trace; no target main, Zygote, framework, SurfaceFlinger or desktop is claimed.";
     }
 
     private void buildUi() {
@@ -186,7 +186,7 @@ public final class MainActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 Gravity.CENTER));
         guestDisplayStatus = new TextView(this);
-        guestDisplayStatus.setText("尚無 guest 畫面\n只顯示驗證過的 guest framebuffer 像素。\n目前 guest fb0／Binder frame producer 尚未接通；此區不是 Android 桌面。");
+        guestDisplayStatus.setText("尚無真實 guest 畫面\n只顯示 guest fb0 mmap／page-flip 產生並驗證的像素。\nfb0 軟體 producer 已接上；仍需 guest Binder／SurfaceFlinger 實際輸出 frame。此區不是 Android 桌面。");
         guestDisplayStatus.setTextColor(0xFF9AA8B6);
         guestDisplayStatus.setTextSize(14);
         guestDisplayStatus.setGravity(Gravity.CENTER);
@@ -404,8 +404,8 @@ public final class MainActivity extends Activity {
             guestDisplayImage.setImageDrawable(null);
             guestDisplayImage.setVisibility(View.GONE);
             guestDisplayStatus.setVisibility(View.VISIBLE);
-            guestDisplayStatus.setText("等待此次 run 的真實 guest framebuffer frame…\n測試 packet 不會顯示在 viewport。");
-            guestDisplayTitle.setText("Guest display · 等待真實 guest frame");
+            guestDisplayStatus.setText("等待此次 run 的 guest fb0 frame…\n只有 guest MAP_SHARED 寫入並 page-flip 的像素會送到 viewport；測試 packet 不會顯示。");
+            guestDisplayTitle.setText("Guest display · 等待 guest fb0 page flip");
             guestDisplayFrame.setContentDescription("Guest display viewport; waiting for a verified guest framebuffer frame");
         } catch (IOException e) {
             guestFrameChannelAvailable = false;
@@ -814,7 +814,7 @@ public final class MainActivity extends Activity {
         out.append("Supervisor: ").append(supervisor.getAbsolutePath()).append('\n');
         out.append("ARM32 executable directory: ").append(guestLibraryDir.getAbsolutePath()).append('\n');
         out.append("Source image hashes: original Google API10 ramdisk/system; no Samsung payloads\n");
-        out.append("Guest display transport: app-private GVMF/1 receiver; only verified guest-framebuffer packets render; no guest fb0 ioctl/mmap/page-flip producer or guest Binder is connected\n");
+        out.append("Guest display transport: app-private GVMF/1 receiver plus source-backed Goldfish fb0 ioctl/mmap/page-flip producer; only guest-written backing bytes render; guest Binder/SurfaceFlinger remains unavailable until implemented and traced\n");
         out.append("Host root/mount calls: none\n\n");
 
         out.append("Continuous trace: one original /init with its traced child tree; maximum 32 tracees, bounded by the supervisor timeout.\n");

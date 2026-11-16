@@ -25,7 +25,7 @@ int main(void) {
                   "goldfish-emulator-pipe-backend-not-implemented") == 0);
     const char *api10_hardware_nodes[] = {
         "/dev/msm_hw3dc", "/dev/kgsl", "/dev/diag", "/dev/android_adb",
-        "/dev/uinput", "/dev/alarm", "/dev/graphics/fb0",
+        "/dev/uinput", "/dev/alarm", "/dev/graphics/fb1",
         "/dev/input/event0", "/dev/pmem_adsp0", "/dev/oncrpc/00000000",
         "/dev/snd/dsp", "/dev/akm8976_daemon", "/dev/msm_pcm_out0",
         "/dev/qmi0", "/dev/usb_accessory", "/dev/ts0710mux0", "/dev/tun"
@@ -36,6 +36,9 @@ int main(void) {
     assert(guest_device_unimplemented_reason("/dev/null") == NULL);
     assert(guest_device_unimplemented_reason("/dev/urandom") == NULL);
     assert(guest_device_unimplemented_reason("/dev/random") == NULL);
+    assert(guest_device_unimplemented_reason("/dev/graphics/fb0") == NULL);
+    assert(strcmp(guest_device_unimplemented_reason("/dev/graphics/fb1"),
+                  "api10-ueventd-declared-hardware-backend-not-implemented") == 0);
     assert(guest_device_unimplemented_reason("/dev/zero") == NULL);
     assert(guest_device_unimplemented_reason("/dev/full") == NULL);
     assert(guest_device_unimplemented_reason("/dev/.coldboot_done") == NULL);

@@ -2,6 +2,7 @@
 #define GINGERVM_GUEST_PSEUDO_DEVICE_H
 
 #include "guest_socket_virtual.h"
+#include "guest_framebuffer_virtual.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -19,6 +20,8 @@ typedef int (*guest_entropy_fill_fn)(void *context, unsigned char *out, size_t l
 struct guest_pseudo_device_metadata {
     enum virtual_fd_kind kind;
     uint32_t mode;
+    uint32_t uid;
+    uint32_t gid;
     uint32_t major;
     uint32_t minor;
 };
@@ -41,6 +44,13 @@ static inline int guest_pseudo_device_metadata_for_path(
         value.kind = VIRTUAL_FD_DEV_RANDOM; value.minor = 8u;
     } else if (strcmp(path, "/dev/urandom") == 0) {
         value.kind = VIRTUAL_FD_DEV_RANDOM; value.minor = 9u;
+    } else if (strcmp(path, GUEST_FB0_PATH) == 0) {
+        value.kind = VIRTUAL_FD_DEV_FRAMEBUFFER;
+        value.mode = GUEST_FB0_MODE;
+        value.uid = GUEST_FB0_OWNER_UID;
+        value.gid = GUEST_FB0_OWNER_GID;
+        value.major = GUEST_FB0_MAJOR;
+        value.minor = GUEST_FB0_MINOR;
     } else if (strcmp(path, "/dev/__kmsg__") == 0) {
         value.kind = VIRTUAL_FD_DEV_KMSG; value.minor = 11u; value.mode = GUEST_MODE_IFCHR | 0600u;
     } else {
@@ -125,17 +135,24 @@ static inline uint64_t guest_pseudo_makedev(uint32_t major, uint32_t minor) {
 }
 
 /* ARM32 API10 kernel stat64 layout from bionic/libc/kernel/arch-arm/asm/stat.h. */
-static inline int guest_pseudo_device_stat64(uint32_t mode, uint32_t major,
-                                             uint32_t minor,
-                                             unsigned char out[GUEST_ARM32_STAT64_BYTES]) {
+static inline int guest_pseudo_device_stat64_owner(uint32_t mode, uint32_t uid,
+                                                   uint32_t gid, uint32_t major,
+                                                   uint32_t minor,
+                                                   unsigned char out[GUEST_ARM32_STAT64_BYTES]) {
     if (!out) return -EFAULT;
     memset(out, 0, GUEST_ARM32_STAT64_BYTES);
     guest_pseudo_store32(out, 16u, mode);
     guest_pseudo_store32(out, 20u, 1u); /* one guest node */
-    guest_pseudo_store32(out, 24u, 0u); /* guest root uid */
-    guest_pseudo_store32(out, 28u, 0u); /* guest root gid */
+    guest_pseudo_store32(out, 24u, uid);
+    guest_pseudo_store32(out, 28u, gid);
     guest_pseudo_store64(out, 32u, guest_pseudo_makedev(major, minor));
     return 0;
+}
+
+static inline int guest_pseudo_device_stat64(uint32_t mode, uint32_t major,
+                                             uint32_t minor,
+                                             unsigned char out[GUEST_ARM32_STAT64_BYTES]) {
+    return guest_pseudo_device_stat64_owner(mode, 0u, 0u, major, minor, out);
 }
 
 static inline int guest_pseudo_device_stat64_for_path(
@@ -143,8 +160,8 @@ static inline int guest_pseudo_device_stat64_for_path(
     struct guest_pseudo_device_metadata metadata;
     int result = guest_pseudo_device_metadata_for_path(path, &metadata);
     if (result <= 0) return result;
-    int rc = guest_pseudo_device_stat64(metadata.mode, metadata.major,
-                                        metadata.minor, out);
+    int rc = guest_pseudo_device_stat64_owner(metadata.mode, metadata.uid,
+        metadata.gid, metadata.major, metadata.minor, out);
     return rc == 0 ? 1 : rc;
 }
 
