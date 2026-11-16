@@ -31,8 +31,12 @@ int main(void) {
     assert(strcmp(guest_diag_syscall_name(175), "rt_sigprocmask") == 0);
     assert(strcmp(guest_diag_syscall_name(202), "getegid32") == 0);
     assert(strcmp(guest_diag_syscall_name(281), "socket") == 0);
+    assert(strcmp(guest_diag_syscall_name(290), "sendto") == 0);
+    assert(strcmp(guest_diag_syscall_name(292), "recvfrom") == 0);
     assert(strcmp(guest_diag_syscall_name(999), "unknown") == 0);
     assert(strcmp(guest_diag_errno_name(EACCES), "EACCES") == 0);
+    assert(strcmp(guest_diag_errno_name(ENOTSOCK), "ENOTSOCK") == 0);
+    assert(strcmp(guest_diag_errno_name(EOPNOTSUPP), "EOPNOTSUPP") == 0);
     assert(strcmp(guest_diag_errno_name(12345), "ERRNO") == 0);
 
     struct guest_diag_proc_map mapping;
@@ -57,6 +61,6 @@ int main(void) {
     assert(seccomp_mode == 0 || seccomp_mode == 1 || seccomp_mode == 2 ||
            seccomp_mode == -ENOENT);
 
-    puts("guest diagnostics regression: PASS (escaped paths, ARM syscall labels, bounded proc maps, module offsets, Seccomp status)");
+    puts("guest diagnostics regression: PASS (escaped paths, ARM syscall labels/errno names, bounded proc maps, module offsets, Seccomp status)");
     return 0;
 }

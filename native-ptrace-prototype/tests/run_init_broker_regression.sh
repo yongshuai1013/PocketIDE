@@ -48,6 +48,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_socket_path_ops_test.c" -o "$TMP/guest_socket_path_ops_test"
 "$TMP/guest_socket_path_ops_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_property_socket_regression_test.c" -o "$TMP/guest_property_socket_regression_test"
+"$TMP/guest_property_socket_regression_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_diagnostics_test.c" -o "$TMP/guest_diagnostics_test"
 "$TMP/guest_diagnostics_test"
 mkdir -p "$TMP/java"
@@ -104,6 +107,8 @@ safe_dir = Path(sys.argv[1]).with_name('guest_safe_dir.h').read_text()
 safe_dir_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_safe_dir_test.c').read_text()
 socket_model = Path(sys.argv[1]).with_name('guest_socket_virtual.h').read_text()
 socket_path = Path(sys.argv[1]).with_name('guest_socket_path_ops.h').read_text()
+property_protocol = Path(sys.argv[1]).with_name('guest_property_protocol.h').read_text()
+property_socket_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_property_socket_regression_test.c').read_text()
 diagnostics = Path(sys.argv[1]).with_name('guest_diagnostics.h').read_text()
 sigsys_context = Path(sys.argv[1]).with_name('guest_sigsys_context.h').read_text()
 script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
@@ -163,8 +168,27 @@ assert 'guest_vsocket_poll_events(' in src and '&guest_sockets, fd, fds[i].event
 assert 'VIRTUAL PROPERTY SOCKET CREATE:' in src and 'VIRTUAL PROPERTY BIND:' in src
 assert 'VIRTUAL PROPERTY LISTEN:' in src and 'VIRTUAL PROPERTY ACCEPT:' in src
 assert 'VIRTUAL PROPERTY CONNECT:' in src and 'VIRTUAL PROPERTY SO_PEERCRED:' in src
+assert '#define ARM_NR_SENDTO 290' in src and '#define ARM_NR_RECVFROM 292' in src
+assert 'virtual_guest_property_stream_io' in src and 'VIRTUAL PROPERTY STREAM SYSCALL:' in src
+assert 'VIRTUAL PROPERTY STREAM SUMMARY:' in src and 'app-private connected AF_UNIX stream only' in src
+assert 'ET_EXEC-e_entry-PC-hits=%lu (app_process=%lu ueventd=%lu other=%lu)' in src
+assert 'ARM sendto=%lu bytes=%lu recvfrom=%lu bytes=%lu errors=%lu' in src
+assert 'host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv/sendto/recvfrom calls=0' in src
 assert 'VIRTUAL SIGNAL SOCKETPAIR:' in src and 'VIRTUAL GUEST SOCKET IO:' in src
 assert 'endpoint=%s direction=%s' in src and 'sigchld-socketpair' in src
+assert 'guest_vsocket_property_stream_validate(&guest_sockets, fd' in src
+assert 'guest_vsocket_sendto(&guest_sockets, fd' in src
+assert 'guest_vsocket_peek(&guest_sockets, fd, buffer, amount, 0)' in src
+assert 'read_remote(pid, buffer_address, buffer, amount)' in src
+assert 'write_remote(pid, buffer_address, buffer' in src
+assert 'guest_vsocket_property_stream_validate' in socket_model
+assert 'GUEST_API10_PROP_NAME_MAX 32u' in property_protocol
+assert 'GUEST_API10_PROP_VALUE_MAX 92u' in property_protocol
+assert 'sizeof(struct guest_api10_prop_msg) == 128u' in property_protocol
+assert 'request.cmd = GUEST_API10_PROP_MSG_SETPROP' in property_socket_test
+assert 'strcmp(received.name, "sys.gingervm.test")' in property_socket_test
+assert '== -EAGAIN' in property_socket_test and '== -EOPNOTSUPP' in property_socket_test
+assert '== -ENOTSOCK' in property_socket_test and '== -EPIPE' in property_socket_test
 assert 'guest_socket_marker_create_app_private(host_path, guest_root)' in src
 assert 'close_virtual_fds_on_exec(state)' in src and 'child_state->virtual_fd_table_id' in src
 assert 'tracee_owns_virtual_fd' in src and 'GUEST_VSOCKET_POLLNVAL' in src
@@ -475,8 +499,8 @@ assert 'MAX_CONSECUTIVE_INTERRUPTED_READS = 32' in capture
 assert 'e.bytesTransferred' in capture and 'too many consecutive interrupted pipe reads' in capture
 assert 'setText("查看日誌")' in activity and 'setText("停止")' in activity
 assert 'private void showLogViewer()' in activity and 'readLatestLogTail()' in activity
-assert 'VIRTUAL PROPERTY/SIGNAL SOCKET SUMMARY' in src and 'virtual_property_connect_count' in src
-assert 'host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv calls=0' in src
+assert 'VIRTUAL PROPERTY STREAM SUMMARY:' in src and 'virtual_property_connect_count' in src
+assert 'host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv/sendto/recvfrom calls=0' in src
 assert 'MAX_LOG_VIEW_BYTES = 256 * 1024' in activity and 'MAX_REPORT_CHARS = 48 * 1024' in activity
 assert 'private ScrollView reportScrollView' in activity
 assert 'private void scrollToLatest(final ScrollView scrollView)' in activity
@@ -496,16 +520,18 @@ assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activ
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'LATEST DEVICE TRACE (owner-provided v0.6.14 Android 12 log)' in activity
-assert "PID1's post-marker stat succeeded" in activity
-assert '31 fork/clone/vfork events, 25 guest execs and 24 original linker entries' in activity
-assert 'Target executable-code/e_entry hits were 0' in activity
-assert 'monotonic 32-record tracee registry' in activity
-assert 'tracked=17, reaped=13, already-gone=4, unresolved=0' in activity
-assert 'ifup lo returning ENODEV' in activity and '/dev/urandom reads returning EOPNOTSUPP' in activity
-assert 'process slots need ptrace exit plus guest wait4 reap; non-waitable thread slots need ptrace-confirmed terminal exit' in activity
-assert 'This v0.6.14 device trace is the current verified baseline' in activity
-assert 'v0.6.15 retains process slots until ptrace exit plus guest wait4 reap' in activity
+assert 'LATEST DEVICE TRACE (owner-provided v0.6.15 Android 12 log)' in activity
+assert 'Goldfish uevent delivery and coldboot marker/stat release succeeded' in activity
+assert '38 fork/clone/vfork events, 30 guest execs and 29 original linker entries' in activity
+assert 'only e_entry syscall-PC hit identified was /sbin/ueventd' in activity
+assert 'app_process entered the linker but its target executable-code/e_entry was not observed' in activity
+assert 'ARM sendto(290)/recvfrom(292) on the property stream returned ENOSYS' in activity
+assert 'The 32-slot registry stayed within bounds' in activity
+assert 'cleanup unresolved=0' in activity
+assert 'qemud exited 1, but no qemu_pipe open was observed, so its cause is unproven' in activity
+assert 'No host AF_UNIX or network calls were made' in activity
+assert 'This v0.6.15 device trace is the current verified baseline' in activity
+assert 'v0.6.16 mediates only the source-confirmed API10 property sendto/recvfrom stream path' in activity
 assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
 assert 'network-effects=guest-software-broker-only' in src
 assert 'guest_tracee_slot_allocate' in src and 'guest_tracee_slot_mark_ptrace_exit' in src
@@ -556,11 +582,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.15-test-signed-apk' in upload
-assert 'gingervm-v0.6.15-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 24" in gradle and "versionName '0.6.15'" in gradle
+assert 'gingervm-continuous-trace-v0.6.16-test-signed-apk' in upload
+assert 'gingervm-v0.6.16-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 25" in gradle and "versionName '0.6.16'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.15' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.16' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

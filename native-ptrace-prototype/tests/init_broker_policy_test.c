@@ -42,14 +42,14 @@ int main(void) {
     assert(guest_syscall_policy(285) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* accept */
     assert(guest_syscall_policy(288) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* socketpair */
     assert(guest_syscall_policy(289) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* send */
+    assert(guest_syscall_policy(290) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* sendto: property stream adapter */
     assert(guest_syscall_policy(291) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* recv */
+    assert(guest_syscall_policy(292) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* recvfrom: property stream adapter */
     assert(guest_syscall_policy(294) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* setsockopt */
     assert(guest_syscall_policy(295) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* getsockopt */
     assert(guest_syscall_policy(297) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* recvmsg for ueventd only */
     assert(guest_syscall_policy(286) == GUEST_SYSCALL_DENY); /* getpeername */
     assert(guest_syscall_policy(287) == GUEST_SYSCALL_DENY); /* getsockname */
-    assert(guest_syscall_policy(290) == GUEST_SYSCALL_DENY); /* sendto not implemented */
-    assert(guest_syscall_policy(292) == GUEST_SYSCALL_DENY); /* recvfrom not implemented */
     assert(guest_syscall_policy(293) == GUEST_SYSCALL_DENY); /* shutdown not implemented */
     assert(guest_syscall_policy(168) == GUEST_SYSCALL_VIRTUALIZE); /* software poll */
     assert(guest_syscall_policy(174) == GUEST_SYSCALL_ALLOW_SAFE); /* install guest SIGCHLD handler */

@@ -341,6 +341,12 @@ static unsigned long virtual_property_bind_count;
 static unsigned long virtual_property_socket_count;
 static unsigned long virtual_property_connect_count;
 static unsigned long virtual_property_accept_count;
+static unsigned long virtual_property_sendto_count;
+static unsigned long virtual_property_recvfrom_count;
+static unsigned long virtual_property_sendto_bytes;
+static unsigned long virtual_property_recvfrom_bytes;
+static unsigned long virtual_property_stream_errors;
+static unsigned long virtual_property_stream_diagnostics;
 static unsigned long virtual_socketpair_count;
 static unsigned long virtual_socket_rejected_count;
 static int virtual_uevent_fd = -1;
@@ -375,6 +381,9 @@ static unsigned long guest_qemud_exit_count;
 static int guest_qemud_last_exit_code = -1;
 static unsigned long guest_target_elf_text_entry_count;
 static unsigned long guest_target_elf_declared_entry_pc_count;
+static unsigned long guest_app_process_declared_entry_pc_count;
+static unsigned long guest_ueventd_declared_entry_pc_count;
+static unsigned long guest_other_declared_entry_pc_count;
 static unsigned long guest_shell_elf_text_entry_count;
 static unsigned long guest_app_process_elf_text_entry_count;
 static int saw_exec;
@@ -877,6 +886,12 @@ static void observe_guest_target_elf_text(pid_t host_pid,
     if (exact_entry_pc && !state->target_elf_entry_pc_seen) {
         state->target_elf_entry_pc_seen = 1;
         guest_target_elf_declared_entry_pc_count++;
+        if (strcmp(state->exec_target, "/system/bin/app_process") == 0)
+            guest_app_process_declared_entry_pc_count++;
+        else if (strcmp(state->exec_target, "/sbin/ueventd") == 0)
+            guest_ueventd_declared_entry_pc_count++;
+        else
+            guest_other_declared_entry_pc_count++;
     }
     guest_target_elf_text_entry_count++;
     if (strcmp(state->exec_target, GUEST_API10_SHELL_PATH) == 0)
@@ -1901,6 +1916,89 @@ static int virtual_guest_socket_stream_io(pid_t pid, int fd, uint32_t buffer_add
         printf("VIRTUAL GUEST SOCKET IO: guest-pid=%d executable=%s fd=%d endpoint=%s direction=%s bytes=%d; app-private software queue only, host socket API not called\n",
                state->guest_pid, state->exec_target, fd, endpoint,
                receive ? "recv" : "send", result);
+    }
+    return result;
+}
+
+static int virtual_guest_property_stream_io(pid_t pid,
+        const struct compat_pt_regs *regs, int receive) {
+    struct tracee_state *state = active_tracee && active_tracee->pid == pid
+        ? active_tracee : NULL;
+    int fd = (int32_t)regs->uregs[0];
+    uint32_t buffer_address = regs->uregs[1];
+    uint32_t guest_length = regs->uregs[2];
+    int flags = (int)regs->uregs[3];
+    uintptr_t address = (uintptr_t)regs->uregs[4];
+    uintptr_t address_length_or_pointer = (uintptr_t)regs->uregs[5];
+    int result = -ESRCH;
+    struct guest_vsocket_fd *entry = NULL;
+
+    if (state) {
+        if (!is_virtual_fd_number(fd)) {
+            result = -ENOTSOCK;
+        } else if (!is_virtual_fd(fd) || !tracee_owns_virtual_fd(state, fd)) {
+            result = -EBADF;
+        } else if (guest_length > (uint32_t)INT32_MAX) {
+            result = -EINVAL;
+        } else {
+            result = guest_vsocket_property_stream_validate(&guest_sockets, fd,
+                flags, address, address_length_or_pointer);
+            entry = guest_vsocket_fd_get(&guest_sockets, fd);
+            if (result == 0 && guest_length == 0) {
+                result = 0;
+            } else if (result == 0 && buffer_address == 0) {
+                result = -EFAULT;
+            } else if (result == 0) {
+                size_t amount = guest_length > GUEST_VSOCKET_BUFFER_SIZE
+                    ? GUEST_VSOCKET_BUFFER_SIZE : (size_t)guest_length;
+                unsigned char buffer[GUEST_VSOCKET_BUFFER_SIZE];
+                if (!receive) {
+                    if (read_remote(pid, buffer_address, buffer, amount) != 0)
+                        result = -EFAULT;
+                    else
+                        result = guest_vsocket_sendto(&guest_sockets, fd, buffer,
+                            amount, flags, address, (uint32_t)address_length_or_pointer);
+                } else {
+                    result = guest_vsocket_peek(&guest_sockets, fd, buffer, amount, 0);
+                    if (result > 0) {
+                        if (write_remote(pid, buffer_address, buffer,
+                                         (size_t)result) != 0) {
+                            result = -EFAULT;
+                        } else if (guest_vsocket_consume(&guest_sockets, fd,
+                                                        (size_t)result) != 0) {
+                            result = -EIO;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    virtual_socket_calls++;
+    if (receive) virtual_property_recvfrom_count++;
+    else virtual_property_sendto_count++;
+    if (result < 0) virtual_property_stream_errors++;
+    else if (result > 0) {
+        if (receive) virtual_property_recvfrom_bytes += (unsigned long)result;
+        else virtual_property_sendto_bytes += (unsigned long)result;
+    }
+    size_t queued = 0;
+    if (entry) {
+        struct guest_vsocket_channel *channel =
+            guest_vsocket_channel_get(&guest_sockets, entry->channel);
+        if (channel)
+            queued = channel->data_len[receive ? entry->side : 1 - entry->side];
+    }
+    if (virtual_property_stream_diagnostics < 64u) {
+        virtual_property_stream_diagnostics++;
+        printf("VIRTUAL PROPERTY STREAM SYSCALL: host-pid=%d guest-pid=%d executable=%s syscall=%s fd=%d len=%u flags=0x%x address=0x%08x address-length-or-pointer=0x%08x result=%d%s%s queue-after=%zu; app-private connected AF_UNIX stream only, host socket API not called\n",
+               pid, state ? state->guest_pid : -1,
+               state && state->exec_target[0] ? state->exec_target : "<unknown>",
+               receive ? "recvfrom" : "sendto", fd, guest_length,
+               (unsigned)flags, (unsigned)address,
+               (unsigned)address_length_or_pointer, result,
+               result < 0 ? " errno=" : "",
+               result < 0 ? guest_diag_errno_name(-result) : "", queued);
     }
     return result;
 }
@@ -3281,6 +3379,11 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
                                                    regs->uregs[2], regs->uregs[3]);
         *fake = 1; return 0;
     }
+    if (nr == ARM_NR_SENDTO || nr == ARM_NR_RECVFROM) {
+        *pending_return = virtual_guest_property_stream_io(pid, regs,
+                                                            nr == ARM_NR_RECVFROM);
+        *fake = 1; return 0;
+    }
     if (nr == ARM_NR_SEND || nr == ARM_NR_RECV) {
         int fd = (int32_t)regs->uregs[0];
         if (is_virtual_fd_number(fd)) {
@@ -4063,20 +4166,26 @@ int main(int argc, char **argv) {
     int rc = run_trace((pid_t)child, &exit_code, &exit_signal);
     traced_pid = -1;
     printf("INITIAL /init POST-EXEC: %s\n", saw_exec ? "SIGTRAP observed" : "not observed");
-    printf("CONTINUOUS PROCESS TREE: fork/clone/vfork events=%lu; guest exec events=%lu; dynamic execs redirected=%lu; kernel entries into original guest linker=%lu; target ELF code syscall-PCs=%lu (shell=%lu app_process=%lu); literal ET_EXEC e_entry syscall-PC hits=%lu; C main symbol unproven\n",
+    printf("CONTINUOUS PROCESS TREE: fork/clone/vfork events=%lu; guest exec events=%lu; dynamic execs redirected=%lu; kernel entries into original guest linker=%lu; target ELF code syscall-PCs=%lu (shell=%lu app_process=%lu); literal ET_EXEC e_entry syscall-PC hits=%lu (app_process=%lu ueventd=%lu other=%lu); C main symbol unproven\n",
            process_events, successful_guest_execs, dynamic_exec_allowed_count,
            dynamic_exec_started_count, guest_target_elf_text_entry_count,
            guest_shell_elf_text_entry_count, guest_app_process_elf_text_entry_count,
-           guest_target_elf_declared_entry_pc_count);
+           guest_target_elf_declared_entry_pc_count,
+           guest_app_process_declared_entry_pc_count,
+           guest_ueventd_declared_entry_pc_count,
+           guest_other_declared_entry_pc_count);
     printf("TRACE REGISTRY: hard-cap=%d; active-at-stop=%zu; maximum-active=%zu; registry-high-water=%zu; safely-reused-slots=%zu; terminal-thread-releases=%lu; retained-unreaped=%zu; process-limit-hit=%d\n",
            MAX_TRACEES, tracee_slot_pool.active_count,
            tracee_slot_pool.maximum_active, tracee_slot_pool.high_water,
            tracee_slot_pool.reused_count, guest_thread_ptrace_exits,
            guest_tracee_slot_retained_count(&tracee_slot_pool), process_limit_hit);
-    printf("GUEST STARTUP STAGE SUMMARY: original-init-post-exec=%s; original-linker-entry-events=%lu; target-ELF-code-syscall-PCs=%lu; ET_EXEC-e_entry-PC-hits=%lu; qemud-execs=%lu exits=%lu last-exit=%d; qemu-props-execs=%lu; C-main/Zygote/framework/system_server/desktop=unproven\n",
+    printf("GUEST STARTUP STAGE SUMMARY: original-init-post-exec=%s; original-linker-entry-events=%lu; target-ELF-code-syscall-PCs=%lu; app_process-code-PCs=%lu; ET_EXEC-e_entry-PC-hits=%lu (app_process=%lu ueventd=%lu other=%lu); qemud-execs=%lu exits=%lu last-exit=%d; qemu-props-execs=%lu; C-main/Zygote/framework/system_server/desktop=unproven\n",
            saw_exec ? "observed" : "not-observed", dynamic_exec_started_count,
-           guest_target_elf_text_entry_count,
+           guest_target_elf_text_entry_count, guest_app_process_elf_text_entry_count,
            guest_target_elf_declared_entry_pc_count,
+           guest_app_process_declared_entry_pc_count,
+           guest_ueventd_declared_entry_pc_count,
+           guest_other_declared_entry_pc_count,
            guest_qemud_exec_count, guest_qemud_exit_count,
            guest_qemud_last_exit_code, guest_qemu_props_exec_count);
     printf("GUEST SCRIPT LAUNCH SUMMARY: approved-routes=%lu; exec-events=%lu; guest-shell=%s; guest-script=%s; host-shell-exec=0; network-effects=guest-software-broker-only\n",
@@ -4121,7 +4230,11 @@ int main(int argc, char **argv) {
            coldboot_observation.pid1_stat_succeeded_after_marker,
            coldboot_observation.marker_stat_pair_observed,
            coldboot_observation.pid1_stat_checks);
-    printf("VIRTUAL PROPERTY/SIGNAL SOCKET SUMMARY: created=%lu binds=%lu connects=%lu accepts=%lu signal-pairs=%lu; host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv calls=0\n",
+    printf("VIRTUAL PROPERTY STREAM SUMMARY: ARM sendto=%lu bytes=%lu recvfrom=%lu bytes=%lu errors=%lu diagnostics-emitted=%lu (limit=64); fixed API10 setprop request size=128 bytes; sendto/recvfrom supported only with flags=0 and NULL address outputs/inputs\n",
+           virtual_property_sendto_count, virtual_property_sendto_bytes,
+           virtual_property_recvfrom_count, virtual_property_recvfrom_bytes,
+           virtual_property_stream_errors, virtual_property_stream_diagnostics);
+    printf("VIRTUAL PROPERTY/SIGNAL SOCKET SUMMARY: created=%lu binds=%lu connects=%lu accepts=%lu signal-pairs=%lu; host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv/sendto/recvfrom calls=0\n",
            virtual_property_socket_count, virtual_property_bind_count,
            virtual_property_connect_count, virtual_property_accept_count,
            virtual_socketpair_count);

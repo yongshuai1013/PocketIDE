@@ -94,6 +94,8 @@ static inline const char *guest_diag_syscall_name(int number) {
         case 284: return "listen";
         case 285: return "accept";
         case 288: return "socketpair";
+        case 290: return "sendto";
+        case 292: return "recvfrom";
         case 297: return "recvmsg";
         case 314: return "ioprio_set";
         case 322: return "openat";
@@ -117,6 +119,10 @@ static inline const char *guest_diag_errno_name(int error_number) {
         case EINVAL: return "EINVAL";
         case EBADF: return "EBADF";
         case EEXIST: return "EEXIST";
+        case ENOTSOCK: return "ENOTSOCK";
+        case ENOTCONN: return "ENOTCONN";
+        case EPIPE: return "EPIPE";
+        case EOPNOTSUPP: return "EOPNOTSUPP";
         default: return "ERRNO";
     }
 }

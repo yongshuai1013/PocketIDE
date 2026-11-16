@@ -436,6 +436,56 @@ static inline int guest_vsocket_recv(struct guest_vsocket_table *table, int fd,
     return guest_vsocket_consume(table, fd, (size_t)result) == 0 ? result : -EIO;
 }
 
+/* API10 property clients use send()/recv() on a connected AF_UNIX stream.
+ * ARM EABI lowers these to sendto/recvfrom with flags=0 and NULL address
+ * arguments. Keep this adapter narrower than the generic signal-pair stream. */
+static inline int guest_vsocket_property_stream_validate(
+        struct guest_vsocket_table *table, int fd, int flags,
+        uintptr_t address, uintptr_t address_length_or_pointer) {
+    struct guest_vsocket_fd *entry = guest_vsocket_fd_get(table, fd);
+    if (!entry) return guest_vsocket_fd_number_reserved(fd) ? -EBADF : -ENOTSOCK;
+    if (entry->kind != VIRTUAL_FD_PROPERTY &&
+        entry->kind != VIRTUAL_FD_PROPERTY_ACCEPTED) return -ENOTSOCK;
+    if (flags != 0) return -EOPNOTSUPP;
+    if (address != 0 || address_length_or_pointer != 0) return -EOPNOTSUPP;
+    if (entry->channel < 0) return -ENOTCONN;
+    struct guest_vsocket_channel *channel =
+        guest_vsocket_channel_get(table, entry->channel);
+    if (!channel || channel->kind != GUEST_VSOCKET_CHANNEL_PROPERTY)
+        return -ENOTCONN;
+    if (entry->side == 0) {
+        if (entry->kind != VIRTUAL_FD_PROPERTY || channel->fd[0] != fd)
+            return -ENOTCONN;
+    } else if (entry->side == 1) {
+        if (entry->kind != VIRTUAL_FD_PROPERTY_ACCEPTED ||
+            channel->fd[1] != fd || channel->pending) return -ENOTCONN;
+    } else {
+        return -ENOTCONN;
+    }
+    if (channel->closed[entry->side]) return -EBADF;
+    return 0;
+}
+
+static inline int guest_vsocket_sendto(struct guest_vsocket_table *table, int fd,
+                                       const void *data, size_t length, int flags,
+                                       uintptr_t destination, uint32_t address_length) {
+    int valid = guest_vsocket_property_stream_validate(
+        table, fd, flags, destination, address_length);
+    if (valid != 0) return valid;
+    if (length > (size_t)INT32_MAX) return -EINVAL;
+    return guest_vsocket_send(table, fd, data, length, 0);
+}
+
+static inline int guest_vsocket_recvfrom(struct guest_vsocket_table *table, int fd,
+                                         void *out, size_t length, int flags,
+                                         uintptr_t source, uintptr_t source_length_pointer) {
+    int valid = guest_vsocket_property_stream_validate(
+        table, fd, flags, source, source_length_pointer);
+    if (valid != 0) return valid;
+    if (length > (size_t)INT32_MAX) return -EINVAL;
+    return guest_vsocket_recv(table, fd, out, length, 0);
+}
+
 static inline int guest_vsocket_poll_events(struct guest_vsocket_table *table,
                                             int fd, int16_t events) {
     struct guest_vsocket_fd *entry = guest_vsocket_fd_get(table, fd);
