@@ -47,10 +47,23 @@ chmod 755 "$OUT64/libgingervm_init_supervisor.so" "$OUT32/libgingervm_guest_init
 python3 "$ROOT/tests/stage_init_assets.py" \
   "$GUEST_STAGING" "$SYSTEM_TREE" "$ASSETS" "$OUT32"
 
-"$READELF" -h "$OUT64/libgingervm_init_supervisor.so" | grep -Eq 'Class:.*ELF64'
-"$READELF" -h "$OUT64/libgingervm_init_supervisor.so" | grep -Eq 'Machine:.*AArch64'
-"$READELF" -h "$OUT32/libgingervm_guest_init.so" | grep -Eq 'Class:.*ELF32'
-"$READELF" -h "$OUT32/libgingervm_guest_init.so" | grep -Eq 'Machine:.*ARM'
+verify_elf_header() {
+  local binary="$1" class_pattern="$2" machine_pattern="$3" header
+  if ! header=$("$READELF" -h "$binary" 2>&1); then
+    printf 'ELF header inspection failed for %s:\n%s\n' "$binary" "$header" >&2
+    return 1
+  fi
+  if ! grep -Eq "$class_pattern" <<<"$header"; then
+    printf 'ELF class mismatch for %s (expected %s):\n%s\n' "$binary" "$class_pattern" "$header" >&2
+    return 1
+  fi
+  if ! grep -Eq "$machine_pattern" <<<"$header"; then
+    printf 'ELF machine mismatch for %s (expected %s):\n%s\n' "$binary" "$machine_pattern" "$header" >&2
+    return 1
+  fi
+}
+verify_elf_header "$OUT64/libgingervm_init_supervisor.so" 'Class:.*ELF64' 'Machine:.*AArch64'
+verify_elf_header "$OUT32/libgingervm_guest_init.so" 'Class:.*ELF32' 'Machine:.*ARM'
 
 printf '%s\n' 'Continuous ARM64 supervisor and original static init staged; complete API10 userland native payloads staged.'
 printf 'ARM64 supervisor: %s\n' "$OUT64/libgingervm_init_supervisor.so"
