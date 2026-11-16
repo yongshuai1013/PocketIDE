@@ -47,6 +47,7 @@
 #include "guest_framebuffer_virtual.h"
 #include "guest_identity_compat.h"
 #include "guest_binder_virtual.h"
+#include "guest_syscall_abi.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -331,6 +332,7 @@ static char guest_root[PATH_MAX];
 static char native_guest_root[PATH_MAX];
 static const char *guest_program = "/init";
 static char guest_frame_directory[PATH_MAX];
+static int guest_frame_directory_fd = -1;
 static int guest_frame_channel_ready;
 static unsigned long guest_frame_published_count;
 static struct guest_framebuffer_model guest_fb0_model;
@@ -349,18 +351,20 @@ static void configure_guest_frame_channel(void) {
     const char *configured = getenv(GUEST_FRAME_CHANNEL_ENV);
     if (configured && configured[0]) {
         struct guest_frame_channel_validation_detail validation;
-        int rc = guest_frame_channel_validate_app_private_directory_ex(
+        int rc = guest_frame_channel_open_app_private_sibling_ex(
             configured, guest_root, getuid(), &validation);
-        if (rc == 1) {
+        if (rc >= 0) {
             size_t length = strlen(configured);
             memcpy(guest_frame_directory, configured, length + 1);
+            guest_frame_directory_fd = rc;
             guest_frame_channel_ready = 1;
-            printf("GUEST FRAME CHANNEL CONFIG: ready=1 path=%s guest-root=%s owner=%u mode=0700; exact app-private sibling; atomic GVMF/1 packets; no pixels claimed\n",
+            printf("GUEST FRAME CHANNEL CONFIG: ready=1 path=%s guest-root=%s owner=%u mode=0700; parent directory identities match, guest-root/channel leaves opened O_NOFOLLOW; atomic GVMF/1 packets; no pixels claimed\n",
                    configured, guest_root, (unsigned)getuid());
             guest_framebuffer_model_init(&guest_fb0_model);
             char backing_path[PATH_MAX];
-            rc = guest_fb0_prepare_app_private_backing(guest_frame_directory,
-                guest_root, backing_path, sizeof(backing_path), &guest_fb0_backing_fd);
+            rc = guest_fb0_prepare_app_private_backing_at(guest_frame_directory_fd,
+                guest_frame_directory, backing_path, sizeof(backing_path),
+                &guest_fb0_backing_fd);
             if (rc == 0 && fstat(guest_fb0_backing_fd, &guest_fb0_backing_stat) == 0) {
                 guest_fb0_backend_ready = 1;
                 printf("GUEST FB0 SOFTWARE BACKEND: ready=1 path=%s profile=%s %ux%u RGB565 double-buffer-bytes=%u source=Goldfish-fbdev-model; no host framebuffer/MMIO/IRQ/QEMU used\n",
@@ -393,8 +397,8 @@ static void configure_guest_frame_channel(void) {
 }
 
 int gingervm_publish_guest_frame_from_fb(const guest_frame_packet *frame) {
-    if (!guest_frame_channel_ready || !guest_frame_directory[0]) return -ENODEV;
-    int rc = guest_frame_channel_publish_file(guest_frame_directory, frame);
+    if (!guest_frame_channel_ready || guest_frame_directory_fd < 0) return -ENODEV;
+    int rc = guest_frame_channel_publish_file_at(guest_frame_directory_fd, frame);
     if (rc == 0) {
         ++guest_frame_published_count;
         if (guest_frame_published_count == 1)
@@ -820,6 +824,19 @@ static void log_broker_denial_detail(pid_t host_pid, const struct tracee_state *
             reason ? reason : "unspecified", exe_truncated, path_truncated);
 }
 
+static const char *guest_mknod_mode_type(uint32_t mode) {
+    switch (mode & S_IFMT) {
+        case S_IFREG: return "regular";
+        case S_IFDIR: return "directory";
+        case S_IFCHR: return "character";
+        case S_IFBLK: return "block";
+        case S_IFIFO: return "fifo";
+        case S_IFLNK: return "symlink";
+        case S_IFSOCK: return "socket";
+        default: return "unknown";
+    }
+}
+
 static void log_unbrokered_seccomp_sigsys_context(
         pid_t host_pid, const struct tracee_state *state, int siginfo_code,
         int sigsys_syscall, unsigned int sigsys_arch, void *sigsys_call_addr,
@@ -1177,7 +1194,7 @@ static int mediate_guest_fb0_ioctl(pid_t pid, struct tracee_state *state,
                        guest_fb0_model.software_base_update_acks);
                 if (state && state->fb_mapping_valid) {
                     int publish_rc = guest_fb0_capture_publish(
-                        guest_fb0_backing_fd, guest_frame_directory,
+                        guest_fb0_backing_fd, guest_frame_directory_fd,
                         &guest_fb0_model, guest_fb0_model.yoffset);
                     if (publish_rc == 0) {
                         guest_frame_published_count++;
@@ -4275,6 +4292,8 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
     if (policy == GUEST_SYSCALL_PATH_REWRITE) {
         int is_virtual = 0;
         int32_t result = 0;
+        if ((nr == ARM_NR_MKNOD || nr == ARM_NR_MKNODAT) && state)
+            state->last_guest_path[0] = '\0';
         int rc = path_syscall(pid, regs, nr, &result, &is_virtual);
         if ((nr == ARM_NR_MKNOD || nr == ARM_NR_MKNODAT) && rc != 1) {
             uint32_t requested_mode = regs->uregs[nr == ARM_NR_MKNOD ? 1u : 2u];
@@ -4282,6 +4301,10 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
             int32_t effective_result = rc == 0 ? result : rc;
             const char *path = state && state->last_guest_path[0]
                 ? state->last_guest_path : "<path-unavailable>";
+            char safe_path[GUEST_DIAGNOSTIC_TEXT_CAPACITY];
+            int path_truncated = guest_diag_escape(path, safe_path, sizeof(safe_path));
+            uint32_t device_major = guest_fb0_device_major(requested_device);
+            uint32_t device_minor = guest_fb0_device_minor(requested_device);
             const char *reason = "app-private-placeholder";
             if (strcmp(path, GUEST_FB0_PATH) == 0) {
                 reason = state ? guest_fb0_mknod_rejection_reason(
@@ -4297,12 +4320,14 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
             }
             if (guest_mknod_diagnostics_emitted < 64u) {
                 guest_mknod_diagnostics_emitted++;
-                printf("GUEST MKNOD MEDIATION: guest-pid=%d executable=%s path=%s syscall=%s dirfd=%d mode=0%o device=0x%x guest-euid=%u guest-fsgid=%u graphics-event=%d virtual=%d result=%d errno=%s reason=%s; device effects stay in app-private guest model\n",
+                printf("GUEST MKNOD MEDIATION: guest-pid=%d executable=%s path=\"%s\" path-truncated=%d syscall=%s dirfd=%d mode=0%o type=%s permissions=0%04o device=0x%08x major=%u minor=%u guest-euid=%u guest-fsgid=%u graphics-event=%d virtual=%d result=%d errno=%s reason=%s; device effects stay in app-private guest model\n",
                        state ? state->guest_pid : -1,
                        state && state->exec_target[0] ? state->exec_target : "<unknown>",
-                       path, guest_diag_syscall_name(nr),
+                       safe_path, path_truncated, guest_diag_syscall_name(nr),
                        nr == ARM_NR_MKNODAT ? (int32_t)regs->uregs[0] : AT_FDCWD,
-                       requested_mode, requested_device,
+                       requested_mode, guest_mknod_mode_type(requested_mode),
+                       requested_mode & 07777u, requested_device,
+                       device_major, device_minor,
                        state ? state->identity.euid : 0u,
                        state ? state->identity.fsgid : 0u,
                        guest_fb0_graphics_uevent_received, is_virtual,
@@ -4856,8 +4881,9 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     return 0;
                 }
             } else {
-                int32_t syscall_result = state->pending ? state->pending_return :
-                    (int32_t)regs.uregs[0];
+                uint32_t syscall_result_bits = state->pending
+                    ? (uint32_t)state->pending_return : (uint32_t)regs.uregs[0];
+                int32_t syscall_result = (int32_t)syscall_result_bits;
                 if (complete_guest_sigaction(waited, state, &regs, &syscall_result) != 0) {
                     fprintf(stderr, "cannot complete guest legacy sigaction translation pid=%d; terminating traced tree\n",
                             waited);
@@ -4865,8 +4891,9 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 }
                 record_guest_path_fd_result(state, &regs, syscall_result);
                 if (state->fb_mmap_pending) {
-                    if (state->last_syscall == ARM_NR_MMAP2 && syscall_result >= 0) {
-                        state->fb_mapping_start = (uint32_t)syscall_result;
+                    if (state->last_syscall == ARM_NR_MMAP2 &&
+                        !guest_arm32_syscall_result_is_error(syscall_result_bits)) {
+                        state->fb_mapping_start = syscall_result_bits;
                         state->fb_mapping_length = state->fb_pending_map_length;
                         state->fb_mapping_valid = 1;
                         printf("GUEST FB0 MMAP2: guest-pid=%d executable=%s fd=%d address=0x%08x length=%u prot=0x%x offset-pages=%u; shared mapping is the app-private software framebuffer backing, not /dev/fb0 on host\n",
@@ -4882,13 +4909,14 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     state->fb_mmap_pending = 0;
                 }
                 if (state->binder_mmap_pending) {
-                    if (state->last_syscall == ARM_NR_MMAP2 && syscall_result >= 0) {
+                    if (state->last_syscall == ARM_NR_MMAP2 &&
+                        !guest_arm32_syscall_result_is_error(syscall_result_bits)) {
                         int map_rc = guest_binder_note_mapping(&state->binder,
-                            (uint32_t)syscall_result,
+                            syscall_result_bits,
                             state->binder_pending_map_length);
                         if (map_rc == 0) guest_binder_state.mapping_successes++;
                         printf("GUEST BINDER MAPPING: guest-pid=%d address=0x%08x length=%u read-only=%d registration=%d; anonymous guest receive memory only, no Binder transaction buffers delivered\n",
-                               state->guest_pid, (uint32_t)syscall_result,
+                               state->guest_pid, syscall_result_bits,
                                state->binder_pending_map_length,
                                map_rc == 0, map_rc);
                     } else {
@@ -5214,6 +5242,8 @@ int main(int argc, char **argv) {
            broker_denial_diagnostics_emitted, broker_denial_diagnostics_suppressed,
            MAX_BROKER_DENIAL_DIAGNOSTICS, exec_failure_diagnostics_emitted,
            exec_failure_diagnostics_suppressed, MAX_EXEC_FAILURE_DIAGNOSTICS);
+    printf("GUEST MKNOD DIAGNOSTICS: emitted=%lu suppressed=%lu (limit=64); fb0 node is counted only for exact guest path, root:graphics identity, consumed add event and API10 mode/device tuple\n",
+           guest_mknod_diagnostics_emitted, guest_mknod_diagnostics_suppressed);
     printf("SIGSYS CONTEXT DIAGNOSTICS: emitted=%lu suppressed=%lu (limit=%u); non-placeholder SYS_SECCOMP records only; signal forwarding unchanged\n",
            sigsys_context_diagnostics_emitted, sigsys_context_diagnostics_suppressed,
            MAX_SIGSYS_CONTEXT_DIAGNOSTICS);
@@ -5293,6 +5323,11 @@ int main(int argc, char **argv) {
     else if (dynamic_exec_blocked) printf("STOP: unsupported dynamic guest exec; process tree stopped fail-closed\n");
     else printf("STOP: supervisor error\n");
     printf("HOST PRIVILEGED MOUNTS: 0 (host mount/umount were never invoked)\n");
+    if (guest_frame_directory_fd >= 0) {
+        if (close(guest_frame_directory_fd) != 0)
+            fprintf(stderr, "GUEST FRAME CHANNEL CLOSE: validated directory fd close failed errno=%d\n", errno);
+        guest_frame_directory_fd = -1;
+    }
     if (rc != 0) return 1;
     if (!saw_exec) return 1;
     if (trace_cancelled) return exit_code == 130 ? 130 : 1;

@@ -841,6 +841,9 @@ public final class MainActivity extends Activity {
 
     private String runNative(StringBuilder header, File supervisor, File guestExecutable, File guestRoot,
                              int timeoutSeconds, File allowedGuestLibraryDir, String... guestArgv) {
+        header.append("GINGERVM APP BUILD: versionName=").append(BuildConfig.VERSION_NAME)
+                .append(" versionCode=").append(BuildConfig.VERSION_CODE)
+                .append(" sourceCommit=").append(BuildConfig.GINGER_SOURCE_COMMIT).append('\n');
         java.lang.Process process;
         try {
             int traceMillis = Math.max(500, Math.min(120000, (timeoutSeconds - 3) * 1000));

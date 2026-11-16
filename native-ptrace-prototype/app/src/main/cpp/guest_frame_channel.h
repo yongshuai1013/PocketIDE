@@ -178,7 +178,35 @@ static inline int guest_frame_channel_open_private_directory(const char *directo
     return fd;
 }
 
-static inline int guest_frame_channel_validate_app_private_directory_ex(
+static inline int guest_frame_channel_split_absolute_path(const char *path,
+        char *parent, size_t parent_capacity, char *leaf, size_t leaf_capacity) {
+    if (!path || path[0] != '/' || !parent || !leaf) return -EINVAL;
+    size_t length = strlen(path);
+    if (length < 2u || length >= PATH_MAX || path[length - 1u] == '/') return -EINVAL;
+    const char *slash = strrchr(path, '/');
+    if (!slash || slash[1] == '\0') return -EINVAL;
+    size_t parent_length = slash == path ? 1u : (size_t)(slash - path);
+    size_t leaf_length = length - (size_t)(slash + 1u - path);
+    if (parent_length >= parent_capacity || leaf_length == 0u || leaf_length >= leaf_capacity)
+        return -ENAMETOOLONG;
+    memcpy(parent, path, parent_length);
+    parent[parent_length] = '\0';
+    memcpy(leaf, slash + 1, leaf_length + 1u);
+    const char *component = path + 1;
+    while (*component) {
+        const char *end = strchr(component, '/');
+        size_t component_length = end ? (size_t)(end - component) : strlen(component);
+        if (component_length == 0u ||
+            (component_length == 1u && component[0] == '.') ||
+            (component_length == 2u && component[0] == '.' && component[1] == '.'))
+            return -EACCES;
+        if (!end) break;
+        component = end + 1;
+    }
+    return 0;
+}
+
+static inline int guest_frame_channel_open_app_private_sibling_ex(
         const char *directory, const char *guest_root, uid_t expected_owner,
         struct guest_frame_channel_validation_detail *detail) {
     struct guest_frame_channel_validation_detail value;
@@ -190,24 +218,29 @@ static inline int guest_frame_channel_validate_app_private_directory_ex(
         if (detail) *detail = value;
         return -EINVAL;
     }
-    char parent[PATH_MAX];
-    size_t root_len = strlen(guest_root);
-    if (root_len == 0 || root_len >= sizeof(parent)) {
+    char root_parent[PATH_MAX], channel_parent[PATH_MAX];
+    char root_leaf[NAME_MAX + 1u], channel_leaf[NAME_MAX + 1u];
+    int split_rc = guest_frame_channel_split_absolute_path(guest_root,
+        root_parent, sizeof(root_parent), root_leaf, sizeof(root_leaf));
+    if (split_rc == 0)
+        split_rc = guest_frame_channel_split_absolute_path(directory,
+            channel_parent, sizeof(channel_parent), channel_leaf, sizeof(channel_leaf));
+    if (split_rc != 0) {
+        value.reason = split_rc == -ENAMETOOLONG ? GUEST_FRAME_CHANNEL_PATH_TOO_LONG :
+                       GUEST_FRAME_CHANNEL_INVALID_ARGUMENT;
+        value.error_number = -split_rc;
+        if (detail) *detail = value;
+        return split_rc;
+    }
+    size_t root_len = strlen(root_parent);
+    if (root_len >= sizeof(value.expected_path)) {
         value.reason = GUEST_FRAME_CHANNEL_PATH_TOO_LONG;
         value.error_number = ENAMETOOLONG;
         if (detail) *detail = value;
         return -ENAMETOOLONG;
     }
-    memcpy(parent, guest_root, root_len + 1);
-    char *slash = strrchr(parent, '/');
-    if (!slash) {
-        if (detail) *detail = value;
-        return -EINVAL;
-    }
-    if (slash == parent) slash[1] = '\0';
-    else *slash = '\0';
-    int n = snprintf(value.expected_path, sizeof(value.expected_path), "%s%s%s", parent,
-                     strcmp(parent, "/") == 0 ? "" : "/",
+    int n = snprintf(value.expected_path, sizeof(value.expected_path), "%s%s%s", root_parent,
+                     strcmp(root_parent, "/") == 0 ? "" : "/",
                      GUEST_FRAME_CHANNEL_DIRECTORY);
     if (n <= 0 || (size_t)n >= sizeof(value.expected_path)) {
         value.reason = GUEST_FRAME_CHANNEL_PATH_TOO_LONG;
@@ -215,13 +248,105 @@ static inline int guest_frame_channel_validate_app_private_directory_ex(
         if (detail) *detail = value;
         return -ENAMETOOLONG;
     }
-    if (strcmp(directory, value.expected_path) != 0) {
+    if (strcmp(channel_leaf, GUEST_FRAME_CHANNEL_DIRECTORY) != 0) {
         value.reason = GUEST_FRAME_CHANNEL_NOT_EXACT_SIBLING;
         value.error_number = EACCES;
         if (detail) *detail = value;
         return -EACCES;
     }
-    int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+
+    int root_parent_fd = open(root_parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (root_parent_fd < 0) {
+        value.reason = GUEST_FRAME_CHANNEL_OPEN_FAILED;
+        value.error_number = errno;
+        if (detail) *detail = value;
+        return -errno;
+    }
+    int channel_parent_fd = open(channel_parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (channel_parent_fd < 0) {
+        int saved = errno;
+        close(root_parent_fd);
+        value.reason = GUEST_FRAME_CHANNEL_OPEN_FAILED;
+        value.error_number = saved;
+        if (detail) *detail = value;
+        return -saved;
+    }
+    struct stat root_parent_stat, channel_parent_stat;
+    if (fstat(root_parent_fd, &root_parent_stat) != 0 ||
+        fstat(channel_parent_fd, &channel_parent_stat) != 0) {
+        int saved = errno;
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.reason = GUEST_FRAME_CHANNEL_FSTAT_FAILED;
+        value.error_number = saved;
+        if (detail) *detail = value;
+        return -saved;
+    }
+    if (!S_ISDIR(root_parent_stat.st_mode) || !S_ISDIR(channel_parent_stat.st_mode) ||
+        root_parent_stat.st_dev != channel_parent_stat.st_dev ||
+        root_parent_stat.st_ino != channel_parent_stat.st_ino) {
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.reason = GUEST_FRAME_CHANNEL_NOT_EXACT_SIBLING;
+        value.error_number = EACCES;
+        if (detail) *detail = value;
+        return -EACCES;
+    }
+    if (root_parent_stat.st_uid != expected_owner || channel_parent_stat.st_uid != expected_owner) {
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.reason = GUEST_FRAME_CHANNEL_WRONG_OWNER;
+        value.error_number = EACCES;
+        if (detail) *detail = value;
+        return -EACCES;
+    }
+    if ((root_parent_stat.st_mode & 0077) != 0 || (channel_parent_stat.st_mode & 0077) != 0) {
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.reason = GUEST_FRAME_CHANNEL_NOT_PRIVATE;
+        value.error_number = EACCES;
+        if (detail) *detail = value;
+        return -EACCES;
+    }
+
+    int root_fd = openat(root_parent_fd, root_leaf,
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (root_fd < 0) {
+        int saved = errno;
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.reason = GUEST_FRAME_CHANNEL_OPEN_FAILED;
+        value.error_number = saved;
+        if (detail) *detail = value;
+        return -saved;
+    }
+    struct stat root_stat;
+    if (fstat(root_fd, &root_stat) != 0) {
+        int saved = errno;
+        close(root_fd);
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.reason = GUEST_FRAME_CHANNEL_FSTAT_FAILED;
+        value.error_number = saved;
+        if (detail) *detail = value;
+        return -saved;
+    }
+    if (!S_ISDIR(root_stat.st_mode) || root_stat.st_uid != expected_owner) {
+        close(root_fd);
+        close(channel_parent_fd);
+        close(root_parent_fd);
+        value.reason = S_ISDIR(root_stat.st_mode) ? GUEST_FRAME_CHANNEL_WRONG_OWNER :
+                       GUEST_FRAME_CHANNEL_NOT_DIRECTORY;
+        value.error_number = S_ISDIR(root_stat.st_mode) ? EACCES : ENOTDIR;
+        if (detail) *detail = value;
+        return -value.error_number;
+    }
+    close(root_fd);
+
+    int fd = openat(channel_parent_fd, channel_leaf,
+                    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    close(channel_parent_fd);
+    close(root_parent_fd);
     if (fd < 0) {
         value.reason = GUEST_FRAME_CHANNEL_OPEN_FAILED;
         value.error_number = errno;
@@ -261,10 +386,19 @@ static inline int guest_frame_channel_validate_app_private_directory_ex(
         if (detail) *detail = value;
         return -EACCES;
     }
-    close(fd);
     value.reason = GUEST_FRAME_CHANNEL_VALID;
     value.error_number = 0;
     if (detail) *detail = value;
+    return fd;
+}
+
+static inline int guest_frame_channel_validate_app_private_directory_ex(
+        const char *directory, const char *guest_root, uid_t expected_owner,
+        struct guest_frame_channel_validation_detail *detail) {
+    int fd = guest_frame_channel_open_app_private_sibling_ex(
+        directory, guest_root, expected_owner, detail);
+    if (fd < 0) return fd;
+    close(fd);
     return 1;
 }
 
@@ -288,13 +422,15 @@ static inline int guest_frame_write_all(int fd, const unsigned char *data, size_
     return 0;
 }
 
-static inline int guest_frame_channel_publish_file(const char *directory,
-                                                    const guest_frame_packet *frame) {
+static inline int guest_frame_channel_publish_file_at(int dirfd,
+                                                       const guest_frame_packet *frame) {
     uint32_t payload_bytes = 0;
     int rc = guest_frame_channel_profile_valid(frame, &payload_bytes);
     if (rc != 0) return rc;
-    int dirfd = guest_frame_channel_open_private_directory(directory);
-    if (dirfd < 0) return dirfd;
+    struct stat directory_stat;
+    if (fstat(dirfd, &directory_stat) != 0) return -errno;
+    if (!S_ISDIR(directory_stat.st_mode) || directory_stat.st_uid != getuid() ||
+        (directory_stat.st_mode & 0077) != 0) return -EACCES;
 
     unsigned char header[GUEST_FRAME_PROTOCOL_HEADER_BYTES];
     memset(header, 0, sizeof(header));
@@ -326,24 +462,18 @@ static inline int guest_frame_channel_publish_file(const char *directory,
     (void)unlinkat(dirfd, GUEST_FRAME_CHANNEL_TEMP_FILE, 0);
     int fd = openat(dirfd, GUEST_FRAME_CHANNEL_TEMP_FILE,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd < 0) {
-        int saved = errno;
-        close(dirfd);
-        return -saved;
-    }
+    if (fd < 0) return -errno;
     struct stat st;
     if (fstat(fd, &st) != 0) {
         int saved = errno;
         close(fd);
         (void)unlinkat(dirfd, GUEST_FRAME_CHANNEL_TEMP_FILE, 0);
-        close(dirfd);
         return -saved;
     }
     if (!S_ISREG(st.st_mode) || st.st_uid != getuid()) {
         int saved = EACCES;
         close(fd);
         (void)unlinkat(dirfd, GUEST_FRAME_CHANNEL_TEMP_FILE, 0);
-        close(dirfd);
         return -saved;
     }
     rc = guest_frame_write_all(fd, header, sizeof(header));
@@ -354,7 +484,15 @@ static inline int guest_frame_channel_publish_file(const char *directory,
                             dirfd, GUEST_FRAME_CHANNEL_FILE) != 0) rc = -errno;
     if (rc == 0 && fsync(dirfd) != 0) rc = -errno;
     if (rc != 0) (void)unlinkat(dirfd, GUEST_FRAME_CHANNEL_TEMP_FILE, 0);
-    close(dirfd);
+    return rc;
+}
+
+static inline int guest_frame_channel_publish_file(const char *directory,
+                                                    const guest_frame_packet *frame) {
+    int dirfd = guest_frame_channel_open_private_directory(directory);
+    if (dirfd < 0) return dirfd;
+    int rc = guest_frame_channel_publish_file_at(dirfd, frame);
+    if (close(dirfd) != 0 && rc == 0) rc = -errno;
     return rc;
 }
 

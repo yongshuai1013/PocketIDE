@@ -7,6 +7,9 @@ def testSigningPassword = System.getenv('GINGERVM_SIGNING_PASSWORD')
 def testSigningAlias = System.getenv('GINGERVM_SIGNING_KEY_ALIAS')
 def testSigningValues = [testSigningStore, testSigningPassword, testSigningAlias]
 def useTestSigning = testSigningValues.any { it != null && !it.isEmpty() }
+def gingerSourceCommit = System.getenv('GITHUB_SHA')
+if (!gingerSourceCommit) gingerSourceCommit = 'local-uncommitted'
+else if (!(gingerSourceCommit ==~ /[0-9a-fA-F]{40}/)) gingerSourceCommit = 'unknown'
 if (useTestSigning && testSigningValues.any { it == null || it.isEmpty() }) {
     throw new GradleException('Incomplete GingerVM test-signing configuration.')
 }
@@ -14,13 +17,17 @@ if (useTestSigning && testSigningValues.any { it == null || it.isEmpty() }) {
 android {
     namespace 'dev.gingervm.nativeprobe'
     compileSdk 35
+    buildFeatures {
+        buildConfig true
+    }
 
     defaultConfig {
         applicationId 'dev.gingervm.nativeprobe'
         minSdk 23
         targetSdk 35
-        versionCode 29
-        versionName '0.6.20'
+        versionCode 30
+        versionName '0.6.21'
+        buildConfigField 'String', 'GINGER_SOURCE_COMMIT', "\"${gingerSourceCommit}\""
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a'
         }

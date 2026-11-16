@@ -45,6 +45,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_binder_virtual_test.c" -o "$TMP/guest_binder_virtual_test"
 "$TMP/guest_binder_virtual_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_syscall_abi_test.c" -o "$TMP/guest_syscall_abi_test"
+"$TMP/guest_syscall_abi_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_uevent_virtual_test.c" -o "$TMP/guest_uevent_virtual_test"
 "$TMP/guest_uevent_virtual_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -151,6 +154,8 @@ pending_child_stop_test = Path(sys.argv[1]).parents[4].joinpath('tests/ptrace_ch
 device_boundary = Path(sys.argv[1]).with_name('guest_device_boundary.h').read_text()
 binder_model = Path(sys.argv[1]).with_name('guest_binder_virtual.h').read_text()
 binder_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_binder_virtual_test.c').read_text()
+syscall_abi = Path(sys.argv[1]).with_name('guest_syscall_abi.h').read_text()
+syscall_abi_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_syscall_abi_test.c').read_text()
 sigmask_compat = Path(sys.argv[1]).with_name('guest_sigprocmask_compat.h').read_text()
 sigmask_ptrace = Path(sys.argv[1]).with_name('guest_sigprocmask_ptrace.h').read_text()
 frame_channel = Path(sys.argv[1]).with_name('guest_frame_channel.h').read_text()
@@ -352,6 +357,11 @@ assert 'pty-kernel-backend-not-implemented' in device_boundary
 assert 'binder-software-bootstrap-only-no-ipc-transactions' in device_boundary
 assert 'GUEST BINDER OPEN:' in src and 'GUEST BINDER IOCTL DENIED:' in src
 assert 'GUEST BINDER MMAP ROUTE:' in src and 'GUEST BINDER MAPPING:' in src
+assert 'guest_arm32_syscall_result_is_error(syscall_result_bits)' in src
+assert 'uint32_t syscall_result_bits' in src
+assert '0xe9380000u' in binder_test and '0xffff0000u' in binder_test
+assert '0xe9380000u' in syscall_abi_test and '0xfffff001u' in syscall_abi_test
+assert 'result_bits >= GUEST_ARM32_ERRNO_MIN' in syscall_abi
 assert 'GUEST BINDER BLOCKED READ:' in src and 'guest-software-blocked-read' in src
 assert 'no guest transaction queue exists, remains parked until bounded timeout/cancel' in src
 assert 'GUEST BINDER FD OP DENIED:' in src and 'GUEST BINDER STREAM IO DENIED:' in src
@@ -438,6 +448,11 @@ assert 'GUEST_FRAME_SOURCE_GUEST_FRAMEBUFFER 1u' in frame_channel
 assert 'GUEST_FRAME_SOURCE_TEST_ONLY 2u' in frame_channel
 assert 'GUEST_FRAME_MAX_PAYLOAD_BYTES 8388608u' in frame_channel
 assert 'guest_frame_channel_validate_app_private_directory' in frame_channel
+assert 'guest_frame_channel_open_app_private_sibling_ex' in frame_channel
+assert 'root_parent_stat.st_dev != channel_parent_stat.st_dev' in frame_channel
+assert 'root_parent_stat.st_ino != channel_parent_stat.st_ino' in frame_channel
+assert 'openat(root_parent_fd, root_leaf' in frame_channel and 'openat(channel_parent_fd, channel_leaf' in frame_channel
+assert 'guest_frame_channel_publish_file_at' in frame_channel
 assert 'O_NOFOLLOW' in frame_channel and 'renameat(dirfd' in frame_channel
 assert 'guest_frame_channel_test.c' in network_test_runner and 'GuestFramePacketTest.java' in network_test_runner
 assert 'GUEST_FRAME_SOURCE_GUEST_FRAMEBUFFER' in frame_native_test and 'symlink(target_dir, link_dir)' in frame_native_test
@@ -450,8 +465,13 @@ assert 'payload checksum mismatch' in frame_packet and 'unsupported guest frameb
 assert 'GUEST FRAME CHANNEL CONFIG:' in src and 'unsetenv(GUEST_FRAME_CHANNEL_ENV)' in src
 assert 'expected-sibling=%s reason=%s' in src and 'guest_frame_channel_validation_reason_name(validation.reason)' in src
 assert 'frameGuestRoot.getParentFile()' in activity and 'new File(frameParent, GuestFramePacket.CHANNEL_DIRECTORY)' in activity
-assert 'GUEST MKNOD MEDIATION: guest-pid=%d executable=%s path=%s syscall=%s' in src
-assert 'gingervm_publish_guest_frame_from_fb' in src and 'guest_frame_channel_publish_file' in src
+assert 'GUEST MKNOD MEDIATION: guest-pid=%d executable=%s path=\\"%s\\" path-truncated=%d syscall=%s' in src
+assert 'mode=0%o type=%s permissions=0%04o device=0x%08x major=%u minor=%u' in src
+assert 'GUEST MKNOD DIAGNOSTICS: emitted=%lu suppressed=%lu' in src
+assert 'gingervm_publish_guest_frame_from_fb' in src and 'guest_frame_channel_publish_file_at' in src
+assert 'guest_fb0_backing_fd, guest_frame_directory_fd' in src
+assert 'BuildConfig.VERSION_NAME' in activity and 'BuildConfig.VERSION_CODE' in activity
+assert 'BuildConfig.GINGER_SOURCE_COMMIT' in activity
 main_source = src.split('int main(', 1)[1]
 assert main_source.index('configure_guest_frame_channel();') < main_source.index('start_guest(')
 assert 'GUEST FB0 OUTPUT SUMMARY:' in src and 'GUEST FB0 PAGE FLIP FRAME:' in src
@@ -463,6 +483,7 @@ assert 'GUEST FB0 GRAPHICS UEVENT RECEIVED:' in src and 'GUEST FB0 NODE CREATED:
 assert 'GUEST_FB0_IOCTL_GET_VSCREENINFO' in framebuffer_model
 assert 'GUEST_FB0_IOCTL_GET_FSCREENINFO' in framebuffer_model
 assert 'GUEST_FB0_IOCTL_PAN_DISPLAY' in framebuffer_model and 'guest_fb0_capture_publish' in framebuffer_model
+assert 'guest_frame_channel_publish_file_at(frame_directory_fd, &packet)' in framebuffer_model
 assert 'guest_fsgid != GUEST_FB0_OWNER_GID' in framebuffer_model
 assert 'GUEST_FB0_OWNER_GID GUEST_ID_AID_GRAPHICS' in framebuffer_model
 assert 'software_base_update_acks++' in framebuffer_model
@@ -714,11 +735,14 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.20-test-signed-apk' in upload
-assert 'gingervm-v0.6.20-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 29" in gradle and "versionName '0.6.20'" in gradle
+assert 'gingervm-continuous-trace-v0.6.21-test-signed-apk' in upload
+assert 'gingervm-v0.6.21-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 30" in gradle and "versionName '0.6.21'" in gradle
+assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
+assert "gingerSourceCommit = 'local-uncommitted'" in gradle
+assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.20' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.21' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

@@ -100,6 +100,14 @@ static inline uint32_t guest_fb0_makedev(uint32_t major, uint32_t minor) {
            ((minor & ~0xffu) << 12);
 }
 
+static inline uint32_t guest_fb0_device_major(uint32_t device) {
+    return (device >> 8) & 0xfffu;
+}
+
+static inline uint32_t guest_fb0_device_minor(uint32_t device) {
+    return (device & 0xffu) | ((device >> 12) & 0xffffff00u);
+}
+
 static inline const char *guest_fb0_mknod_rejection_reason(
         uint32_t guest_euid, uint32_t guest_fsgid,
         int graphics_uevent_received, uint32_t mode, uint32_t device) {
@@ -260,21 +268,19 @@ static inline int guest_fb0_validate_mmap(uint32_t length, uint32_t protection,
     return 0;
 }
 
-static inline int guest_fb0_prepare_app_private_backing(const char *directory,
-                                                       const char *guest_root,
-                                                       char *path, size_t path_capacity,
-                                                       int *backing_fd) {
-    if (!directory || !guest_root || !path || path_capacity == 0 || !backing_fd)
+static inline int guest_fb0_prepare_app_private_backing_at(int dirfd,
+        const char *directory, char *path, size_t path_capacity, int *backing_fd) {
+    if (dirfd < 0 || !directory || !path || path_capacity == 0 || !backing_fd)
         return -EINVAL;
     *backing_fd = -1;
-    int validated = guest_frame_channel_validate_app_private_directory(directory, guest_root);
-    if (validated != 1) return validated < 0 ? validated : -EACCES;
-    int dirfd = guest_frame_channel_open_private_directory(directory);
-    if (dirfd < 0) return dirfd;
+    struct stat directory_stat;
+    if (fstat(dirfd, &directory_stat) != 0) return -errno;
+    if (!S_ISDIR(directory_stat.st_mode) || directory_stat.st_uid != getuid() ||
+        (directory_stat.st_mode & 0077) != 0) return -EACCES;
     int fd = openat(dirfd, GUEST_FB0_BACKING_FILE,
                     O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     int saved = errno;
-    if (fd < 0) { close(dirfd); return -saved; }
+    if (fd < 0) return -saved;
     struct stat st;
     int rc = 0;
     if (fstat(fd, &st) != 0) rc = -errno;
@@ -285,17 +291,31 @@ static inline int guest_fb0_prepare_app_private_backing(const char *directory,
         rc = -errno;
     int n = snprintf(path, path_capacity, "%s/%s", directory, GUEST_FB0_BACKING_FILE);
     if (n <= 0 || (size_t)n >= path_capacity) rc = -ENAMETOOLONG;
-    if (close(dirfd) != 0 && rc == 0) rc = -errno;
     if (rc != 0) { close(fd); return rc; }
     *backing_fd = fd;
     return 0;
 }
 
+static inline int guest_fb0_prepare_app_private_backing(const char *directory,
+                                                       const char *guest_root,
+                                                       char *path, size_t path_capacity,
+                                                       int *backing_fd) {
+    if (!directory || !guest_root || !path || path_capacity == 0 || !backing_fd)
+        return -EINVAL;
+    int dirfd = guest_frame_channel_open_app_private_sibling_ex(
+        directory, guest_root, getuid(), NULL);
+    if (dirfd < 0) return dirfd;
+    int rc = guest_fb0_prepare_app_private_backing_at(dirfd, directory,
+        path, path_capacity, backing_fd);
+    if (close(dirfd) != 0 && rc == 0) rc = -errno;
+    return rc;
+}
+
 static inline int guest_fb0_capture_publish(int backing_fd,
-                                            const char *frame_directory,
+                                            int frame_directory_fd,
                                             struct guest_framebuffer_model *model,
                                             uint32_t yoffset) {
-    if (backing_fd < 0 || !frame_directory || !model ||
+    if (backing_fd < 0 || frame_directory_fd < 0 || !model ||
         yoffset > model->yres_virtual - model->yres) return -EINVAL;
     uint64_t byte_offset = (uint64_t)yoffset * guest_fb0_line_length();
     uint64_t frame_length = (uint64_t)guest_fb0_line_length() * model->yres;
@@ -329,7 +349,7 @@ static inline int guest_fb0_capture_publish(int backing_fd,
         .sequence = model->sequence + 1u,
         .pixels = pixels,
     };
-    int rc = guest_frame_channel_publish_file(frame_directory, &packet);
+    int rc = guest_frame_channel_publish_file_at(frame_directory_fd, &packet);
     free(pixels);
     if (rc == 0) {
         model->sequence++;

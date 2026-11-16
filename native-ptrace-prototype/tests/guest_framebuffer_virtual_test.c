@@ -55,6 +55,10 @@ int main(int argc, char **argv) {
     assert(guest_fb0_open_ready(1, 0, 0) == -ENOENT);
     assert(guest_fb0_open_ready(1, 1, 0) == -ENOENT);
     assert(guest_fb0_open_ready(1, 1, 1) == 0);
+    assert(guest_fb0_device_major(guest_fb0_makedev(29, 0)) == 29u);
+    assert(guest_fb0_device_minor(guest_fb0_makedev(29, 0)) == 0u);
+    assert(guest_fb0_device_major(guest_fb0_makedev(1, 11)) == 1u);
+    assert(guest_fb0_device_minor(guest_fb0_makedev(1, 11)) == 11u);
     assert(strcmp(guest_fb0_mknod_rejection_reason(1000, GUEST_FB0_OWNER_GID,
         1, GUEST_FB0_MODE, guest_fb0_makedev(29, 0)), "guest-euid-not-root") == 0);
     assert(strcmp(guest_fb0_mknod_rejection_reason(0, 1000, 1,
@@ -171,8 +175,12 @@ int main(int argc, char **argv) {
     assert(guest_fb0_commit_pan(&model, &var) == 0);
     assert(model.yoffset == 800 && model.page_flips == 1 &&
            model.software_base_update_acks == 1);
-    assert(guest_fb0_capture_publish(backing_fd, frame_dir, &model,
+    int frame_directory_fd = guest_frame_channel_open_app_private_sibling_ex(
+        frame_dir, guest_root, getuid(), NULL);
+    assert(frame_directory_fd >= 0);
+    assert(guest_fb0_capture_publish(backing_fd, frame_directory_fd, &model,
                                      model.yoffset) == 0);
+    assert(close(frame_directory_fd) == 0);
     assert(model.sequence == 1 && model.published == 1);
 
     join(packet_path, sizeof(packet_path), frame_dir, GUEST_FRAME_CHANNEL_FILE);

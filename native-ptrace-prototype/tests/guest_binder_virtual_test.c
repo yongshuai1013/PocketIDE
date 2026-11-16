@@ -62,10 +62,14 @@ int main(void) {
     uint32_t max_threads = 15;
     memcpy(memory.bytes + 1024, &zero, sizeof(zero));
     memcpy(memory.bytes + 1028, &max_threads, sizeof(max_threads));
-    assert(guest_binder_note_mapping(&process, 0x10000000u,
+    assert(guest_binder_note_mapping(&process, 0xe9380000u,
         GUEST_BINDER_SERVICEMANAGER_MAP_BYTES) == 0);
-    assert(guest_binder_note_mapping(&process, 0x20000000u,
+    assert(process.mapping_start == 0xe9380000u && process.mapping_valid);
+    assert(guest_binder_note_mapping(&process, 0xf3641000u,
         GUEST_BINDER_PROCESS_MAP_BYTES) == -EBUSY);
+    struct guest_binder_process_state overflow_mapping = {0};
+    assert(guest_binder_note_mapping(&overflow_mapping, 0xffff0000u,
+        GUEST_BINDER_SERVICEMANAGER_MAP_BYTES) == -EINVAL);
 
     assert(guest_binder_ioctl_bootstrap(&process, &global, 42,
         GUEST_BINDER_IOCTL_VERSION, 1100, mock_copyin, mock_copyout,
@@ -163,7 +167,7 @@ int main(void) {
         &memory, &parked) == -EFAULT);
     assert(guest_binder_ioctl_bootstrap(&process, &global, 42,
         0xdeadbeefu, 0, mock_copyin, mock_copyout, &memory, &parked) == -ENOTTY);
-    assert(guest_binder_note_unmap(&process, 0x10000000u,
+    assert(guest_binder_note_unmap(&process, 0xe9380000u,
         GUEST_BINDER_SERVICEMANAGER_MAP_BYTES) == 0);
     assert(!process.mapping_valid);
     guest_binder_process_exec_reset(&process);
