@@ -50,8 +50,11 @@ fi
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_exec_elf_test.c" -o "$TMP/guest_exec_elf_test"
 "$TMP/guest_exec_elf_test" \
-  "$GUEST_BASE/guest-root-staging/init" \
+"$GUEST_BASE/guest-root-staging/init" \
   "$GUEST_BASE/system-tree/bin/app_process"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_script_launch_test.c" -o "$TMP/guest_script_launch_test"
+"$TMP/guest_script_launch_test"
 python3 "$ROOT/tests/test_stage_interp_patch.py"
 python3 "$ROOT/tests/test_procfd_interp_execution.py"
 
@@ -67,6 +70,7 @@ uevent = Path(sys.argv[1]).with_name('guest_uevent_virtual.h').read_text()
 socket_model = Path(sys.argv[1]).with_name('guest_socket_virtual.h').read_text()
 socket_path = Path(sys.argv[1]).with_name('guest_socket_path_ops.h').read_text()
 diagnostics = Path(sys.argv[1]).with_name('guest_diagnostics.h').read_text()
+script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
 activity = Path(sys.argv[2]).read_text()
 capture = Path(sys.argv[2]).with_name('TraceOutputCapture.java').read_text()
 tree_cleanup = Path(sys.argv[2]).with_name('AppPrivateTreeCleanup.java').read_text()
@@ -121,6 +125,28 @@ assert 'guest-executable=' in src and 'errno=%d(%s) reason=%s' in src
 assert 'guest_diag_escape' in src and 'state->last_syscall_args' in src
 assert 'pending_exec_target' in src and 'child_state->exec_target' in src
 assert 'kernel-execve-returned-error-after-path-rewrite' in src
+assert '#include "guest_script_launch.h"' in src
+assert 'mediate_guest_script_execve' in src and 'guest_script_path_is_whitelisted(guest)' in src
+assert 'guest_script_file_is_authorized' in src and 'O_NOFOLLOW' in src
+assert 'pread(script_fd, shebang' in src and 'guest-script-shebang-is-not-approved-system-shell' in src
+assert 'GUEST SCRIPT EXEC ROUTE:' in src and 'GUEST SCRIPT LAUNCH EVENT:' in src
+assert 'GUEST SCRIPT LAUNCH SUMMARY:' in src and 'host-shell-exec=0 same-tracee=1' in src
+assert 'guest_script_plan_argv' in src and 'regs->uregs[1] = plan.argv_address' in src
+assert 'GUEST_API10_SHELL_PATH' in src and 'GUEST_API10_GOLDFISH_SCRIPT' in src
+assert 'guest_script_collect_preserved_args' in src
+assert 'PTRACE_O_TRACEEXEC' in src and 'if (event == PTRACE_EVENT_EXEC)' in src
+assert 'guest_script_exec_started_count++' in src
+assert 'guest-script-shell-linker-entry=observed' in src
+assert 'guest-script-path-not-whitelisted' in src
+assert 'resolved-executable-outside-approved-native-root' in src
+assert 'GUEST_SCRIPT_LAUNCH_MAX_BYTES 2048u' in script_launch
+assert 'strcmp(guest_path, GUEST_API10_GOLDFISH_SCRIPT) == 0' in script_launch
+assert 'canonical_system_root' in script_launch and 'resolved_script' in script_launch
+assert 'GUEST_API10_SHELL_PATH' in script_launch and 'GUEST_API10_GOLDFISH_SCRIPT' in script_launch
+script_test = Path(sys.argv[1]).parents[4] / 'tests/guest_script_launch_test.c'
+assert 'test_guest_script_path_and_symlink_containment' in script_test.read_text()
+assert 'test_original_argv_collection' in script_test.read_text()
+assert 'test_shell_launcher_argv_layout' in script_test.read_text()
 assert 'GUEST STARTUP STAGE: linker-entry=observed' in src
 assert 'target-main-entry=not-observed (no target-entry instrumentation)' in src
 assert 'GUEST STARTUP STAGE SUMMARY' in src and 'BROKER DIAGNOSTIC SUMMARY' in src
@@ -294,11 +320,13 @@ assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activ
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'HISTORICAL DEVICE TRACE (user-provided v0.6.8 Android 12 log; not this run)' in activity
-assert 'Guest PID 13 execve returned brokered -13 (EACCES)' in activity
+assert 'HISTORICAL DEVICE TRACE (user-provided v0.6.9 Android 12 log; not this run)' in activity
+assert 'Guest PID 13 attempted /system/etc/init.goldfish.sh' in activity
 assert 'tracked=4, reaped=4, unresolved=0' in activity
 assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
-assert 'No v0.6.9 device trace has been recorded yet' in activity
+assert 'No v0.6.10 device trace has been recorded yet' in activity
+assert 'resolved file was outside the approved native executable root' in activity
+assert 'does not execute a host shell or perform host networking' in activity
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
 assert 'android:grantUriPermissions="true"' in manifest and '${applicationId}.trace-logs' in manifest
@@ -327,11 +355,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.9-test-signed-apk' in upload
-assert 'gingervm-v0.6.9-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 18" in gradle and "versionName '0.6.9'" in gradle
+assert 'gingervm-continuous-trace-v0.6.10-test-signed-apk' in upload
+assert 'gingervm-v0.6.10-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 19" in gradle and "versionName '0.6.10'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.9' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.10' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

@@ -26,6 +26,7 @@
 #include "guest_socket_virtual.h"
 #include "guest_socket_path_ops.h"
 #include "guest_diagnostics.h"
+#include "guest_script_launch.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -226,6 +227,7 @@ struct tracee_state {
     int needs_options;
     int last_syscall;
     int exec_was_dynamic;
+    int exec_was_script;
     int32_t pending_return;
     struct broker_sigsys_candidate broker_sigsys;
     unsigned int poll_diagnostic_count;
@@ -233,6 +235,8 @@ struct tracee_state {
     char last_guest_path[PATH_MAX];
     char exec_target[PATH_MAX];
     char pending_exec_target[PATH_MAX];
+    char exec_script_path[PATH_MAX];
+    char pending_exec_script[PATH_MAX];
 };
 enum pending_kind { PENDING_NONE, PENDING_RESULT };
 
@@ -263,6 +267,8 @@ static unsigned long process_events;
 static unsigned long successful_guest_execs;
 static unsigned long dynamic_exec_allowed_count;
 static unsigned long dynamic_exec_started_count;
+static unsigned long guest_script_routes_approved;
+static unsigned long guest_script_exec_started_count;
 static unsigned long brokered_sigsys_suppressed;
 static struct guest_vsocket_table guest_sockets;
 static unsigned long virtual_property_bind_count;
@@ -1333,6 +1339,238 @@ static int patched_dynamic_native_path(const char *original, char *out, size_t c
     return n > 0 && (size_t)n < capacity ? 0 : -ENAMETOOLONG;
 }
 
+static int guest_script_remote_read_word(void *context, uint32_t address,
+                                         uint32_t *value) {
+    if (!context || !value) return -1;
+    pid_t pid = *(const pid_t *)context;
+    return read_remote(pid, address, value, sizeof(*value));
+}
+
+static int mediate_guest_script_execve(pid_t pid, struct tracee_state *state,
+                                       struct compat_pt_regs *regs,
+                                       const char *guest_path,
+                                       const char *mapped_script,
+                                       const char *resolved_script,
+                                       const char **failure_reason) {
+    int script_fd = -1;
+    int rc = -EACCES;
+    const char *reason = "guest-script-launch-rejected";
+    char canonical_guest_root[PATH_MAX], system_candidate[PATH_MAX];
+    char canonical_system_root[PATH_MAX], fd_path[64], fd_resolved[PATH_MAX];
+    char mapped_shell[PATH_MAX], shell_resolved[PATH_MAX], shell_interpreter[PATH_MAX];
+    char patched_shell[PATH_MAX], patched_shell_resolved[PATH_MAX];
+    char patched_interpreter[PATH_MAX];
+
+    if (!guest_script_path_is_whitelisted(guest_path)) {
+        reason = "guest-script-path-not-whitelisted";
+        goto fail;
+    }
+    if (!realpath(guest_root, canonical_guest_root)) {
+        reason = "guest-script-root-resolution-failed";
+        rc = -errno;
+        goto fail;
+    }
+    int n = snprintf(system_candidate, sizeof(system_candidate), "%s/.images/system",
+                     canonical_guest_root);
+    if (n <= 0 || (size_t)n >= sizeof(system_candidate)) {
+        reason = "guest-script-system-root-resolution-failed";
+        rc = -ENAMETOOLONG;
+        goto fail;
+    }
+    if (!realpath(system_candidate, canonical_system_root)) {
+        reason = "guest-script-system-root-resolution-failed";
+        rc = -errno;
+        goto fail;
+    }
+    if (!guest_script_file_is_authorized(guest_path, canonical_guest_root,
+            canonical_system_root, resolved_script, 1)) {
+        reason = "guest-script-resolved-outside-approved-api10-system-path";
+        rc = -EACCES;
+        goto fail;
+    }
+
+    struct stat path_st, opened_st;
+    if (lstat(mapped_script, &path_st) != 0) {
+        reason = "guest-script-lstat-failed";
+        rc = -errno;
+        goto fail;
+    }
+    if (!S_ISREG(path_st.st_mode)) {
+        reason = S_ISLNK(path_st.st_mode) ? "guest-script-final-component-is-symlink"
+                                         : "guest-script-is-not-regular-file";
+        rc = -EACCES;
+        goto fail;
+    }
+    script_fd = open(mapped_script, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (script_fd < 0) {
+        reason = "guest-script-open-no-follow-failed";
+        rc = -errno;
+        goto fail;
+    }
+    if (fstat(script_fd, &opened_st) != 0) {
+        reason = "guest-script-fstat-failed";
+        rc = -errno;
+        goto fail;
+    }
+    if (!S_ISREG(opened_st.st_mode) || opened_st.st_dev != path_st.st_dev ||
+        opened_st.st_ino != path_st.st_ino) {
+        reason = "guest-script-changed-during-validation";
+        rc = -EACCES;
+        goto fail;
+    }
+    n = snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", script_fd);
+    if (n <= 0 || (size_t)n >= sizeof(fd_path) || !realpath(fd_path, fd_resolved)) {
+        reason = "guest-script-open-fd-resolution-failed";
+        rc = errno ? -errno : -ENAMETOOLONG;
+        goto fail;
+    }
+    if (!guest_script_file_is_authorized(guest_path, canonical_guest_root,
+            canonical_system_root, fd_resolved, S_ISREG(path_st.st_mode)) ||
+        strcmp(fd_resolved, resolved_script) != 0) {
+        reason = "guest-script-resolved-outside-approved-api10-system-path";
+        rc = -EACCES;
+        goto fail;
+    }
+    if (!(opened_st.st_mode & 0111)) {
+        reason = "guest-script-has-no-execute-bit";
+        rc = -EACCES;
+        goto fail;
+    }
+    static const char expected_shebang[] = "#!/system/bin/sh\n";
+    char shebang[sizeof(expected_shebang) - 1];
+    ssize_t shebang_bytes = pread(script_fd, shebang, sizeof(shebang), 0);
+    if (shebang_bytes != (ssize_t)sizeof(shebang) ||
+        memcmp(shebang, expected_shebang, sizeof(shebang)) != 0) {
+        reason = "guest-script-shebang-is-not-approved-system-shell";
+        rc = -EACCES;
+        goto fail;
+    }
+    if (close(script_fd) != 0) {
+        script_fd = -1;
+        reason = "guest-script-close-after-validation-failed";
+        rc = -errno;
+        goto fail;
+    }
+    script_fd = -1;
+
+    rc = map_guest_path(GUEST_API10_SHELL_PATH, mapped_shell, sizeof(mapped_shell));
+    if (rc != 0) {
+        reason = "guest-system-shell-vfs-mapping-failed";
+        goto fail;
+    }
+    if (!realpath(mapped_shell, shell_resolved)) {
+        reason = "guest-system-shell-payload-resolution-failed";
+        rc = -errno;
+        goto fail;
+    }
+    if (!path_is_within(shell_resolved, native_guest_root)) {
+        reason = "guest-system-shell-outside-approved-native-root";
+        rc = -EACCES;
+        goto fail;
+    }
+    struct stat shell_st;
+    if (stat(shell_resolved, &shell_st) != 0) {
+        reason = "guest-system-shell-payload-not-executable-regular-file";
+        rc = -errno;
+        goto fail;
+    }
+    if (!S_ISREG(shell_st.st_mode) || !(shell_st.st_mode & 0111)) {
+        reason = "guest-system-shell-payload-not-executable-regular-file";
+        rc = -EACCES;
+        goto fail;
+    }
+    int shell_kind = guest_elf32_arm_interpreter(shell_resolved, shell_interpreter,
+                                                  sizeof(shell_interpreter));
+    if (shell_kind != 1 || strcmp(shell_interpreter, "/system/bin/linker") != 0) {
+        reason = "guest-system-shell-is-not-verified-api10-dynamic-arm-elf";
+        rc = shell_kind < 0 ? shell_kind : -ENOEXEC;
+        goto fail;
+    }
+    rc = patched_dynamic_native_path(shell_resolved, patched_shell, sizeof(patched_shell));
+    if (rc != 0 || !realpath(patched_shell, patched_shell_resolved) ||
+        !path_is_within(patched_shell_resolved, native_guest_root)) {
+        reason = "guest-system-shell-patched-linker-alias-invalid";
+        rc = rc != 0 ? rc : -EACCES;
+        goto fail;
+    }
+    struct stat patched_st;
+    int patched_kind = guest_elf32_arm_interpreter(patched_shell_resolved,
+        patched_interpreter, sizeof(patched_interpreter));
+    if (stat(patched_shell_resolved, &patched_st) != 0 || !S_ISREG(patched_st.st_mode) ||
+        !(patched_st.st_mode & 0111) || patched_kind != 1 ||
+        strcmp(patched_interpreter, "/proc/self/fd/198") != 0) {
+        reason = "guest-system-shell-patched-linker-payload-unverified";
+        rc = -ENOEXEC;
+        goto fail;
+    }
+
+    uint32_t preserved[GUEST_SCRIPT_MAX_PRESERVED_ARGS];
+    size_t preserved_count = 0;
+    pid_t remote_pid = pid;
+    rc = guest_script_collect_preserved_args(regs->uregs[1],
+        guest_script_remote_read_word, &remote_pid, preserved,
+        GUEST_SCRIPT_MAX_PRESERVED_ARGS, &preserved_count);
+    if (rc != 0) {
+        reason = rc == -E2BIG ? "guest-script-argv-exceeds-bounded-limit"
+                              : "guest-script-argv-unreadable";
+        goto fail;
+    }
+    if (regs->uregs[13] <= SCRATCH_BELOW_SP + 16u) {
+        reason = "guest-script-argv-scratch-address-underflow";
+        rc = -EFAULT;
+        goto fail;
+    }
+    uint32_t scratch = (regs->uregs[13] - SCRATCH_BELOW_SP) &
+                       ~((uint32_t)sizeof(long) - 1u);
+    struct guest_script_argv_plan plan;
+    rc = guest_script_plan_argv(scratch, patched_shell_resolved, preserved,
+                                preserved_count, &plan);
+    if (rc != 0) {
+        reason = "guest-script-argv-layout-invalid-or-too-large";
+        goto fail;
+    }
+    size_t exec_path_bytes = strlen(patched_shell_resolved) + 1;
+    if (write_remote(pid, plan.exec_path_address, patched_shell_resolved,
+                     exec_path_bytes) != 0 ||
+        write_remote(pid, plan.shell_argv0_address, GUEST_API10_SHELL_PATH,
+                     sizeof(GUEST_API10_SHELL_PATH)) != 0 ||
+        write_remote(pid, plan.script_argv1_address, GUEST_API10_GOLDFISH_SCRIPT,
+                     sizeof(GUEST_API10_GOLDFISH_SCRIPT)) != 0 ||
+        write_remote(pid, plan.argv_address, plan.argv_words,
+                     (plan.argc + 1u) * sizeof(uint32_t)) != 0) {
+        reason = "guest-script-launcher-argv-write-failed";
+        rc = -EFAULT;
+        goto fail;
+    }
+    regs->uregs[0] = plan.exec_path_address;
+    regs->uregs[1] = plan.argv_address;
+    if (set_regs(pid, regs) != 0) {
+        reason = "guest-script-launcher-register-update-failed";
+        rc = -EFAULT;
+        goto fail;
+    }
+    if (state) {
+        snprintf(state->pending_exec_target, sizeof(state->pending_exec_target), "%s",
+                 GUEST_API10_SHELL_PATH);
+        snprintf(state->pending_exec_script, sizeof(state->pending_exec_script), "%s",
+                 GUEST_API10_GOLDFISH_SCRIPT);
+        state->exec_was_dynamic = 1;
+        state->exec_was_script = 1;
+    }
+    dynamic_exec_allowed_count++;
+    guest_script_routes_approved++;
+    path_rewrites++;
+    printf("GUEST SCRIPT EXEC ROUTE: host-pid=%d guest-pid=%d guest-shell=%s script=%s argv0=%s argv1=%s forwarded-extra-args=%zu shell-elf=verified-API10-ARM32 patched-linker=fd-198 host-shell-exec=0 same-tracee=1\n",
+           pid, state ? state->guest_pid : 0, GUEST_API10_SHELL_PATH,
+           GUEST_API10_GOLDFISH_SCRIPT, GUEST_API10_SHELL_PATH,
+           GUEST_API10_GOLDFISH_SCRIPT, preserved_count);
+    return 0;
+
+fail:
+    if (script_fd >= 0) close(script_fd);
+    return guest_exec_failure(failure_reason, reason, rc);
+}
+
 static int mediate_guest_execve(pid_t pid, struct tracee_state *state,
                                 struct compat_pt_regs *regs, char *diagnostic_path,
                                 size_t diagnostic_capacity, const char **failure_reason) {
@@ -1357,6 +1595,9 @@ static int mediate_guest_execve(pid_t pid, struct tracee_state *state,
         int saved_errno = errno;
         return guest_exec_failure(failure_reason, "guest-vfs-path-resolution-failed", -saved_errno);
     }
+    if (guest_script_path_is_whitelisted(guest))
+        return mediate_guest_script_execve(pid, state, regs, guest, host, resolved,
+                                           failure_reason);
 
     char staged_init[PATH_MAX], resolved_init[PATH_MAX];
     int n = snprintf(staged_init, sizeof(staged_init), "%s/init", guest_root);
@@ -1450,7 +1691,9 @@ static int mediate_guest_execve(pid_t pid, struct tracee_state *state,
         return guest_exec_failure(failure_reason, "execve-path-register-update-failed", -EFAULT);
     if (state) {
         snprintf(state->pending_exec_target, sizeof(state->pending_exec_target), "%s", guest);
+        state->pending_exec_script[0] = '\0';
         state->exec_was_dynamic = dynamic_exec;
+        state->exec_was_script = 0;
     }
     path_rewrites++;
     if (dynamic_exec)
@@ -2048,6 +2291,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 child_state->guest_egid = state->guest_egid;
                 snprintf(child_state->exec_target, sizeof(child_state->exec_target), "%s",
                          state->exec_target[0] ? state->exec_target : "<unknown>");
+                snprintf(child_state->exec_script_path, sizeof(child_state->exec_script_path),
+                         "%s", state->exec_script_path);
                 process_events++;
                 printf("GUEST PROCESS EVENT: parent=%d guest-pid=%d child=%d guest-pid=%d type=%s tracees=%zu/%d\n",
                        waited, state->guest_pid, child_pid, child_guest_pid,
@@ -2062,26 +2307,51 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
         }
         if (event == PTRACE_EVENT_EXEC) {
             broker_sigsys_clear(&state->broker_sigsys);
+            int script_launch = state->exec_was_script || state->pending_exec_script[0] != '\0';
             if (state->pending_exec_target[0]) {
                 snprintf(state->exec_target, sizeof(state->exec_target), "%s",
                          state->pending_exec_target);
                 state->pending_exec_target[0] = '\0';
             }
+            if (script_launch) {
+                snprintf(state->exec_script_path, sizeof(state->exec_script_path), "%s",
+                         state->pending_exec_script[0] ? state->pending_exec_script
+                                                       : GUEST_API10_GOLDFISH_SCRIPT);
+            } else {
+                state->exec_script_path[0] = '\0';
+            }
+            state->pending_exec_script[0] = '\0';
             close_virtual_fds_on_exec(state);
             successful_guest_execs++;
             if (state->exec_was_dynamic) {
                 dynamic_exec_started_count++;
-                printf("GUEST DYNAMIC EXEC EVENT: pid=%d target=%s; kernel entered the original API10 linker via fd=%d; target main entry remains unproven\n",
-                       waited, state->exec_target[0] ? state->exec_target : "unknown guest path",
-                       GUEST_LINKER_FD);
-                printf("GUEST STARTUP STAGE: linker-entry=observed pid=%d guest-pid=%d target=%s; target-main-entry=not-observed (no target-entry instrumentation); Zygote/framework=unproven\n",
-                       waited, state->guest_pid,
-                       state->exec_target[0] ? state->exec_target : "unknown guest path");
+                if (script_launch) {
+                    guest_script_exec_started_count++;
+                    printf("GUEST SCRIPT LAUNCH EVENT: host-pid=%d guest-pid=%d guest-shell=%s script=%s; original API10 linker entered via fd=%d; shell-main-entry=unobserved\n",
+                           waited, state->guest_pid,
+                           state->exec_target[0] ? state->exec_target : GUEST_API10_SHELL_PATH,
+                           state->exec_script_path[0] ? state->exec_script_path
+                                                      : GUEST_API10_GOLDFISH_SCRIPT,
+                           GUEST_LINKER_FD);
+                    printf("GUEST STARTUP STAGE: guest-script-shell-linker-entry=observed pid=%d guest-pid=%d shell=%s script=%s; target-main-entry=not-observed (no target-entry instrumentation); Zygote/framework=unproven\n",
+                           waited, state->guest_pid,
+                           state->exec_target[0] ? state->exec_target : GUEST_API10_SHELL_PATH,
+                           state->exec_script_path[0] ? state->exec_script_path
+                                                      : GUEST_API10_GOLDFISH_SCRIPT);
+                } else {
+                    printf("GUEST DYNAMIC EXEC EVENT: pid=%d target=%s; kernel entered the original API10 linker via fd=%d; target main entry remains unproven\n",
+                           waited, state->exec_target[0] ? state->exec_target : "unknown guest path",
+                           GUEST_LINKER_FD);
+                    printf("GUEST STARTUP STAGE: linker-entry=observed pid=%d guest-pid=%d target=%s; target-main-entry=not-observed (no target-entry instrumentation); Zygote/framework=unproven\n",
+                           waited, state->guest_pid,
+                           state->exec_target[0] ? state->exec_target : "unknown guest path");
+                }
             } else {
                 printf("GUEST EXEC EVENT: pid=%d target=%s (verified ELF32 ARM payload)\n",
                        waited, state->exec_target[0] ? state->exec_target : "unknown guest path");
             }
             state->exec_was_dynamic = 0;
+            state->exec_was_script = 0;
             if (resume_trace(waited, 0) != 0) { kill_all_tracees(); return -1; }
             continue;
         }
@@ -2170,11 +2440,18 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 if (!state->pending && state->last_syscall == ARM_NR_EXECVE &&
                     (int32_t)regs.uregs[0] < 0) {
                     int32_t exec_result = (int32_t)regs.uregs[0];
+                    const char *failed_exec_path = state->pending_exec_script[0]
+                        ? state->pending_exec_script
+                        : state->pending_exec_target[0] ? state->pending_exec_target : NULL;
+                    const char *failed_exec_reason = state->pending_exec_script[0]
+                        ? "kernel-execve-returned-error-after-guest-script-shell-substitution"
+                        : "kernel-execve-returned-error-after-path-rewrite";
                     log_broker_denial_detail(waited, state, ARM_NR_EXECVE, exec_result,
-                        state->pending_exec_target[0] ? state->pending_exec_target : NULL,
-                        "kernel-execve-returned-error-after-path-rewrite", 1);
+                        failed_exec_path, failed_exec_reason, 1);
                     state->pending_exec_target[0] = '\0';
+                    state->pending_exec_script[0] = '\0';
                     state->exec_was_dynamic = 0;
+                    state->exec_was_script = 0;
                 }
                 state->expect_exit = 0;
                 state->pending = 0;
@@ -2328,6 +2605,9 @@ int main(int argc, char **argv) {
            dynamic_exec_started_count, MAX_TRACEES);
     printf("GUEST STARTUP STAGE SUMMARY: original-init-post-exec=%s; original-linker-entry-events=%lu; target-main-entry=unobserved (target-entry instrumentation not installed); Zygote/framework/system_server/desktop=unproven\n",
            saw_exec ? "observed" : "not-observed", dynamic_exec_started_count);
+    printf("GUEST SCRIPT LAUNCH SUMMARY: approved-routes=%lu; exec-events=%lu; guest-shell=%s; guest-script=%s; host-shell-exec=0; network-effects=guest-software-broker-only\n",
+           guest_script_routes_approved, guest_script_exec_started_count,
+           GUEST_API10_SHELL_PATH, GUEST_API10_GOLDFISH_SCRIPT);
     printf("SYSCALL ENTRIES: %lu; PATH REWRITES: %lu; VIRTUAL MOUNTS: %lu; VIRTUAL DEVICE/MODE OPS: %lu; VIRTUAL ID OPS: %lu; VIRTUAL FILE OPS: %lu; VIRTUAL SYMLINK OPS: %lu; VIRTUAL SOCKET CALLS: %lu; VIRTUAL POLL WAITS: %lu; BROKERED SIGSYS SUPPRESSED: %lu; BLOCKED PROCESS STARTS: %lu; DENIED: %lu\n",
            syscall_stops, path_rewrites, virtual_mount_count, virtual_device_count,
            virtual_identity_count, virtual_file_ops, virtual_symlink_ops, virtual_socket_calls, virtual_poll_waits,
