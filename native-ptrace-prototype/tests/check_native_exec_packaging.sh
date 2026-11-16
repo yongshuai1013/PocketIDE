@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import pathlib
+import stat
 import struct
 import sys
 import zipfile
@@ -125,6 +126,8 @@ with zipfile.ZipFile(apk) as zf:
     assert len(file_rows) == manifest["regular_file_count"]
     assert len({row["path"] for row in file_rows}) == len(file_rows), "duplicate file paths in manifest"
     assert sum(row["size"] for row in file_rows) == manifest["regular_file_bytes"]
+    goldfish_script = next(row for row in file_rows if row["path"] == "etc/init.goldfish.sh")
+    assert goldfish_script["kind"] == "asset" and goldfish_script["mode"] == 0o550
     file_bytes = 0
     patched_exec_count = 0
     patched_exec_bytes = 0
@@ -137,6 +140,9 @@ with zipfile.ZipFile(apk) as zf:
         relative = row["path"]
         source = safe_source_path(relative)
         assert source.is_file() and not source.is_symlink(), f"missing regular source file: {relative}"
+        source_stat = source.lstat()
+        assert stat.S_ISREG(source_stat.st_mode), f"source manifest path is not a regular file: {relative}"
+        assert row.get("mode") == stat.S_IMODE(source_stat.st_mode), f"source file mode changed since manifest: {relative}"
         source_bytes = source.read_bytes()
         assert digest(source_bytes) == row["sha256"], f"source system tree changed since manifest: {relative}"
         assert len(source_bytes) == row["size"]
@@ -238,6 +244,6 @@ if [[ -x "$AAPT" ]]; then
   "$AAPT" dump badging "$APK" > "$TMP/badging"
   grep -Fq "native-code: 'arm64-v8a'" "$TMP/badging"
   grep -Fq "alt-native-code: 'armeabi-v7a'" "$TMP/badging"
-  grep -Fq "versionName='0.6.10'" "$TMP/badging"
+  grep -Fq "versionName='0.6.11'" "$TMP/badging"
 fi
 printf '%s\n' 'Native ABI metadata regression: PASS (arm64-v8a supervisor + armeabi-v7a original userland; extracted libraries required).'

@@ -46,6 +46,32 @@ static void write_script(const char *path) {
     assert(close(fd) == 0);
 }
 
+static void assert_shared_route_markers(void) {
+    FILE *capture = tmpfile();
+    assert(capture != NULL);
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    assert(saved_stdout >= 0);
+    assert(dup2(fileno(capture), STDOUT_FILENO) == STDOUT_FILENO);
+
+    guest_script_log_exec_route(101, 13, GUEST_API10_SHELL_PATH,
+                                GUEST_API10_GOLDFISH_SCRIPT, 2);
+    guest_script_log_launch_event(101, 13, GUEST_API10_SHELL_PATH,
+                                  GUEST_API10_GOLDFISH_SCRIPT, 198);
+    assert(fflush(stdout) == 0);
+    assert(dup2(saved_stdout, STDOUT_FILENO) == STDOUT_FILENO);
+    assert(close(saved_stdout) == 0);
+
+    assert(fseek(capture, 0, SEEK_SET) == 0);
+    char log[2048] = {0};
+    size_t bytes = fread(log, 1, sizeof(log) - 1, capture);
+    assert(!ferror(capture) && bytes > 0);
+    assert(fclose(capture) == 0);
+    assert(strstr(log, "GUEST SCRIPT EXEC ROUTE: host-pid=101 guest-pid=13 guest-shell=/system/bin/sh script=/system/etc/init.goldfish.sh") != NULL);
+    assert(strstr(log, "forwarded-extra-args=2 shell-elf=verified-API10-ARM32 patched-linker=fd-198 host-shell-exec=0 same-tracee=1") != NULL);
+    assert(strstr(log, "GUEST SCRIPT LAUNCH EVENT: host-pid=101 guest-pid=13 guest-shell=/system/bin/sh script=/system/etc/init.goldfish.sh; original API10 linker entered via fd=198; shell-main-entry=unobserved") != NULL);
+}
+
 static void test_guest_script_path_and_symlink_containment(void) {
     char tmp[] = "/tmp/gingervm-script-launch.XXXXXX";
     char *base = mkdtemp(tmp);
@@ -66,11 +92,37 @@ static void test_guest_script_path_and_symlink_containment(void) {
     assert(realpath(root, canonical_root) != NULL);
     assert(realpath(system, canonical_system) != NULL);
     assert(realpath(script, canonical_script) != NULL);
+    struct stat script_stat;
+    assert(lstat(script, &script_stat) == 0 && S_ISREG(script_stat.st_mode));
+    assert((script_stat.st_mode & 07777) == 0550);
     assert(guest_script_path_is_whitelisted(GUEST_API10_GOLDFISH_SCRIPT));
     assert(!guest_script_path_is_whitelisted("/system/etc/../etc/init.goldfish.sh"));
     assert(!guest_script_path_is_whitelisted("/tmp/outside.sh"));
     assert(guest_script_file_is_authorized(GUEST_API10_GOLDFISH_SCRIPT,
         canonical_root, canonical_system, canonical_script, 1));
+    assert(guest_script_mode_is_executable((uint32_t)script_stat.st_mode));
+    assert(!guest_script_mode_is_executable(0644));
+    static const char approved_shebang[] = "#!/system/bin/sh\n";
+    static const char rejected_shebang[] = "#!/bin/sh\n";
+    assert(guest_script_has_approved_shebang(approved_shebang, sizeof(approved_shebang) - 1));
+    assert(!guest_script_has_approved_shebang(rejected_shebang, sizeof(rejected_shebang) - 1));
+    int route_authorized = guest_script_launch_is_authorized(
+        GUEST_API10_GOLDFISH_SCRIPT, canonical_root, canonical_system,
+        canonical_script, 1, (uint32_t)script_stat.st_mode,
+        approved_shebang, sizeof(approved_shebang) - 1);
+    assert(route_authorized);
+    if (route_authorized) assert_shared_route_markers();
+    assert(!guest_script_launch_is_authorized(
+        "/system/etc/../etc/init.goldfish.sh", canonical_root, canonical_system,
+        canonical_script, 1, (uint32_t)script_stat.st_mode,
+        approved_shebang, sizeof(approved_shebang) - 1));
+    assert(!guest_script_launch_is_authorized(
+        GUEST_API10_GOLDFISH_SCRIPT, canonical_root, canonical_system,
+        canonical_script, 1, 0644, approved_shebang, sizeof(approved_shebang) - 1));
+    assert(!guest_script_launch_is_authorized(
+        GUEST_API10_GOLDFISH_SCRIPT, canonical_root, canonical_system,
+        canonical_script, 1, (uint32_t)script_stat.st_mode,
+        rejected_shebang, sizeof(rejected_shebang) - 1));
     assert(!guest_script_file_is_authorized("/system/etc/../etc/init.goldfish.sh",
         canonical_root, canonical_system, canonical_script, 1));
     assert(!guest_script_file_is_authorized(GUEST_API10_GOLDFISH_SCRIPT,
@@ -81,6 +133,9 @@ static void test_guest_script_path_and_symlink_containment(void) {
     assert(realpath(link_path, resolved_link) != NULL);
     assert(!guest_script_file_is_authorized(GUEST_API10_GOLDFISH_SCRIPT,
         canonical_root, canonical_system, resolved_link, 0));
+    assert(!guest_script_launch_is_authorized(GUEST_API10_GOLDFISH_SCRIPT,
+        canonical_root, canonical_system, resolved_link, 0,
+        (uint32_t)script_stat.st_mode, approved_shebang, sizeof(approved_shebang) - 1));
     assert(unlink(link_path) == 0);
 
     assert(symlink(other, link_path) == 0);
@@ -144,6 +199,6 @@ int main(void) {
     test_guest_script_path_and_symlink_containment();
     test_original_argv_collection();
     test_shell_launcher_argv_layout();
-    puts("guest script launch regression: PASS (one API10 script whitelist, canonical app-private path, no symlink escape, guest-shell argv, bounded arguments)");
+    puts("guest script launch integration regression: PASS (0550 authorized API10 path, no symlink escape, shared route/launch markers, guest-shell argv, bounded arguments)");
     return 0;
 }

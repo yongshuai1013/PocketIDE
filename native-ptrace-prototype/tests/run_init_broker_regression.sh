@@ -25,10 +25,13 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
 "$TMP/guest_diagnostics_test"
 mkdir -p "$TMP/java"
 javac -d "$TMP/java" \
+  "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/AppPrivateFileModeRestorer.java" \
   "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/AppPrivateTreeCleanup.java" \
   "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/TraceOutputCapture.java" \
+  "$ROOT/tests/AppPrivateFileModeRestorerTest.java" \
   "$ROOT/tests/AppPrivateTreeCleanupTest.java" \
   "$ROOT/tests/TraceOutputCaptureTest.java"
+java -ea -cp "$TMP/java" dev.gingervm.nativeprobe.AppPrivateFileModeRestorerTest
 java -cp "$TMP/java" dev.gingervm.nativeprobe.AppPrivateTreeCleanupTest
 java -cp "$TMP/java" dev.gingervm.nativeprobe.TraceOutputCaptureTest
 if [[ "$(uname -m)" == "x86_64" ]]; then
@@ -129,9 +132,13 @@ assert 'kernel-execve-returned-error-after-path-rewrite' in src
 assert '#include "guest_script_launch.h"' in src
 assert 'mediate_guest_script_execve' in src and 'guest_script_path_is_whitelisted(guest)' in src
 assert 'guest_script_file_is_authorized' in src and 'O_NOFOLLOW' in src
-assert 'pread(script_fd, shebang' in src and 'guest-script-shebang-is-not-approved-system-shell' in src
-assert 'GUEST SCRIPT EXEC ROUTE:' in src and 'GUEST SCRIPT LAUNCH EVENT:' in src
-assert 'GUEST SCRIPT LAUNCH SUMMARY:' in src and 'host-shell-exec=0 same-tracee=1' in src
+assert 'guest_script_launch_is_authorized' in src
+assert 'guest_script_mode_is_executable((uint32_t)opened_st.st_mode)' in src
+assert 'pread(script_fd, shebang' in src and 'guest_script_has_approved_shebang' in src
+assert 'guest-script-shebang-is-not-approved-system-shell' in src
+assert 'guest_script_log_exec_route' in src and 'guest_script_log_launch_event' in src
+assert 'GUEST SCRIPT LAUNCH SUMMARY:' in src
+assert 'host-shell-exec=0 same-tracee=1' in script_launch
 assert 'guest_script_plan_argv' in src and 'regs->uregs[1] = plan.argv_address' in src
 assert 'GUEST_API10_SHELL_PATH' in src and 'GUEST_API10_GOLDFISH_SCRIPT' in src
 assert 'guest_script_collect_preserved_args' in src
@@ -144,10 +151,32 @@ assert 'GUEST_SCRIPT_LAUNCH_MAX_BYTES 2048u' in script_launch
 assert 'strcmp(guest_path, GUEST_API10_GOLDFISH_SCRIPT) == 0' in script_launch
 assert 'canonical_system_root' in script_launch and 'resolved_script' in script_launch
 assert 'GUEST_API10_SHELL_PATH' in script_launch and 'GUEST_API10_GOLDFISH_SCRIPT' in script_launch
+assert 'guest_script_mode_is_executable' in script_launch and 'guest_script_has_approved_shebang' in script_launch
+assert 'guest_script_launch_is_authorized' in script_launch
+assert 'GUEST SCRIPT EXEC ROUTE:' in script_launch and 'GUEST SCRIPT LAUNCH EVENT:' in script_launch
 script_test = Path(sys.argv[1]).parents[4] / 'tests/guest_script_launch_test.c'
 assert 'test_guest_script_path_and_symlink_containment' in script_test.read_text()
 assert 'test_original_argv_collection' in script_test.read_text()
 assert 'test_shell_launcher_argv_layout' in script_test.read_text()
+assert 'assert_shared_route_markers' in script_test.read_text()
+assert 'int route_authorized = guest_script_launch_is_authorized' in script_test.read_text()
+assert 'if (route_authorized) assert_shared_route_markers()' in script_test.read_text()
+assert 'guest_script_mode_is_executable((uint32_t)script_stat.st_mode)' in script_test.read_text()
+assert 'guest script launch integration regression: PASS' in script_test.read_text()
+mode_helper = Path(sys.argv[2]).with_name('AppPrivateFileModeRestorer.java').read_text()
+mode_test = Path(sys.argv[1]).parents[4] / 'tests/AppPrivateFileModeRestorerTest.java'
+assert 'ops.openReadOnlyNoFollow(target.file)' in mode_helper and 'ops.fchmod(descriptor, safeMode)' in mode_helper
+assert 'validateRelativePath' in mode_helper and 'refusing guest mode traversal through a symlink' in mode_helper
+assert 'O_NOFOLLOW' in activity and 'Os.fchmod((FileDescriptor) descriptor' in activity
+assert 'restoreSystemAssetModes(systemRoot, manifest)' in activity
+staging = activity.split('copyAssetTree("api10-system", systemRoot)', 1)[1].split(
+    'installNativeSystemPayloads(systemRoot, guestLibraryDir)', 1)[0]
+assert staging.index('restoreSystemAssetNames') < staging.index('restoreSystemAssetModes') < staging.index('restoreSystemSymlinks')
+assert 'AppPrivateFileModeRestorer.verify(systemRoot, relative, sourceMode, fileModeOps)' in activity
+assert 'source_stat = source.lstat()' in stager and 'stat.S_IMODE(source_stat.st_mode)' in stager
+assert '"mode": source_mode' in stager
+assert '0550' in mode_test.read_text() and 'final-link.sh' in mode_test.read_text()
+assert 'outside-parent/outside.sh' in mode_test.read_text() and '../outside.sh' in mode_test.read_text()
 assert 'GUEST STARTUP STAGE: linker-entry=observed' in src
 assert 'target-main-entry=not-observed (no target-entry instrumentation)' in src
 assert 'GUEST STARTUP STAGE SUMMARY' in src and 'BROKER DIAGNOSTIC SUMMARY' in src
@@ -321,12 +350,13 @@ assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activ
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'HISTORICAL DEVICE TRACE (user-provided v0.6.9 Android 12 log; not this run)' in activity
+assert 'HISTORICAL DEVICE TRACE (user-provided v0.6.10 Android 12 log; not this run)' in activity
 assert 'Guest PID 13 attempted /system/etc/init.goldfish.sh' in activity
 assert 'tracked=4, reaped=4, unresolved=0' in activity
 assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
-assert 'No v0.6.10 device trace has been recorded yet' in activity
-assert 'resolved file was outside the approved native executable root' in activity
+assert 'No v0.6.11 device trace has been recorded yet' in activity
+assert 'guest-script-has-no-execute-bit' in activity
+assert 'script mode is 0550' in activity and 'authenticated manifest' in activity
 assert 'does not execute a host shell or perform host networking' in activity
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
@@ -363,11 +393,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.10-test-signed-apk' in upload
-assert 'gingervm-v0.6.10-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 19" in gradle and "versionName '0.6.10'" in gradle
+assert 'gingervm-continuous-trace-v0.6.11-test-signed-apk' in upload
+assert 'gingervm-v0.6.11-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 20" in gradle and "versionName '0.6.11'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.10' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.11' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

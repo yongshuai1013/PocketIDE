@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import struct
 import sys
 from pathlib import Path, PurePosixPath
@@ -214,7 +215,11 @@ def main() -> int:
                 continue
             if not source.is_file():
                 continue
-            size = source.stat().st_size
+            source_stat = source.lstat()
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise SystemExit(f"system payload changed type while staging: {rel}")
+            size = source_stat.st_size
+            source_mode = stat.S_IMODE(source_stat.st_mode)
             digest = sha256(source)
             total_bytes += size
             regular_files += 1
@@ -224,6 +229,7 @@ def main() -> int:
                 native = copy_native(source, native32, GUEST_LINKER_NAME)
                 abi_native_payload_bytes += size
                 file_manifest.append({"path": rel, "kind": "native-linker", "size": size, "sha256": digest,
+                                      "mode": source_mode,
                                       "native": native["name"]})
                 continue
 
@@ -233,9 +239,10 @@ def main() -> int:
                     raise SystemExit(f"system library is not ELF32 ARM: {rel}")
                 native = copy_native(source, native32, rel_path.name)
                 abi_native_payload_bytes += size
-                native_libraries.append({"path": rel, "native": native["name"], "size": size, "sha256": digest})
+                native_libraries.append({"path": rel, "native": native["name"], "size": size,
+                                         "sha256": digest, "mode": source_mode})
                 file_manifest.append({"path": rel, "kind": "native-library", "size": size, "sha256": digest,
-                                      "native": native["name"]})
+                                      "mode": source_mode, "native": native["name"]})
                 continue
 
             if rel_path.parts[0] in ("bin", "xbin") and len(rel_path.parts) == 2 and (source.stat().st_mode & 0o111) and is_arm32_elf(source):
@@ -243,7 +250,8 @@ def main() -> int:
                 copy_native(source, native32, native_name)
                 abi_native_payload_bytes += size
                 executable_row: dict[str, object] = {
-                    "path": rel, "native": native_name, "size": size, "sha256": digest
+                    "path": rel, "native": native_name, "size": size, "sha256": digest,
+                    "mode": source_mode
                 }
                 patched, patched_interpreter = patch_guest_interpreter(source.read_bytes())
                 if patched_interpreter is not None:
@@ -270,7 +278,7 @@ def main() -> int:
             copy_file(source, system_assets / asset_rel)
             app_private_asset_bytes += size
             file_manifest.append({"path": rel, "asset_path": asset_rel, "kind": payload_kind,
-                                  "size": size, "sha256": digest})
+                                  "size": size, "sha256": digest, "mode": source_mode})
 
     if not symlinks or not native_libraries or not native_executables:
         raise SystemExit("system image staging unexpectedly produced an incomplete payload")

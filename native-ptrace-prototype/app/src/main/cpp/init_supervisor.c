@@ -1431,7 +1431,7 @@ static int mediate_guest_script_execve(pid_t pid, struct tracee_state *state,
         rc = -EACCES;
         goto fail;
     }
-    if (!(opened_st.st_mode & 0111)) {
+    if (!guest_script_mode_is_executable((uint32_t)opened_st.st_mode)) {
         reason = "guest-script-has-no-execute-bit";
         rc = -EACCES;
         goto fail;
@@ -1440,8 +1440,15 @@ static int mediate_guest_script_execve(pid_t pid, struct tracee_state *state,
     char shebang[sizeof(expected_shebang) - 1];
     ssize_t shebang_bytes = pread(script_fd, shebang, sizeof(shebang), 0);
     if (shebang_bytes != (ssize_t)sizeof(shebang) ||
-        memcmp(shebang, expected_shebang, sizeof(shebang)) != 0) {
+        !guest_script_has_approved_shebang(shebang, (size_t)shebang_bytes)) {
         reason = "guest-script-shebang-is-not-approved-system-shell";
+        rc = -EACCES;
+        goto fail;
+    }
+    if (!guest_script_launch_is_authorized(guest_path, canonical_guest_root,
+            canonical_system_root, fd_resolved, S_ISREG(opened_st.st_mode),
+            (uint32_t)opened_st.st_mode, shebang, sizeof(shebang))) {
+        reason = "guest-script-combined-route-authorization-failed";
         rc = -EACCES;
         goto fail;
     }
@@ -1560,10 +1567,9 @@ static int mediate_guest_script_execve(pid_t pid, struct tracee_state *state,
     dynamic_exec_allowed_count++;
     guest_script_routes_approved++;
     path_rewrites++;
-    printf("GUEST SCRIPT EXEC ROUTE: host-pid=%d guest-pid=%d guest-shell=%s script=%s argv0=%s argv1=%s forwarded-extra-args=%zu shell-elf=verified-API10-ARM32 patched-linker=fd-198 host-shell-exec=0 same-tracee=1\n",
-           pid, state ? state->guest_pid : 0, GUEST_API10_SHELL_PATH,
-           GUEST_API10_GOLDFISH_SCRIPT, GUEST_API10_SHELL_PATH,
-           GUEST_API10_GOLDFISH_SCRIPT, preserved_count);
+    guest_script_log_exec_route(pid, state ? state->guest_pid : 0,
+                                GUEST_API10_SHELL_PATH,
+                                GUEST_API10_GOLDFISH_SCRIPT, preserved_count);
     return 0;
 
 fail:
@@ -2327,12 +2333,11 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 dynamic_exec_started_count++;
                 if (script_launch) {
                     guest_script_exec_started_count++;
-                    printf("GUEST SCRIPT LAUNCH EVENT: host-pid=%d guest-pid=%d guest-shell=%s script=%s; original API10 linker entered via fd=%d; shell-main-entry=unobserved\n",
-                           waited, state->guest_pid,
-                           state->exec_target[0] ? state->exec_target : GUEST_API10_SHELL_PATH,
-                           state->exec_script_path[0] ? state->exec_script_path
-                                                      : GUEST_API10_GOLDFISH_SCRIPT,
-                           GUEST_LINKER_FD);
+                    guest_script_log_launch_event(waited, state->guest_pid,
+                        state->exec_target[0] ? state->exec_target : GUEST_API10_SHELL_PATH,
+                        state->exec_script_path[0] ? state->exec_script_path
+                                                   : GUEST_API10_GOLDFISH_SCRIPT,
+                        GUEST_LINKER_FD);
                     printf("GUEST STARTUP STAGE: guest-script-shell-linker-entry=observed pid=%d guest-pid=%d shell=%s script=%s; target-main-entry=not-observed (no target-entry instrumentation); Zygote/framework=unproven\n",
                            waited, state->guest_pid,
                            state->exec_target[0] ? state->exec_target : GUEST_API10_SHELL_PATH,

@@ -32,6 +32,33 @@ static inline int guest_script_path_is_whitelisted(const char *guest_path) {
     return guest_path && strcmp(guest_path, GUEST_API10_GOLDFISH_SCRIPT) == 0;
 }
 
+static inline int guest_script_mode_is_executable(uint32_t mode) {
+    return (mode & 0111u) != 0;
+}
+
+static inline int guest_script_has_approved_shebang(const char *bytes, size_t length) {
+    static const char expected[] = "#!/system/bin/sh\n";
+    return bytes && length == sizeof(expected) - 1 &&
+           memcmp(bytes, expected, sizeof(expected) - 1) == 0;
+}
+
+static inline void guest_script_log_exec_route(int host_pid, int guest_pid,
+                                               const char *guest_shell,
+                                               const char *script,
+                                               size_t forwarded_extra_args) {
+    printf("GUEST SCRIPT EXEC ROUTE: host-pid=%d guest-pid=%d guest-shell=%s script=%s argv0=%s argv1=%s forwarded-extra-args=%zu shell-elf=verified-API10-ARM32 patched-linker=fd-198 host-shell-exec=0 same-tracee=1\n",
+           host_pid, guest_pid, guest_shell, script, GUEST_API10_SHELL_PATH,
+           GUEST_API10_GOLDFISH_SCRIPT, forwarded_extra_args);
+}
+
+static inline void guest_script_log_launch_event(int host_pid, int guest_pid,
+                                                 const char *guest_shell,
+                                                 const char *script,
+                                                 int linker_fd) {
+    printf("GUEST SCRIPT LAUNCH EVENT: host-pid=%d guest-pid=%d guest-shell=%s script=%s; original API10 linker entered via fd=%d; shell-main-entry=unobserved\n",
+           host_pid, guest_pid, guest_shell, script, linker_fd);
+}
+
 static inline int guest_script_path_within(const char *path, const char *root) {
     if (!path || !root || root[0] != '/' || path[0] != '/') return 0;
     size_t root_length = strlen(root);
@@ -56,6 +83,20 @@ static inline int guest_script_file_is_authorized(const char *guest_path,
                      canonical_system_root);
     if (n <= 0 || (size_t)n >= sizeof(expected)) return 0;
     return strcmp(resolved_script, expected) == 0;
+}
+
+static inline int guest_script_launch_is_authorized(const char *guest_path,
+                                                     const char *canonical_guest_root,
+                                                     const char *canonical_system_root,
+                                                     const char *resolved_script,
+                                                     int regular_nosymlink,
+                                                     uint32_t mode,
+                                                     const char *shebang,
+                                                     size_t shebang_length) {
+    return guest_script_file_is_authorized(guest_path, canonical_guest_root,
+               canonical_system_root, resolved_script, regular_nosymlink) &&
+           guest_script_mode_is_executable(mode) &&
+           guest_script_has_approved_shebang(shebang, shebang_length);
 }
 
 /* Collect argv[1..] only; kernel shebang semantics replace the original argv[0]. */

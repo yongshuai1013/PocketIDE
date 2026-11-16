@@ -99,10 +99,10 @@ public final class MainActivity extends Activity {
                 + "Host ABI: " + Arrays.toString(Build.SUPPORTED_ABIS) + "\n"
                 + "64-bit app process: " + Process.is64Bit() + "\n"
                 + "Android API: " + Build.VERSION.SDK_INT + "\n\n"
-                + "HISTORICAL DEVICE TRACE (user-provided v0.6.9 Android 12 log; not this run): original /init passed coldboot. The first detailed guest PID 13 exec failure was /system/etc/init.goldfish.sh with EACCES because its resolved file was outside the approved native executable root. The official app-private API10 file is mode 0550 with shebang #!/system/bin/sh. The tree recorded 14 fork/clone/vfork events, 13 execs and 12 original-linker entries including /system/bin/app_process, but no target-main entry, Zygote or framework. ueventd waited on an empty software event queue; supervisor timeout cleanup succeeded (tracked=4, reaped=4, unresolved=0), host privileged mounts=0. This build permits only that exact script, through the verified guest shell ELF and confined app-private system file; it does not execute a host shell or perform host networking.\n"
+                + "HISTORICAL DEVICE TRACE (user-provided v0.6.10 Android 12 log; not this run): original /init passed coldboot. Guest PID 13 attempted /system/etc/init.goldfish.sh and received EACCES (guest-script-has-no-execute-bit); approved-routes=0 and exec-events=0, so the guest shell did not start. The official API10 script mode is 0550, but the earlier APK staging omitted source file modes. The tree recorded 14 fork/clone/vfork events, 13 execs and 12 original-linker entries including /system/bin/app_process, but no target-main entry, Zygote or framework. ueventd waited on an empty software event queue; supervisor timeout cleanup succeeded (tracked=4, reaped=4, unresolved=0), host privileged mounts=0. This build authenticates source modes in the manifest and restores app-private modes without following guest symlinks; only that exact script is routed through the verified guest shell ELF. It does not execute a host shell or perform host networking.\n"
                 + "A dynamic-linker entry is not proof of target main, Zygote, framework, system_server or desktop. The guest display panel below has no framebuffer source yet and does not represent a running Android screen.\n\n"
                 + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer follows the latest output; share/save exports the complete log.\n"
-                + "No v0.6.10 device trace has been recorded yet; the v0.6.9 evidence above is historical context.";
+                + "No v0.6.11 device trace has been recorded yet; the v0.6.10 evidence above is historical context.";
     }
 
     private void buildUi() {
@@ -476,7 +476,7 @@ public final class MainActivity extends Activity {
         throwIfStopRequested();
         StringBuilder out = new StringBuilder();
         out.append("GingerVM continuous Android 2.3.7/API 10 init process-tree trace\n");
-        out.append("HISTORICAL DEVICE TRACE (user-provided v0.6.9 Android 12 log; not this run): original /init passed coldboot. Guest PID 13 attempted /system/etc/init.goldfish.sh and received EACCES because the resolved file was outside the approved native executable root; the official app-private script is mode 0550 with shebang #!/system/bin/sh. The tree recorded 14 fork/clone/vfork events, 13 execs and 12 original-linker entries including /system/bin/app_process, but no target-main entry, Zygote or framework. ueventd waited on an empty software event queue; supervisor timeout cleanup succeeded (tracked=4, reaped=4, unresolved=0), host privileged mounts=0. v0.6.10 routes only this exact script through the verified guest shell ELF and confines it to the app-private API10 system tree.\n\n");
+        out.append("HISTORICAL DEVICE TRACE (user-provided v0.6.10 Android 12 log; not this run): original /init passed coldboot. Guest PID 13 attempted /system/etc/init.goldfish.sh and received EACCES (guest-script-has-no-execute-bit); approved-routes=0 and exec-events=0, so the guest shell did not start. The official API10 script mode is 0550, but the earlier APK staging omitted source file modes. The tree recorded 14 fork/clone/vfork events, 13 execs and 12 original-linker entries including /system/bin/app_process, but no target-main entry, Zygote or framework. ueventd waited on an empty software event queue; supervisor timeout cleanup succeeded (tracked=4, reaped=4, unresolved=0), host privileged mounts=0. v0.6.11 authenticates source modes in the manifest and restores app-private modes without following guest symlinks; only this exact script is routed through the verified guest shell ELF. This is not yet a v0.6.11 device result.\n\n");
         out.append("Host ABI: ").append(Arrays.toString(Build.SUPPORTED_ABIS)).append('\n');
         out.append("64-bit app process: ").append(Process.is64Bit()).append('\n');
         out.append("Android API: ").append(Build.VERSION.SDK_INT).append('\n');
@@ -543,6 +543,7 @@ public final class MainActivity extends Activity {
                 copyAssetTree("api10-system", systemRoot);
                 if (!systemRoot.isDirectory()) throw new IOException("full /system image tree was not staged");
                 restoreSystemAssetNames(systemRoot, manifest);
+                int restoredFileModes = restoreSystemAssetModes(systemRoot, manifest);
                 restoreSystemSymlinks(systemRoot);
                 installNativeSystemPayloads(systemRoot, guestLibraryDir);
                 verifyGuestSystemTree(systemRoot, manifest, guestLibraryDir);
@@ -559,6 +560,8 @@ public final class MainActivity extends Activity {
                 out.append("DEPLOYMENT: staged original ramdisk + full ").append(manifest.optInt("regular_file_count"))
                         .append("-file /system tree (uncompressed ").append(manifest.optLong("regular_file_bytes") / (1024 * 1024)).append(" MiB)\n");
                 out.append("SYSTEM LINKS: ").append(manifest.optInt("symlink_count")).append(" confined symlinks restored\n");
+                out.append("SYSTEM FILE MODES: ").append(restoredFileModes)
+                        .append(" app-private asset modes restored from authenticated manifest; special bits cleared\n");
                 out.append("NATIVE PAYLOADS: ").append(manifest.optInt("native_library_count"))
                         .append(" guest system libraries + ").append(manifest.optInt("native_executable_count"))
                         .append(" original guest executable ELFs + ").append(manifest.optInt("dynamic_executable_count"))
@@ -820,6 +823,7 @@ public final class MainActivity extends Activity {
         }
 
         JSONArray files = manifest.getJSONArray("files");
+        AppPrivateFileModeRestorer.Operations fileModeOps = guestFileModeOperations();
         long sourceBytes = 0;
         int sourceFileCount = 0;
         for (int i = 0; i < files.length(); ++i) {
@@ -830,11 +834,14 @@ public final class MainActivity extends Activity {
             validateRelativePath(relative);
             long size = item.getLong("size");
             String digest = item.getString("sha256");
+            int sourceMode = item.getInt("mode");
+            AppPrivateFileModeRestorer.safeHostMode(sourceMode);
             sourceBytes += size;
             sourceFileCount++;
             if ("asset".equals(kind)) {
                 expectedFiles.add(relative);
                 verifyRegularFile(new File(systemRoot, relative), size, digest, false);
+                AppPrivateFileModeRestorer.verify(systemRoot, relative, sourceMode, fileModeOps);
             } else {
                 expectedLinks.add(relative);
                 String nativeName = item.getString("native");
@@ -939,6 +946,58 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private AppPrivateFileModeRestorer.Operations guestFileModeOperations() {
+        return new AppPrivateFileModeRestorer.Operations() {
+            @Override
+            public AppPrivateFileModeRestorer.Node lstat(File path) throws IOException {
+                try {
+                    StructStat stat = Os.lstat(path.getAbsolutePath());
+                    return new AppPrivateFileModeRestorer.Node(stat.st_mode, stat.st_dev, stat.st_ino);
+                } catch (ErrnoException e) {
+                    throw new IOException("cannot lstat app-private guest mode path " + path, e);
+                }
+            }
+
+            @Override
+            public Object openReadOnlyNoFollow(File path) throws IOException {
+                try {
+                    return Os.open(path.getAbsolutePath(),
+                            OsConstants.O_RDONLY | OsConstants.O_CLOEXEC | OsConstants.O_NOFOLLOW, 0);
+                } catch (ErrnoException e) {
+                    throw new IOException("cannot open app-private guest mode target without following symlinks " + path, e);
+                }
+            }
+
+            @Override
+            public AppPrivateFileModeRestorer.Node fstat(Object descriptor) throws IOException {
+                try {
+                    StructStat stat = Os.fstat((FileDescriptor) descriptor);
+                    return new AppPrivateFileModeRestorer.Node(stat.st_mode, stat.st_dev, stat.st_ino);
+                } catch (ErrnoException | ClassCastException e) {
+                    throw new IOException("cannot fstat app-private guest mode descriptor", e);
+                }
+            }
+
+            @Override
+            public void fchmod(Object descriptor, int safeMode) throws IOException {
+                try {
+                    Os.fchmod((FileDescriptor) descriptor, safeMode);
+                } catch (ErrnoException | ClassCastException e) {
+                    throw new IOException("cannot restore app-private guest file mode", e);
+                }
+            }
+
+            @Override
+            public void close(Object descriptor) throws IOException {
+                try {
+                    Os.close((FileDescriptor) descriptor);
+                } catch (ErrnoException | ClassCastException e) {
+                    throw new IOException("cannot close app-private guest mode descriptor", e);
+                }
+            }
+        };
+    }
+
     private String readLink(File link) throws IOException {
         try {
             return Os.readlink(link.getAbsolutePath());
@@ -1016,6 +1075,23 @@ public final class MainActivity extends Activity {
             if (restored.exists()) deleteRecursively(restored);
             if (!staged.renameTo(restored)) throw new IOException("cannot restore original system filename: " + original);
         }
+    }
+
+    private int restoreSystemAssetModes(File systemRoot, JSONObject manifest)
+            throws IOException, JSONException {
+        JSONArray files = manifest.getJSONArray("files");
+        AppPrivateFileModeRestorer.Operations ops = guestFileModeOperations();
+        int restored = 0;
+        for (int i = 0; i < files.length(); ++i) {
+            throwIfStopRequested();
+            JSONObject item = files.getJSONObject(i);
+            if (!"asset".equals(item.getString("kind"))) continue;
+            String relative = item.getString("path");
+            validateRelativePath(relative);
+            AppPrivateFileModeRestorer.restore(systemRoot, relative, item.getInt("mode"), ops);
+            restored++;
+        }
+        return restored;
     }
 
     private void installNativeSystemPayloads(File systemRoot, File guestLibraryDir)
