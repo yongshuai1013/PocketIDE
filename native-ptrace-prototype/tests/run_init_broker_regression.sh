@@ -30,6 +30,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_network_virtual_test.c" -o "$TMP/guest_network_virtual_test"
 "$TMP/guest_network_virtual_test" "$GUEST_BASE/system-tree/etc/init.goldfish.sh"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_frame_channel_test.c" -o "$TMP/guest_frame_channel_test"
+"$TMP/guest_frame_channel_test" "$TMP/guest-frame-root"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_device_boundary_test.c" -o "$TMP/guest_device_boundary_test"
 "$TMP/guest_device_boundary_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -64,12 +67,16 @@ javac -d "$TMP/java" \
   "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/AppPrivateFileModeRestorer.java" \
   "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/AppPrivateTreeCleanup.java" \
   "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/TraceOutputCapture.java" \
+  "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/GuestFramePacket.java" \
   "$ROOT/tests/AppPrivateFileModeRestorerTest.java" \
   "$ROOT/tests/AppPrivateTreeCleanupTest.java" \
-  "$ROOT/tests/TraceOutputCaptureTest.java"
+  "$ROOT/tests/TraceOutputCaptureTest.java" \
+  "$ROOT/tests/GuestFramePacketTest.java"
 java -ea -cp "$TMP/java" dev.gingervm.nativeprobe.AppPrivateFileModeRestorerTest
 java -cp "$TMP/java" dev.gingervm.nativeprobe.AppPrivateTreeCleanupTest
 java -cp "$TMP/java" dev.gingervm.nativeprobe.TraceOutputCaptureTest
+java -cp "$TMP/java" dev.gingervm.nativeprobe.GuestFramePacketTest \
+  "$TMP/guest-frame-root/gingervm-display/latest.gvmf"
 if [[ "$(uname -m)" == "x86_64" ]]; then
   cc -std=c11 -O2 -Wall -Wextra -Werror \
     "$ROOT/tests/ptrace_seccomp_sigsys_regression.c" -o "$TMP/ptrace_seccomp_sigsys_regression"
@@ -132,9 +139,12 @@ pending_child_stop_test = Path(sys.argv[1]).parents[4].joinpath('tests/ptrace_ch
 device_boundary = Path(sys.argv[1]).with_name('guest_device_boundary.h').read_text()
 sigmask_compat = Path(sys.argv[1]).with_name('guest_sigprocmask_compat.h').read_text()
 sigmask_ptrace = Path(sys.argv[1]).with_name('guest_sigprocmask_ptrace.h').read_text()
+frame_channel = Path(sys.argv[1]).with_name('guest_frame_channel.h').read_text()
 repo_root = Path(sys.argv[1]).parents[4]
 network_test = (repo_root / 'tests/guest_network_virtual_test.c').read_text()
 network_test_runner = (repo_root / 'tests/run_init_broker_regression.sh').read_text()
+frame_native_test = (repo_root / 'tests/guest_frame_channel_test.c').read_text()
+frame_java_test = (repo_root / 'tests/GuestFramePacketTest.java').read_text()
 guest_image = repo_root / 'guest-image/google-api10-android-2.3.7'
 system_build_prop = (guest_image / 'system-tree/build.prop').read_text()
 ramdisk_default_prop = (guest_image / 'ramdisk-root/default.prop').read_text()
@@ -378,6 +388,31 @@ for ioctl in ('GUEST_NET_SIOCSIFADDR', 'GUEST_NET_SIOCSIFNETMASK',
     assert ioctl in network_test, ioctl
 assert 'guest_network_virtual_test.c' in network_test_runner
 assert '$GUEST_BASE/system-tree/etc/init.goldfish.sh' in network_test_runner
+assert 'GUEST_FRAME_PROTOCOL_MAGIC "GVMF"' in frame_channel
+assert 'GUEST_FRAME_SOURCE_GUEST_FRAMEBUFFER 1u' in frame_channel
+assert 'GUEST_FRAME_SOURCE_TEST_ONLY 2u' in frame_channel
+assert 'GUEST_FRAME_MAX_PAYLOAD_BYTES 8388608u' in frame_channel
+assert 'guest_frame_channel_validate_app_private_directory' in frame_channel
+assert 'O_NOFOLLOW' in frame_channel and 'renameat(dirfd' in frame_channel
+assert 'guest_frame_channel_test.c' in network_test_runner and 'GuestFramePacketTest.java' in network_test_runner
+assert 'GUEST_FRAME_SOURCE_GUEST_FRAMEBUFFER' in frame_native_test and 'symlink(target_dir, link_dir)' in frame_native_test
+assert 'test-only frame source must never be accepted' in frame_java_test and 'checksum' in frame_java_test
+frame_packet = Path(sys.argv[2]).with_name('GuestFramePacket.java').read_text()
+assert 'decodeGuestFramebuffer' in frame_packet and 'SOURCE_GUEST_FRAMEBUFFER' in frame_packet
+assert 'MAX_PIXELS' in frame_packet and 'MAX_PAYLOAD_BYTES' in frame_packet
+assert 'source is not a guest framebuffer' in frame_packet
+assert 'payload checksum mismatch' in frame_packet and 'unsupported guest framebuffer bits-per-pixel' in frame_packet
+assert 'GUEST FRAME CHANNEL CONFIG:' in src and 'unsetenv(GUEST_FRAME_CHANNEL_ENV)' in src
+assert 'gingervm_publish_guest_frame_from_fb' in src and 'guest_frame_channel_publish_file' in src
+main_source = src.split('int main(', 1)[1]
+assert main_source.index('configure_guest_frame_channel();') < main_source.index('start_guest(')
+assert 'GUEST FRAME OUTPUT SUMMARY:' in src and 'no guest fb producer' in src
+assert 'FileObserver.MOVED_TO' in activity and 'OsConstants.O_NOFOLLOW' in activity
+assert 'GuestFramePacket.decodeGuestFramebuffer(bytes)' in activity
+assert 'Bitmap.createBitmap(frame.argb, frame.width, frame.height' in activity
+assert 'builder.environment().put(GuestFramePacket.CHANNEL_ENVIRONMENT' in activity
+assert 'Guest display transport:' in activity and 'guest fb0 ioctl/mmap/page-flip producer' in activity
+assert 'setImageBitmap(bitmap)' in activity and 'no guest fb0 ioctl/mmap/page-flip producer' in activity
 for node in ('/dev/null', '/dev/zero', '/dev/full', '/dev/random', '/dev/urandom', '/dev/ashmem', '/dev/binder'):
     assert node in ueventd_rc, node
 assert 'GUEST_MODE_IFCHR 0020000u' in pseudo_device
@@ -546,9 +581,9 @@ assert 'dialog.setOnDismissListener' in activity
 assert 'Theme.Material' in theme
 assert '#38BDF8' in theme and '#FF0B0F14' in theme
 assert 'FrameLayout guestDisplayFrame' in activity
-assert 'Guest display · 尚未啟動畫面輸出' in activity
-assert 'no guest framebuffer is available' in activity
-assert '尚無 guest 畫面' in activity and '不是正在執行的 Android 桌面' in activity
+assert 'Guest display · 等待真實 guest frame' in activity
+assert 'waiting for a verified guest framebuffer frame' in activity
+assert '尚無 guest 畫面' in activity and '此區不是 Android 桌面' in activity
 assert 'setTitle("GingerVM")' in activity
 assert 'supervisor.destroy()' in activity and 'USER STOP REQUESTED' in activity
 assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activity
@@ -566,10 +601,10 @@ assert 'supervisor ended by bounded timeout; cleanup tracked=12/reaped=12/unreso
 assert 'v0.6.17 defers only recognized ptrace child-initial-stop statuses until an exact parent event PID match' in activity
 assert 'pending children share the same hard 32-slot budget' in activity
 assert 'new device trace must show whether the child is adopted and which guest command runs' in activity
-assert 'app display panel remains an honest no-frame placeholder' in activity
-assert 'no guest Binder/framebuffer backend or guest-originated frame has been observed' in activity
-assert 'No host Binder/framebuffer or synthetic Android screen is used' in activity
-assert 'This v0.6.16 owner-provided device trace is the current verified baseline' in activity
+assert 'panel remains explicitly no-frame' in activity
+assert 'guest Goldfish fb0 ioctl/mmap/page-flip producer and guest Binder service are not implemented' in activity
+assert 'No host Binder/framebuffer or drawn Android screen is used' in activity
+assert 'This v0.6.16 owner-provided device trace remains the latest verified device baseline' in activity
 assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
 assert 'network-effects=guest-software-broker-only' in src
 assert 'guest_tracee_slot_allocate' in src and 'guest_tracee_slot_mark_ptrace_exit' in src
@@ -620,11 +655,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.17-test-signed-apk' in upload
-assert 'gingervm-v0.6.17-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 26" in gradle and "versionName '0.6.17'" in gradle
+assert 'gingervm-continuous-trace-v0.6.18-test-signed-apk' in upload
+assert 'gingervm-v0.6.18-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 27" in gradle and "versionName '0.6.18'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.17' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.18' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

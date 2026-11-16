@@ -42,6 +42,7 @@
 #include "guest_tracee_slots.h"
 #include "guest_device_boundary.h"
 #include "ptrace_child_stop_queue.h"
+#include "guest_frame_channel.h"
 
 #ifndef __WALL
 #define __WALL 0x40000000
@@ -299,6 +300,45 @@ static pid_t traced_pid = -1;
 static char guest_root[PATH_MAX];
 static char native_guest_root[PATH_MAX];
 static const char *guest_program = "/init";
+static char guest_frame_directory[PATH_MAX];
+static int guest_frame_channel_ready;
+static unsigned long guest_frame_published_count;
+
+static void configure_guest_frame_channel(void) {
+    const char *configured = getenv(GUEST_FRAME_CHANNEL_ENV);
+    if (configured && configured[0]) {
+        int rc = guest_frame_channel_validate_app_private_directory(configured, guest_root);
+        if (rc == 1) {
+            size_t length = strlen(configured);
+            memcpy(guest_frame_directory, configured, length + 1);
+            guest_frame_channel_ready = 1;
+            puts("GUEST FRAME CHANNEL CONFIG: ready=1; exact app-private guest-root sibling; atomic GVMF/1 packets; no pixels claimed");
+        } else {
+            printf("GUEST FRAME CHANNEL CONFIG: ready=0; app-private sibling/owner/mode validation failed errno=%d; trace continues without frame output\n",
+                   -rc);
+        }
+    } else {
+        puts("GUEST FRAME CHANNEL CONFIG: ready=0; app frame directory not supplied; trace continues without frame output");
+    }
+    if (unsetenv(GUEST_FRAME_CHANNEL_ENV) != 0)
+        printf("GUEST FRAME CHANNEL CONFIG: supervisor environment cleanup failed errno=%d; guest exec still uses a fixed environment\n",
+               errno);
+}
+
+int gingervm_publish_guest_frame_from_fb(const guest_frame_packet *frame) {
+    if (!guest_frame_channel_ready || !guest_frame_directory[0]) return -ENODEV;
+    int rc = guest_frame_channel_publish_file(guest_frame_directory, frame);
+    if (rc == 0) {
+        ++guest_frame_published_count;
+        if (guest_frame_published_count == 1)
+            puts("GUEST FRAME PUBLISHED: first validated source=guest-framebuffer packet written atomically; app renderer will verify checksum/format");
+    } else if (guest_frame_published_count == 0) {
+        printf("GUEST FRAME PUBLISH REJECTED: guest framebuffer packet invalid/unavailable errno=%d; no frame was emitted\n",
+               -rc);
+    }
+    return rc;
+}
+
 static long trace_timeout_ms = TRACE_TIMEOUT_MS;
 static struct guest_mount mounts[MAX_GUEST_MOUNTS];
 static size_t mount_count;
@@ -4197,6 +4237,7 @@ int main(int argc, char **argv) {
     if (!realpath(argv[2], guest_root)) {
         fprintf(stderr, "guest root is not accessible: errno=%d\n", errno); return 2;
     }
+    configure_guest_frame_channel();
     if (!realpath(argv[3], native_guest_root)) {
         fprintf(stderr, "guest ABI native-library directory is not accessible: errno=%d\n", errno); return 2;
     }
@@ -4243,6 +4284,8 @@ int main(int argc, char **argv) {
            GUEST_PROFILE_NET_IFACE, GUEST_PROFILE_NET_ADDRESS,
            GUEST_PROFILE_NET_NETMASK, GUEST_PROFILE_NET_GATEWAY,
            GUEST_PROFILE_NET_DNS1);
+    printf("GUEST FRAME CHANNEL: ready=%d; GVMF/1 app-private receiver; frames-published=%lu; producer=not-connected; fb ioctls/mmap/page-flip=not-implemented; host framebuffer/Binder=0\n",
+           guest_frame_channel_ready, guest_frame_published_count);
     printf("PROCESS TREE: fork/clone/vfork followed with ptrace; active-and-unreaped registry cap=%d; process slots reusable after guest wait4 reap, non-waitable thread slots after ptrace terminal exit; verified ARM32 execs and confined original-linker aliases\n", MAX_TRACEES);
     puts("DYNAMIC ELF POLICY: original API10 linker is inherited as fd 198; unsupported PT_INTERP is denied before host-linker substitution");
     int child = start_guest(binary, &argv[5]);
@@ -4323,6 +4366,8 @@ int main(int argc, char **argv) {
            virtual_property_sendto_count, virtual_property_sendto_bytes,
            virtual_property_recvfrom_count, virtual_property_recvfrom_bytes,
            virtual_property_stream_errors, virtual_property_stream_diagnostics);
+    printf("GUEST FRAME OUTPUT SUMMARY: channel-ready=%d frames-published=%lu; only source=guest-framebuffer packets are renderable; test-only frames rejected; no guest fb producer or Android desktop observed\n",
+           guest_frame_channel_ready, guest_frame_published_count);
     printf("VIRTUAL PROPERTY/SIGNAL SOCKET SUMMARY: created=%lu binds=%lu connects=%lu accepts=%lu signal-pairs=%lu; host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv/sendto/recvfrom calls=0\n",
            virtual_property_socket_count, virtual_property_bind_count,
            virtual_property_connect_count, virtual_property_accept_count,

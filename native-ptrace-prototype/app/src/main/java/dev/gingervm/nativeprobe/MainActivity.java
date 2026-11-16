@@ -7,9 +7,11 @@ import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.res.AssetManager;
 import android.net.Uri;
+import android.graphics.Bitmap;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.FileObserver;
 import android.os.Process;
 import android.os.StatFs;
 import android.system.ErrnoException;
@@ -20,6 +22,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -48,6 +51,10 @@ import java.util.Locale;
 import java.util.Set;
 import java.text.SimpleDateFormat;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class MainActivity extends Activity {
@@ -72,7 +79,18 @@ public final class MainActivity extends Activity {
     private Button viewLogButton;
     private Button stopButton;
     private FrameLayout guestDisplayFrame;
+    private TextView guestDisplayTitle;
+    private ImageView guestDisplayImage;
     private TextView guestDisplayStatus;
+    private File guestFrameDirectory;
+    private File guestFrameFile;
+    private FileObserver guestFrameObserver;
+    private ExecutorService guestFrameExecutor;
+    private final AtomicLong guestFrameEventGeneration = new AtomicLong();
+    private final AtomicLong guestFrameRunEpoch = new AtomicLong();
+    private final AtomicBoolean guestFrameDecodeScheduled = new AtomicBoolean();
+    private volatile boolean guestFrameChannelAvailable;
+    private volatile long displayedGuestFrameSequence;
     private File latestLogFile;
     private volatile boolean stopRequested;
     private volatile boolean explicitStopRequested;
@@ -87,6 +105,7 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         setTitle("GingerVM");
         buildUi();
+        initializeGuestFrameReceiver();
         latestLogFile = new File(getCacheDir(), LOG_FILE_NAME);
         exportButton.setEnabled(hasExportableLog());
         viewLogButton.setEnabled(hasExportableLog());
@@ -102,9 +121,10 @@ public final class MainActivity extends Activity {
                 + "LATEST DEVICE TRACE (owner-provided v0.6.16 Android 12 log): Goldfish uevent delivery, coldboot marker and PID 1 stat succeeded. The continuous tree recorded 42 fork/clone/vfork events, 32 guest execs and 31 original linker entries. app_process entered the linker, but its target-code entry was not observed; the only ET_EXEC entry hit identified was /sbin/ueventd. No target main, Zygote, framework, system_server or desktop was observed.\n"
                 + "The property listener bound/listened, but connect/accept/sendto/recvfrom were all 0, so v0.6.16's new property stream was not exercised. The old trace killed host PID 14912 as unregistered immediately before a later fork-event record identified the same child PID under guest PID 13; the old logger did not include that wait status or the child's exec path, so its exact stop signal and intended command remain unproven. The owner-reported eth0 route failure is not evidence that ifconfig ran. The supervisor ended by bounded timeout; cleanup tracked=12/reaped=12/unresolved=0.\n"
                 + "v0.6.17 defers only recognized ptrace child-initial-stop statuses until an exact parent event PID match, then registers, configures and resumes the child; pending children share the same hard 32-slot budget and timeout cleanup. Host tests pass, but a new device trace must show whether the child is adopted and which guest command runs.\n"
-                + "The app display panel remains an honest no-frame placeholder: the original guest SurfaceFlinger and Goldfish graphics libraries are staged, but no guest Binder/framebuffer backend or guest-originated frame has been observed. No host Binder/framebuffer or synthetic Android screen is used. A linker entry is not proof of target main, Zygote, framework, desktop or display output.\n\n"
+                + "API10 SystemServer.java says init1 is called from Zygote and starts native services including SurfaceFlinger; its JNI init1 calls system_init(). The owner trace did not observe app_process target-code entry, Zygote or SystemServer, so that stage has not run.\n"
+                + "The viewport now has an app-private GVMF/1 receiver and Bitmap renderer. It accepts only bounded, checksum-verified source=guest-framebuffer packets and rejects TEST_ONLY/invalid packets. This is the display sink only: the guest Goldfish fb0 ioctl/mmap/page-flip producer and guest Binder service are not implemented, no real frame has been observed, and the panel remains explicitly no-frame. No host Binder/framebuffer or drawn Android screen is used. A linker entry is not proof of target main, Zygote, framework, desktop or display output.\n\n"
                 + "Log retention: one latest complete session, overwritten by the next run (not circular). The viewer follows the latest output; share/save exports the complete log.\n"
-                + "This v0.6.16 owner-provided device trace is the current verified baseline; a new trace is required to verify v0.6.17 and any future real display pipeline.";
+                + "This v0.6.16 owner-provided device trace remains the latest verified device baseline. v0.6.17/v0.6.18 runtime changes and any real display pipeline require a new on-device trace; this build does not claim a booted desktop.";
     }
 
     private void buildUi() {
@@ -142,8 +162,8 @@ public final class MainActivity extends Activity {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
 
-        TextView guestDisplayTitle = new TextView(this);
-        guestDisplayTitle.setText("Guest display · 尚未啟動畫面輸出");
+        guestDisplayTitle = new TextView(this);
+        guestDisplayTitle.setText("Guest display · 等待真實 guest frame");
         guestDisplayTitle.setTextColor(0xFFC7D2DE);
         guestDisplayTitle.setTextSize(14);
         guestDisplayTitle.setPadding(0, dp(12), 0, dp(6));
@@ -157,9 +177,16 @@ public final class MainActivity extends Activity {
         displayBackground.setCornerRadius(dp(14));
         displayBackground.setStroke(dp(1), 0xFF2B3541);
         guestDisplayFrame.setBackground(displayBackground);
-        guestDisplayFrame.setContentDescription("Guest display viewport; no guest framebuffer is available");
+        guestDisplayFrame.setContentDescription("Guest display viewport; waiting for a verified guest framebuffer frame");
+        guestDisplayImage = new ImageView(this);
+        guestDisplayImage.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        guestDisplayImage.setVisibility(View.GONE);
+        guestDisplayFrame.addView(guestDisplayImage, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                Gravity.CENTER));
         guestDisplayStatus = new TextView(this);
-        guestDisplayStatus.setText("尚無 guest 畫面\n目前沒有 guest framebuffer／Surface frame。\n此區不是正在執行的 Android 桌面。");
+        guestDisplayStatus.setText("尚無 guest 畫面\n只顯示驗證過的 guest framebuffer 像素。\n目前 guest fb0／Binder frame producer 尚未接通；此區不是 Android 桌面。");
         guestDisplayStatus.setTextColor(0xFF9AA8B6);
         guestDisplayStatus.setTextSize(14);
         guestDisplayStatus.setGravity(Gravity.CENTER);
@@ -202,8 +229,211 @@ public final class MainActivity extends Activity {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
+    private void initializeGuestFrameReceiver() {
+        try {
+            guestFrameDirectory = new File(getFilesDir(), GuestFramePacket.CHANNEL_DIRECTORY);
+            ensurePrivateGuestFrameDirectory(guestFrameDirectory);
+            guestFrameFile = new File(guestFrameDirectory, GuestFramePacket.CHANNEL_FILE);
+            guestFrameExecutor = Executors.newSingleThreadExecutor(new java.util.concurrent.ThreadFactory() {
+                @Override public Thread newThread(Runnable task) {
+                    Thread thread = new Thread(task, "guest-frame-decoder");
+                    thread.setDaemon(true);
+                    return thread;
+                }
+            });
+            guestFrameObserver = new FileObserver(guestFrameDirectory.getAbsolutePath(),
+                    FileObserver.MOVED_TO | FileObserver.CLOSE_WRITE) {
+                @Override public void onEvent(int event, String path) {
+                    if (path != null && GuestFramePacket.CHANNEL_FILE.equals(path) &&
+                            (event & (FileObserver.MOVED_TO | FileObserver.CLOSE_WRITE)) != 0)
+                        requestGuestFrameDecode();
+                }
+            };
+            guestFrameObserver.startWatching();
+            guestFrameChannelAvailable = true;
+            guestDisplayStatus.setText("等待真實 guest framebuffer frame…\n僅接收 app-private GVMF/1 且驗證 checksum 的 guest 像素。\n目前尚未接通 guest fb0／Binder frame producer。");
+            requestGuestFrameDecode();
+        } catch (Exception e) {
+            guestFrameChannelAvailable = false;
+            guestDisplayStatus.setText("Guest frame 接收器不可用：" + e.getMessage() + "\n不會顯示測試圖或合成 Android 桌面。");
+        }
+    }
+
+    private void ensurePrivateGuestFrameDirectory(File directory) throws IOException {
+        StructStat state;
+        try {
+            state = Os.lstat(directory.getAbsolutePath());
+        } catch (ErrnoException e) {
+            if (e.errno != OsConstants.ENOENT) throw new IOException("cannot inspect guest frame directory", e);
+            try {
+                Os.mkdir(directory.getAbsolutePath(), 0700);
+            } catch (ErrnoException createError) {
+                if (createError.errno != OsConstants.EEXIST)
+                    throw new IOException("cannot create app-private guest frame directory", createError);
+            }
+            try {
+                state = Os.lstat(directory.getAbsolutePath());
+            } catch (ErrnoException verifyError) {
+                throw new IOException("cannot verify app-private guest frame directory", verifyError);
+            }
+        }
+        if (!OsConstants.S_ISDIR(state.st_mode) || state.st_uid != Process.myUid() ||
+                (state.st_mode & 0077) != 0)
+            throw new IOException("guest frame directory is not an app-owned mode-0700 directory");
+    }
+
+    private void requestGuestFrameDecode() {
+        guestFrameEventGeneration.incrementAndGet();
+        scheduleGuestFrameDecode();
+    }
+
+    private void scheduleGuestFrameDecode() {
+        if (!guestFrameChannelAvailable || guestFrameExecutor == null ||
+                !guestFrameDecodeScheduled.compareAndSet(false, true)) return;
+        try {
+            guestFrameExecutor.execute(new Runnable() {
+                @Override public void run() {
+                    long observedGeneration = guestFrameEventGeneration.get();
+                    long observedRunEpoch = guestFrameRunEpoch.get();
+                    try {
+                        byte[] bytes = readLatestGuestFramePacket();
+                        if (bytes != null) {
+                            GuestFramePacket.Frame frame = GuestFramePacket.decodeGuestFramebuffer(bytes);
+                            renderGuestFrame(frame, observedRunEpoch);
+                        }
+                    } catch (Exception e) {
+                        showGuestFrameDecodeError(e);
+                    } finally {
+                        guestFrameDecodeScheduled.set(false);
+                        if (guestFrameEventGeneration.get() != observedGeneration)
+                            scheduleGuestFrameDecode();
+                    }
+                }
+            });
+        } catch (RuntimeException e) {
+            guestFrameDecodeScheduled.set(false);
+            showGuestFrameDecodeError(e);
+        }
+    }
+
+    private byte[] readLatestGuestFramePacket() throws IOException {
+        FileDescriptor descriptor;
+        try {
+            descriptor = Os.open(guestFrameFile.getAbsolutePath(),
+                    OsConstants.O_RDONLY | OsConstants.O_CLOEXEC | OsConstants.O_NOFOLLOW, 0);
+        } catch (ErrnoException e) {
+            if (e.errno == OsConstants.ENOENT) return null;
+            throw new IOException("cannot open guest frame packet without following symlinks", e);
+        }
+        boolean streamOwnsDescriptor = false;
+        try {
+            StructStat state;
+            try {
+                state = Os.fstat(descriptor);
+            } catch (ErrnoException e) {
+                throw new IOException("cannot inspect guest frame packet", e);
+            }
+            long maxBytes = GuestFramePacket.HEADER_BYTES + (long) GuestFramePacket.MAX_PAYLOAD_BYTES;
+            if (!OsConstants.S_ISREG(state.st_mode) || state.st_uid != Process.myUid() ||
+                    (state.st_mode & 0077) != 0 || state.st_size < GuestFramePacket.HEADER_BYTES ||
+                    state.st_size > maxBytes)
+                throw new IOException("guest frame packet is not an owned bounded regular file");
+            try (FileInputStream input = new FileInputStream(descriptor)) {
+                streamOwnsDescriptor = true;
+                byte[] bytes = new byte[(int) state.st_size];
+                int offset = 0;
+                while (offset < bytes.length) {
+                    int count = input.read(bytes, offset, bytes.length - offset);
+                    if (count < 0) throw new IOException("guest frame packet changed during read");
+                    offset += count;
+                }
+                if (input.read() != -1) throw new IOException("guest frame packet grew beyond its verified size");
+                return bytes;
+            }
+        } finally {
+            if (!streamOwnsDescriptor) {
+                try { Os.close(descriptor); } catch (ErrnoException ignored) { }
+            }
+        }
+    }
+
+    private void renderGuestFrame(final GuestFramePacket.Frame frame, final long runEpoch) {
+        if (frame.sequence <= displayedGuestFrameSequence) return;
+        final Bitmap bitmap;
+        try {
+            bitmap = Bitmap.createBitmap(frame.argb, frame.width, frame.height, Bitmap.Config.ARGB_8888);
+        } catch (RuntimeException e) {
+            showGuestFrameDecodeError(e);
+            return;
+        }
+        runOnUiThread(new Runnable() {
+            @Override public void run() {
+                if (isFinishing() || runEpoch != guestFrameRunEpoch.get() ||
+                        frame.sequence <= displayedGuestFrameSequence) {
+                    bitmap.recycle();
+                    return;
+                }
+                displayedGuestFrameSequence = frame.sequence;
+                guestDisplayImage.setImageBitmap(bitmap);
+                guestDisplayImage.setVisibility(View.VISIBLE);
+                guestDisplayStatus.setVisibility(View.GONE);
+                guestDisplayTitle.setText("Guest display · guest framebuffer " + frame.width + "×" + frame.height);
+                guestDisplayFrame.setContentDescription("Verified pixels from the guest framebuffer; sequence " + frame.sequence);
+            }
+        });
+    }
+
+    private void showGuestFrameDecodeError(final Exception error) {
+        runOnUiThread(new Runnable() {
+            @Override public void run() {
+                if (displayedGuestFrameSequence == 0) {
+                    guestDisplayStatus.setVisibility(View.VISIBLE);
+                    guestDisplayStatus.setText("拒絕無效 guest frame：" + error.getMessage() + "\n等待下一個有效的 guest framebuffer packet。");
+                }
+            }
+        });
+    }
+
+    private void resetGuestFrameBeforeRun() {
+        if (!guestFrameChannelAvailable || guestFrameDirectory == null) return;
+        guestFrameRunEpoch.incrementAndGet();
+        try {
+            unlinkPrivateFrameLeaf(guestFrameFile);
+            unlinkPrivateFrameLeaf(new File(guestFrameDirectory, GuestFramePacket.CHANNEL_TEMP_FILE));
+            displayedGuestFrameSequence = 0;
+            guestDisplayImage.setImageDrawable(null);
+            guestDisplayImage.setVisibility(View.GONE);
+            guestDisplayStatus.setVisibility(View.VISIBLE);
+            guestDisplayStatus.setText("等待此次 run 的真實 guest framebuffer frame…\n測試 packet 不會顯示在 viewport。");
+            guestDisplayTitle.setText("Guest display · 等待真實 guest frame");
+            guestDisplayFrame.setContentDescription("Guest display viewport; waiting for a verified guest framebuffer frame");
+        } catch (IOException e) {
+            guestFrameChannelAvailable = false;
+            guestDisplayStatus.setText("無法安全清除舊 frame：" + e.getMessage() + "；本次不啟用畫面輸送。");
+        }
+    }
+
+    private void unlinkPrivateFrameLeaf(File file) throws IOException {
+        try {
+            StructStat state = Os.lstat(file.getAbsolutePath());
+            if (OsConstants.S_ISDIR(state.st_mode))
+                throw new IOException("refusing to remove a directory at a frame leaf");
+            Os.remove(file.getAbsolutePath());
+        } catch (ErrnoException e) {
+            if (e.errno != OsConstants.ENOENT) throw new IOException("cannot remove stale frame leaf", e);
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (guestFrameObserver != null) guestFrameObserver.stopWatching();
+        if (guestFrameExecutor != null) guestFrameExecutor.shutdownNow();
+        super.onDestroy();
+    }
+
     private void startRun() {
         if (runActive) return;
+        resetGuestFrameBeforeRun();
         stopRequested = false;
         explicitStopRequested = false;
         runActive = true;
@@ -215,7 +445,8 @@ public final class MainActivity extends Activity {
         viewLogButton.setEnabled(true);
         stopButton.setEnabled(true);
         setReportText("Preparing the complete original Google API10 guest image; userland and linker aliases are staged in app-private storage and extracted ARM32 libraries…\n"
-                + "HISTORICAL DEVICE TRACE (user-provided v0.6.8 Android 12 log; not this run): staging and original /init ran; PID 1 passed coldboot wait, with 14 process events, 13 exec events and 12 linker entries. Guest PID 13 execve returned brokered -EACCES and exited 127, but its guest pathname/rejection branch was not logged. The trace ended at the supervisor timeout with tracked=4/reaped=4/unresolved=0. No target main, Zygote, framework or guest display frame was proven. This version adds bounded diagnostics only; the Stop button remains a separate user cancellation.\n");
+                + "LATEST OWNER DEVICE TRACE (v0.6.16, not this run): 42 process events, 32 guest execs and 31 original-linker entries; app_process reached linker entry but no target-code PC, Zygote, SystemServer, SurfaceFlinger or frame was observed. The shell launched route on eth0; route got ENETDOWN and the trace had no ifconfig exec/setup evidence. Supervisor timeout cleanup completed tracked=12/reaped=12/unresolved=0.\n"
+                + "This version adds only an app-private, checksummed guest-frame receiver/renderer. The Goldfish fb0 producer and guest Binder are still absent; this panel remains no-frame until genuine guest framebuffer bytes arrive. Stop is still an independent user cancellation.\n");
         postProgress("RUN STARTED: one continuous original /init process-tree session; this app-private latest-log file will be replaced when the run ends.\n");
         Thread worker = new Thread(new Runnable() {
             @Override public void run() {
@@ -583,6 +814,7 @@ public final class MainActivity extends Activity {
         out.append("Supervisor: ").append(supervisor.getAbsolutePath()).append('\n');
         out.append("ARM32 executable directory: ").append(guestLibraryDir.getAbsolutePath()).append('\n');
         out.append("Source image hashes: original Google API10 ramdisk/system; no Samsung payloads\n");
+        out.append("Guest display transport: app-private GVMF/1 receiver; only verified guest-framebuffer packets render; no guest fb0 ioctl/mmap/page-flip producer or guest Binder is connected\n");
         out.append("Host root/mount calls: none\n\n");
 
         out.append("Continuous trace: one original /init with its traced child tree; maximum 32 tracees, bounded by the supervisor timeout.\n");
@@ -591,7 +823,7 @@ public final class MainActivity extends Activity {
         appendProgress(out, "Start original /init and follow its child processes in the same session");
         out.append(runNative("continuous /init process tree", supervisor, guestInit, guestRoot, 120,
                 guestLibraryDir, "/init"));
-        out.append("\nBOOT BOUNDARY: logs separately mark an observed original-linker entry and the target-main entry, which remains unobserved because no architecture-safe target-entry instrumentation is installed. Neither linker entry nor the dark display panel proves Zygote, framework, system-server, desktop, or framebuffer output.\n");
+        out.append("\nBOOT BOUNDARY: logs separately mark an observed original-linker entry and the target-main entry, which remains unobserved because no architecture-safe target-entry instrumentation is installed. The display sink is ready, but no guest framebuffer producer/frame is connected. Neither a linker entry nor this dark viewport proves Zygote, framework, system-server, desktop, or framebuffer output.\n");
         return out.toString();
     }
 
@@ -613,7 +845,11 @@ public final class MainActivity extends Activity {
             command[3] = allowedGuestLibraryDir.getAbsolutePath();
             command[4] = Integer.toString(traceMillis);
             System.arraycopy(guestArgv, 0, command, 5, guestArgv.length);
-            process = new ProcessBuilder(command).redirectErrorStream(true).start();
+            ProcessBuilder builder = new ProcessBuilder(command).redirectErrorStream(true);
+            if (guestFrameChannelAvailable && guestFrameDirectory != null)
+                builder.environment().put(GuestFramePacket.CHANNEL_ENVIRONMENT,
+                        guestFrameDirectory.getAbsolutePath());
+            process = builder.start();
         } catch (Exception e) {
             if (stopRequested) return header.append("USER CANCELLED BEFORE SUPERVISOR START: ").append(e).append('\n').toString();
             return header.append("START FAILED: ").append(e).append('\n').toString();
