@@ -66,21 +66,34 @@ static inline const char *guest_diag_syscall_name(int number) {
         case 26: return "ptrace";
         case 37: return "kill";
         case 52: return "umount2";
+        case 57: return "setpgid";
+        case 67: return "sigaction";
+        case 79: return "settimeofday";
         case 83: return "symlink";
         case 93: return "ftruncate";
         case 102: return "socketcall";
         case 114: return "wait4";
         case 120: return "clone";
         case 126: return "sigprocmask";
+        case 133: return "fchdir";
+        case 162: return "nanosleep";
         case 168: return "poll";
+        case 174: return "rt_sigaction";
         case 175: return "rt_sigprocmask";
         case 202: return "getegid32";
+        case 195: return "stat64";
+        case 196: return "lstat64";
+        case 197: return "fstat64";
+        case 263: return "clock_gettime";
         case 281: return "socket";
         case 282: return "bind";
         case 283: return "connect";
         case 284: return "listen";
         case 285: return "accept";
         case 288: return "socketpair";
+        case 297: return "recvmsg";
+        case 322: return "openat";
+        case 327: return "fstatat64";
         default: return "unknown";
     }
 }

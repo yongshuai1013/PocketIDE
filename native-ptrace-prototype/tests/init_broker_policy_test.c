@@ -21,6 +21,9 @@ int main(void) {
     assert(guest_syscall_policy(195) == GUEST_SYSCALL_PATH_REWRITE);
     assert(guest_syscall_policy(15) == GUEST_SYSCALL_PATH_REWRITE);
     assert(guest_syscall_policy(24) == GUEST_SYSCALL_VIRTUALIZE);
+    assert(guest_syscall_policy(57) == GUEST_SYSCALL_VIRTUALIZE); /* guest-only setpgid */
+    assert(guest_syscall_policy(67) == GUEST_SYSCALL_VIRTUALIZE); /* legacy sigaction adapter */
+    assert(guest_syscall_policy(79) == GUEST_SYSCALL_VIRTUALIZE); /* timezone-only settimeofday */
     assert(guest_syscall_policy(14) == GUEST_SYSCALL_VIRTUAL_DEVICE);
     assert(guest_syscall_policy(120) == GUEST_SYSCALL_TRACE_PROCESS);
     assert(guest_syscall_policy(2) == GUEST_SYSCALL_TRACE_PROCESS);
@@ -37,6 +40,7 @@ int main(void) {
     assert(guest_syscall_policy(291) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* recv */
     assert(guest_syscall_policy(294) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* setsockopt */
     assert(guest_syscall_policy(295) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* getsockopt */
+    assert(guest_syscall_policy(297) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* recvmsg for ueventd only */
     assert(guest_syscall_policy(286) == GUEST_SYSCALL_DENY); /* getpeername */
     assert(guest_syscall_policy(287) == GUEST_SYSCALL_DENY); /* getsockname */
     assert(guest_syscall_policy(290) == GUEST_SYSCALL_DENY); /* sendto not implemented */

@@ -15,8 +15,26 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_sigprocmask_compat_test.c" -o "$TMP/guest_sigprocmask_compat_test"
 "$TMP/guest_sigprocmask_compat_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_sigaction_compat_test.c" -o "$TMP/guest_sigaction_compat_test"
+"$TMP/guest_sigaction_compat_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_process_compat_test.c" -o "$TMP/guest_process_compat_test"
+"$TMP/guest_process_compat_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_uevent_virtual_test.c" -o "$TMP/guest_uevent_virtual_test"
 "$TMP/guest_uevent_virtual_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_path_fd_test.c" -o "$TMP/guest_path_fd_test"
+"$TMP/guest_path_fd_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_safe_dir_test.c" -o "$TMP/guest_safe_dir_test"
+"$TMP/guest_safe_dir_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_pseudo_device_test.c" -o "$TMP/guest_pseudo_device_test"
+"$TMP/guest_pseudo_device_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_entry_probe_test.c" -o "$TMP/guest_entry_probe_test"
+"$TMP/guest_entry_probe_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_socket_virtual_test.c" -o "$TMP/guest_socket_virtual_test"
 "$TMP/guest_socket_virtual_test"
@@ -76,13 +94,24 @@ import re, sys
 src = Path(sys.argv[1]).read_text()
 trace = src.split("static int run_trace(", 1)[1].split("int main(", 1)[0]
 uevent = Path(sys.argv[1]).with_name('guest_uevent_virtual.h').read_text()
+safe_dir = Path(sys.argv[1]).with_name('guest_safe_dir.h').read_text()
+safe_dir_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_safe_dir_test.c').read_text()
 socket_model = Path(sys.argv[1]).with_name('guest_socket_virtual.h').read_text()
 socket_path = Path(sys.argv[1]).with_name('guest_socket_path_ops.h').read_text()
 diagnostics = Path(sys.argv[1]).with_name('guest_diagnostics.h').read_text()
 sigsys_context = Path(sys.argv[1]).with_name('guest_sigsys_context.h').read_text()
 script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
+profile = Path(sys.argv[1]).with_name('guest_hardware_profile.h').read_text()
+pseudo_device = Path(sys.argv[1]).with_name('guest_pseudo_device.h').read_text()
 sigmask_compat = Path(sys.argv[1]).with_name('guest_sigprocmask_compat.h').read_text()
 sigmask_ptrace = Path(sys.argv[1]).with_name('guest_sigprocmask_ptrace.h').read_text()
+repo_root = Path(sys.argv[1]).parents[4]
+guest_image = repo_root / 'guest-image/google-api10-android-2.3.7'
+system_build_prop = (guest_image / 'system-tree/build.prop').read_text()
+ramdisk_default_prop = (guest_image / 'ramdisk-root/default.prop').read_text()
+goldfish_rc = (guest_image / 'ramdisk-root/init.goldfish.rc').read_text()
+goldfish_script = (guest_image / 'system-tree/etc/init.goldfish.sh').read_text()
+ueventd_rc = (guest_image / 'guest-root-staging/ueventd.rc').read_text()
 activity = Path(sys.argv[2]).read_text()
 capture = Path(sys.argv[2]).with_name('TraceOutputCapture.java').read_text()
 tree_cleanup = Path(sys.argv[2]).with_name('AppPrivateTreeCleanup.java').read_text()
@@ -120,7 +149,7 @@ assert 'host socket API not called' in src and 'host bind API not called' in src
 assert 'host setsockopt API not called' in src
 assert 'GUEST POLL DIAGNOSTIC:' in src and 'virtual_fd_source(fds[i].fd)' in src
 assert 'timeout-ms=%d' in src and 'revents-in=0x%04x revents-out=0x%04x' in src
-assert 'empty/no synthetic device events' in src
+assert 'empty guest-only uevent queue' in src
 assert 'guest_vsocket_poll_events(' in src and '&guest_sockets, fd, fds[i].events' in src
 assert 'VIRTUAL PROPERTY SOCKET CREATE:' in src and 'VIRTUAL PROPERTY BIND:' in src
 assert 'VIRTUAL PROPERTY LISTEN:' in src and 'VIRTUAL PROPERTY ACCEPT:' in src
@@ -214,7 +243,7 @@ assert '"mode": source_mode' in stager
 assert '0550' in mode_test.read_text() and 'final-link.sh' in mode_test.read_text()
 assert 'outside-parent/outside.sh' in mode_test.read_text() and '../outside.sh' in mode_test.read_text()
 assert 'GUEST STARTUP STAGE: linker-entry=observed' in src
-assert 'target-main-entry=not-observed (no target-entry instrumentation)' in src
+assert 'GUEST TARGET ELF TEXT ENTRY:' in src and 'C main() symbol is not inferred' in src
 assert 'GUEST STARTUP STAGE SUMMARY' in src and 'BROKER DIAGNOSTIC SUMMARY' in src
 assert 'guest_diag_escape("bad\\n\\033\\\"path"' in diagnostic_test.read_text()
 assert 'GUEST_VSOCKET_MAX_FDS 32' in socket_model
@@ -227,7 +256,48 @@ assert 'guest_socket_marker_create_app_private' in socket_path
 assert 'openat(dirfd, leaf' in socket_path and 'O_NOFOLLOW' in socket_path
 assert 'realpath(fd_path, opened_parent)' in socket_path
 assert 'GUEST COLD-BOOT MARKER OPEN:' in src
-assert 'INIT COLD-BOOT WAIT RELEASED:' in src
+assert 'GUEST UEVENTD COLD-BOOT MARKER PRECHECK:' in src
+assert 'GUEST COLD-BOOT PID1 STAT:' in src
+assert 'INIT COLD-BOOT WAIT CONDITION OBSERVED:' in src
+assert 'ARM_NR_FSTATAT64' in src and 'pid1_stat_succeeded_after_marker' in src
+assert 'guest_uevent_note_marker_open' not in src
+assert 'sysfs add -> synchronous recvmsg -> marker -> PID1 stat' in Path(sys.argv[1]).parents[4].joinpath('tests/guest_uevent_virtual_test.c').read_text()
+assert '#define GUEST_PROFILE_HARDWARE "goldfish"' in profile
+assert '#define GUEST_PROFILE_CPU_COUNT 1u' in profile
+assert 'explicit GingerVM synthetic defaults' in profile
+assert 'androidboot.hardware=" GUEST_PROFILE_HARDWARE "\\n' in profile
+assert 'Hardware : " GUEST_PROFILE_HARDWARE "\\n' in profile
+assert 'GUEST_PROFILE_SYNTHETIC_RAM_TOTAL_KB 262144u' in profile
+assert 'GUEST_PROFILE_SYNTHETIC_RAM_FREE_KB 131072u' in profile
+assert 'MemTotal:       262144 kB' in profile and 'MemFree:        131072 kB' in profile
+assert 'ro.build.version.sdk=10' in system_build_prop
+assert 'ro.build.version.release=2.3.7' in system_build_prop
+assert 'ro.product.model=sdk' in system_build_prop
+assert 'ro.product.brand=generic' in system_build_prop
+assert 'ro.product.device=generic' in system_build_prop
+assert 'ro.product.cpu.abi=armeabi-v7a' in system_build_prop
+assert 'ro.secure=0' in ramdisk_default_prop and 'ro.debuggable=1' in ramdisk_default_prop
+assert 'GUEST_PROFILE_NET_ADDRESS "10.0.2.15"' in profile
+assert 'GUEST_PROFILE_NET_NETMASK "255.255.255.0"' in profile
+assert 'GUEST_PROFILE_NET_GATEWAY "10.0.2.2"' in profile
+assert 'GUEST_PROFILE_NET_DNS1 "10.0.2.3"' in profile
+for literal in ('ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up',
+                'route add default gw 10.0.2.2 dev eth0',
+                'net.eth0.dns1 10.0.2.3'):
+    assert literal in goldfish_script + goldfish_rc, literal
+for node in ('/dev/null', '/dev/zero', '/dev/full', '/dev/random', '/dev/urandom', '/dev/ashmem', '/dev/binder'):
+    assert node in ueventd_rc, node
+assert 'GUEST_MODE_IFCHR 0020000u' in pseudo_device
+assert 'GUEST PSEUDO-DEVICE STAT64:' in src and 'GUEST PSEUDO-DEVICE FSTAT64:' in src
+assert 'guest_pseudo_device_backing_present(guest)' in src
+assert 'guest_safe_file_open_beneath_root' in src and 'O_NOFOLLOW' in safe_dir
+assert 'GUEST TEMP DEVICE OPEN:' in src and 'app-private temporary placeholder' in src
+assert 'GUEST HARDWARE PROFILE:' in src and 'not host-phone data' in src
+assert 'packet I/O=unavailable, host network calls=0' in src
+assert 'guest_safe_dir_open_beneath_root' in src and 'guest_safe_dir_open_beneath_root' in safe_dir
+assert 'O_NOFOLLOW' in safe_dir and 'AT_SYMLINK_NOFOLLOW' in safe_dir
+assert 'symlink(outside, link_path)' in safe_dir_test and 'symlink(real_directory, second_link)' in safe_dir_test
+assert 'root, "../outside/escape"' in safe_dir_test and 'no outside writes' in safe_dir_test
 assert 'unlink(marker_path)' in src and 'INIT STATE: initial actions reached' not in src
 assert 'GUEST_UEVENT_NETLINK_KOBJECT_UEVENT 15u' in uevent
 assert 'GUEST_UEVENT_RCVBUFFORCE_BYTES 65536' in uevent
@@ -356,7 +426,7 @@ assert continuous_run.count('runNative(') == 1
 assert 'guestLibraryDir, "/init"' in continuous_run
 assert 'one original /init with its traced child tree' in continuous_run
 assert 'changing only PT_INTERP' in continuous_run and '/proc/self/fd/198' in continuous_run
-assert 'target main entry remains unproven' in src
+assert 'GUEST TARGET ELF TEXT ENTRY:' in src and 'C main() symbol is not inferred' in src
 assert 'A dynamic-linker entry is not proof' in activity
 assert 'dynamic_executable_count' in activity and 'dynamic_sha256' in activity
 assert 'captured.size() > 192 * 1024' not in activity and 'reader.join(100L)' in activity
@@ -392,15 +462,16 @@ assert 'STOP_CLEANUP_GRACE_SECONDS' in activity and 'destroyForcibly()' in activ
 assert 'USER CANCELLED DURING STAGING' in activity and 'throwIfStopRequested();' in activity
 assert 'runProgressLog' in activity and 'writeLatestLog(completeLog)' in activity
 assert 'appendReportText(chunk)' in activity and 'InputStreamReader' not in activity
-assert 'HISTORICAL DEVICE TRACE (user-provided v0.6.12 Android 12 log; not this run)' in activity
-assert 'tracee-seccomp-mode=2' in activity and 'ARM syscall 126 sigprocmask(SIG_BLOCK), r0=0' in activity
-assert 'Runtime maps that PC to APK-extracted /system/lib/libc.so offset 0xbf6c' in activity
-assert 'SHA-256 matches official API10 libc' in activity
-assert 'This proves a genuine seccomp trap, not a broker placeholder' in activity
+assert 'LATEST DEVICE TRACE (user-provided v0.6.13 Android 12 log; historical evidence)' in activity
+assert "PID1's successful stat of that marker after creation was not recorded" in activity
+assert 'v0.6.14 source adds a deterministic app-private no-device uevent fixture' in activity
+assert 'Syscall126 compatibility passed (11 calls, all result=0; real signal masks preserved)' in activity
+assert 'No synthetic device event was delivered' in activity
+assert 'denied ARM syscalls 67 sigaction, 57 setpgid and 79 settimeofday' in activity
 assert 'tracked=4, reaped=4, unresolved=0' in activity
 assert 'OsConstants.O_NOFOLLOW' in activity and 'Os.fstat(descriptor)' in activity
-assert 'No v0.6.13 device trace has been recorded yet' in activity
-assert 'v0.6.13 routes only syscall126 through actual PTRACE_GETSIGMASK/SETSIGMASK semantics' in activity
+assert 'No v0.6.14 device trace has been recorded yet' in activity
+assert 'v0.6.14 adds source-backed guest-only uevent and syscall compatibility' in activity
 assert 'network-effects=guest-software-broker-only' in src
 assert 'only read access to the latest trace log' in provider and 'ParcelFileDescriptor.MODE_READ_ONLY' in provider
 assert 'android:name=".TraceLogProvider"' in manifest and 'android:exported="false"' in manifest
@@ -437,11 +508,11 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.13-test-signed-apk' in upload
-assert 'gingervm-v0.6.13-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 22" in gradle and "versionName '0.6.13'" in gradle
+assert 'gingervm-continuous-trace-v0.6.14-test-signed-apk' in upload
+assert 'gingervm-v0.6.14-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 23" in gradle and "versionName '0.6.14'" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.13' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.14' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

@@ -20,9 +20,12 @@
 #define GUEST_VSOCKET_F_GETFL 3
 #define GUEST_VSOCKET_F_SETFL 4
 #define GUEST_VSOCKET_FD_CLOEXEC 1
+#define GUEST_VSOCKET_O_RDONLY 0
+#define GUEST_VSOCKET_O_WRONLY 1
 #define GUEST_VSOCKET_O_NONBLOCK 00004000
 #define GUEST_VSOCKET_O_RDWR 2
 #define GUEST_VSOCKET_POLLIN 0x0001
+#define GUEST_VSOCKET_POLLOUT 0x0004
 #define GUEST_VSOCKET_POLLHUP 0x0010
 #define GUEST_VSOCKET_POLLNVAL 0x0020
 
@@ -33,6 +36,13 @@ enum virtual_fd_kind {
     VIRTUAL_FD_UEVENT = 2,
     VIRTUAL_FD_PROPERTY_ACCEPTED = 3,
     VIRTUAL_FD_SIGNAL = 4,
+    VIRTUAL_FD_SYSFS_UEVENT = 5,
+    VIRTUAL_FD_NETCFG = 6,
+    VIRTUAL_FD_DEV_NULL = 7,
+    VIRTUAL_FD_DEV_ZERO = 8,
+    VIRTUAL_FD_DEV_KMSG = 9,
+    VIRTUAL_FD_DEV_RANDOM = 10,
+    VIRTUAL_FD_DEV_FULL = 11,
 };
 
 enum guest_vsocket_channel_kind {
@@ -44,6 +54,10 @@ struct guest_vsocket_fd {
     int allocated;
     int fd;
     enum virtual_fd_kind kind;
+    uint32_t open_flags;
+    uint32_t device_mode;
+    uint32_t device_major;
+    uint32_t device_minor;
     int channel;
     int side;
     int bound;
@@ -426,6 +440,13 @@ static inline int guest_vsocket_poll_events(struct guest_vsocket_table *table,
                                             int fd, int16_t events) {
     struct guest_vsocket_fd *entry = guest_vsocket_fd_get(table, fd);
     if (!entry) return 0;
+    if (entry->kind == VIRTUAL_FD_NETCFG)
+        return (events & GUEST_VSOCKET_POLLOUT) ? GUEST_VSOCKET_POLLOUT : 0;
+    if (entry->kind == VIRTUAL_FD_DEV_NULL || entry->kind == VIRTUAL_FD_DEV_ZERO ||
+        entry->kind == VIRTUAL_FD_DEV_FULL)
+        return events & (GUEST_VSOCKET_POLLIN | GUEST_VSOCKET_POLLOUT);
+    if (entry->kind == VIRTUAL_FD_DEV_KMSG)
+        return events & GUEST_VSOCKET_POLLOUT;
     if (entry->kind == VIRTUAL_FD_PROPERTY && entry->listening) {
         for (size_t i = 0; i < GUEST_VSOCKET_MAX_CHANNELS; ++i) {
             struct guest_vsocket_channel *channel = &table->channels[i];
@@ -457,8 +478,11 @@ static inline int guest_vsocket_fcntl(struct guest_vsocket_table *table, int fd,
         *descriptor_flags = argument;
         return 0;
     }
-    if (command == GUEST_VSOCKET_F_GETFL)
-        return GUEST_VSOCKET_O_RDWR | (entry->nonblocking ? GUEST_VSOCKET_O_NONBLOCK : 0);
+    if (command == GUEST_VSOCKET_F_GETFL) {
+        int access = entry->kind >= VIRTUAL_FD_DEV_NULL && entry->kind <= VIRTUAL_FD_DEV_FULL
+            ? (int)(entry->open_flags & 3u) : GUEST_VSOCKET_O_RDWR;
+        return access | (entry->nonblocking ? GUEST_VSOCKET_O_NONBLOCK : 0);
+    }
     if (command == GUEST_VSOCKET_F_SETFL) {
         if ((argument & ~(GUEST_VSOCKET_O_RDWR | GUEST_VSOCKET_O_NONBLOCK)) != 0)
             return -EINVAL;

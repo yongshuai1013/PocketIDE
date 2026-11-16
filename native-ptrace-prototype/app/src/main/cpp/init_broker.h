@@ -52,31 +52,32 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
         case 328: case 329: case 330: case 332: case 333: case 334:
             return GUEST_SYSCALL_PATH_REWRITE;
 
-        /* Simulated IDs/permissions; never change the Android app's credentials. */
-        case 20: case 23: case 24: case 46: case 47: case 49: case 50: case 60:
+        /* Guest IDs, process groups, legacy signal ABI and timezone; never change
+         * the Android app's credentials, host process groups or wall clock. */
+        case 20: case 23: case 24: case 46: case 47: case 49: case 50: case 57: case 60:
         case 64: case 80: case 81: case 138: case 139: case 164: case 165:
         case 170: case 171: case 172: case 184: case 185: case 199:
         case 168: case 200: case 201: case 202: case 203: case 204:
         case 205: case 206:
         case 207: case 208: case 209: case 210: case 211: case 213: case 214:
-        case 215: case 216: case 224:
+        case 215: case 216: case 224: case 67: case 79:
             return GUEST_SYSCALL_VIRTUALIZE;
 
         /* Symlinks and ftruncate are brokered only against app-private guest VFS objects. */
         case 83: case 93: case 331:
             return GUEST_SYSCALL_FILE_OPERATION;
 
-        /* Only the API10 property service and init signal socketpair are modeled. */
+        /* API10 property/signaling sockets plus the guest-only ueventd queue. */
         case 102: case 281: case 282: case 283: case 284: case 285:
-        case 288: case 289: case 291: case 294: case 295:
+        case 288: case 289: case 291: case 294: case 295: case 297:
             return GUEST_SYSCALL_VIRTUAL_SOCKET;
 
         /* Guest mount table only: no host mount(2), umount(2), or pivot_root(2). */
         case 21: case 52:
             return GUEST_SYSCALL_VIRTUAL_MOUNT;
 
-        /* Only ordinary files may represent devices; ioctl/socket/device actions
-         * are not forwarded to the host kernel in this first slice. */
+        /* Device operations are guest-only; ioctl is intercepted only for the
+         * whitelisted virtual eth0 control fd, and unknown ioctls fail closed. */
         case 14: case 54: case 94: case 95: case 133:
             return GUEST_SYSCALL_VIRTUAL_DEVICE;
 
@@ -126,10 +127,19 @@ static inline int guest_path_to_host(const char *root, const char *guest,
             size_t root_len = strlen(canonical_root);
             if (strncmp(resolved, canonical_root, root_len) != 0 ||
                 (resolved[root_len] != '\0' && resolved[root_len] != '/')) return -EACCES;
-            n = suffix[0] == '\0'
-                ? snprintf(host, capacity, "%s", resolved)
-                : snprintf(host, capacity, "%s/%s", resolved, suffix);
-            return n > 0 && (size_t)n < capacity ? 0 : -ENAMETOOLONG;
+            size_t resolved_len = strlen(resolved);
+            size_t suffix_len = strlen(suffix);
+            if (suffix[0] == '\0') {
+                if (resolved_len >= capacity) return -ENAMETOOLONG;
+                memcpy(host, resolved, resolved_len + 1u);
+                return 0;
+            }
+            if (resolved_len >= capacity || capacity - resolved_len < 2u ||
+                suffix_len > capacity - resolved_len - 2u) return -ENAMETOOLONG;
+            memcpy(host, resolved, resolved_len);
+            host[resolved_len] = '/';
+            memcpy(host + resolved_len + 1u, suffix, suffix_len + 1u);
+            return 0;
         }
         if (errno != ENOENT && errno != ENOTDIR) return -errno;
         char *slash = strrchr(candidate, '/');
