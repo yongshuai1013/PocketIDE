@@ -280,6 +280,30 @@ static inline int guest_vsocket_path_is_qemud_service(const char *path) {
     return path && strcmp(path, GUEST_VSOCKET_QEMUD_PATH) == 0;
 }
 
+static inline int guest_vsocket_actor_is_verified_api10_init_pid1(
+        int guest_pid, int guest_parent_pid, int guest_euid, int is_thread,
+        int verified_init_image) {
+    return guest_pid == 1 && guest_parent_pid == 0 && guest_euid == 0 &&
+        !is_thread && verified_init_image;
+}
+
+static inline int guest_vsocket_actor_is_verified_api10_init_service_child(
+        int guest_pid, int guest_parent_pid, int guest_euid, int is_thread,
+        int verified_init_image) {
+    return guest_pid > 1 && guest_parent_pid == 1 && guest_euid == 0 &&
+        !is_thread && verified_init_image;
+}
+
+static inline int guest_vsocket_bind_actor_allowed(
+        int verified_api10_init_pid1,
+        int verified_api10_init_service_child, const char *path) {
+    if (guest_vsocket_path_is_property_service(path))
+        return verified_api10_init_pid1 != 0;
+    if (guest_vsocket_path_is_qemud_service(path))
+        return verified_api10_init_service_child != 0;
+    return 0;
+}
+
 static inline int guest_vsocket_bind_validate(struct guest_vsocket_table *table,
                                               int fd, uint32_t family,
                                               const char *path) {

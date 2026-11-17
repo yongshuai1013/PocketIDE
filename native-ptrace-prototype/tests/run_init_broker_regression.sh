@@ -153,6 +153,7 @@ uevent = Path(sys.argv[1]).with_name('guest_uevent_virtual.h').read_text()
 safe_dir = Path(sys.argv[1]).with_name('guest_safe_dir.h').read_text()
 safe_dir_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_safe_dir_test.c').read_text()
 socket_model = Path(sys.argv[1]).with_name('guest_socket_virtual.h').read_text()
+socket_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_socket_virtual_test.c').read_text()
 socket_path = Path(sys.argv[1]).with_name('guest_socket_path_ops.h').read_text()
 property_protocol = Path(sys.argv[1]).with_name('guest_property_protocol.h').read_text()
 property_socket_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_property_socket_regression_test.c').read_text()
@@ -256,8 +257,22 @@ assert 'GUEST POLL DIAGNOSTIC:' in src and 'virtual_fd_source(fds[i].fd)' in src
 assert 'timeout-ms=%d' in src and 'revents-in=0x%04x revents-out=0x%04x' in src
 assert 'empty guest-only uevent queue' in src
 assert 'guest_vsocket_poll_events(' in src and '&guest_sockets, fd, fds[i].events' in src
-assert 'VIRTUAL PROPERTY SOCKET CREATE:' in src and 'VIRTUAL GUEST SERVICE BIND:' in src
-assert 'VIRTUAL GUEST SERVICE LISTEN:' in src and 'VIRTUAL PROPERTY ACCEPT:' in src
+assert 'VIRTUAL AF_UNIX SOCKET CREATE:' in src and 'VIRTUAL GUEST SERVICE BIND:' in src
+assert 'tracee_is_verified_api10_init_service_child' in src
+assert 'guest_vsocket_actor_is_verified_api10_init_pid1(' in src
+assert 'guest_vsocket_actor_is_verified_api10_init_service_child(' in src
+assert 'guest_vsocket_bind_actor_allowed(verified_init_pid1,' in src
+assert 'VIRTUAL GUEST SERVICE BIND DENIED:' in src and 'stage=app-private-marker' in src
+assert 'VIRTUAL GUEST SERVICE LISTEN:' in src and 'executable=%s' in src
+assert 'VIRTUAL PROPERTY ACCEPT:' in src
+assert src.count('tracee_is_verified_api10_qemud(active_tracee)') >= 2
+assert src.count('active_tracee->guest_euid != 0') >= 2
+assert 'guest_vsocket_bind_actor_allowed' in socket_model
+assert 'guest_vsocket_actor_is_verified_api10_init_service_child' in socket_test
+assert 'test_qemud_control_socket_service_child_handoff' in socket_test
+assert 'ANDROID_SOCKET_qemud=%d' in socket_test
+assert '== -EAGAIN' in socket_test and '== -EOPNOTSUPP' in socket_test
+assert 'only verified PID1 property-service and verified init-child qemud binds' in src
 assert 'VIRTUAL PROPERTY CONNECT:' in src and 'VIRTUAL PROPERTY SO_PEERCRED:' in src
 assert '#define ARM_NR_SENDTO 290' in src and '#define ARM_NR_RECVFROM 292' in src
 assert 'virtual_guest_property_stream_io' in src and 'VIRTUAL PROPERTY STREAM SYSCALL:' in src
@@ -1007,17 +1022,17 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'Build GingerVM v0.6.32 test-signed Android APK' in workflow
-assert 'gingervm-continuous-trace-v0.6.32-test-signed-apk' in upload
-assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.32-apk.sha256"' in workflow
-assert '${{ runner.temp }}/gingervm-v0.6.32-apk.sha256' in upload
+assert 'Build GingerVM v0.6.33 test-signed Android APK' in workflow
+assert 'gingervm-continuous-trace-v0.6.33-test-signed-apk' in upload
+assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.33-apk.sha256"' in workflow
+assert '${{ runner.temp }}/gingervm-v0.6.33-apk.sha256' in upload
 assert '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 41" in gradle and "versionName '0.6.32'" in gradle
+assert "versionCode 42" in gradle and "versionName '0.6.33'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.32' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.33' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

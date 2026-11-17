@@ -625,7 +625,7 @@ static struct guest_kmsg_runtime guest_kmsg_runtime;
 static unsigned long guest_kmsg_diagnostics_emitted;
 static unsigned long virtual_fd_duplicate_denials;
 static unsigned long virtual_property_bind_count;
-static unsigned long virtual_property_socket_count;
+static unsigned long virtual_af_unix_socket_count;
 static unsigned long virtual_property_connect_count;
 static unsigned long virtual_property_accept_count;
 static unsigned long virtual_property_sendto_count;
@@ -1100,6 +1100,28 @@ static int mkdir_p(const char *path) {
 static int path_is_within(const char *path, const char *root) {
     size_t n = strlen(root);
     return strncmp(path, root, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
+static int tracee_has_verified_api10_init_image(const struct tracee_state *state) {
+    return state && strcmp(state->exec_target, "/init") == 0 &&
+        state->exec_image_committed && state->target_elf_entry_valid &&
+        state->target_elf_type == ET_EXEC && state->exec_backing_path[0] &&
+        ((guest_root[0] && path_is_within(state->exec_backing_path, guest_root)) ||
+         (native_guest_root[0] &&
+          path_is_within(state->exec_backing_path, native_guest_root)));
+}
+
+static int tracee_is_verified_api10_init(const struct tracee_state *state) {
+    return state && guest_vsocket_actor_is_verified_api10_init_pid1(
+        state->guest_pid, state->guest_parent_pid, state->guest_euid,
+        state->is_thread, tracee_has_verified_api10_init_image(state));
+}
+
+static int tracee_is_verified_api10_init_service_child(
+        const struct tracee_state *state) {
+    return state && guest_vsocket_actor_is_verified_api10_init_service_child(
+        state->guest_pid, state->guest_parent_pid, state->guest_euid,
+        state->is_thread, tracee_has_verified_api10_init_image(state));
 }
 
 static int tracee_is_verified_api10_qemud(const struct tracee_state *state) {
@@ -2250,9 +2272,9 @@ static int virtual_guest_socket_create(pid_t pid, uint32_t domain,
         return fd;
     }
     track_virtual_fd_for_group(active_tracee, fd);
-    virtual_property_socket_count++;
+    virtual_af_unix_socket_count++;
     virtual_socket_calls++;
-    printf("VIRTUAL PROPERTY SOCKET CREATE: host-pid=%d guest-pid=%d fd=%d family=AF_UNIX type=SOCK_STREAM protocol=0; app-private software descriptor; host socket API not called\n",
+    printf("VIRTUAL AF_UNIX SOCKET CREATE: host-pid=%d guest-pid=%d fd=%d family=AF_UNIX type=SOCK_STREAM protocol=0; app-private software descriptor; host socket API not called\n",
            pid, active_tracee ? active_tracee->guest_pid : -1, fd);
     return fd;
 }
@@ -2331,15 +2353,40 @@ static int virtual_guest_socket_bind(pid_t pid, int fd, uint32_t address,
     int rc = virtual_property_socket_address(pid, address, address_length,
                                              &family, guest_path, sizeof(guest_path));
     if (rc != 0) return rc;
-    if (!active_tracee || active_tracee->pid != pid || active_tracee->guest_pid != 1 ||
-        strcmp(active_tracee->exec_target, "/init") != 0) return -EPERM;
+    if (!active_tracee || active_tracee->pid != pid) return -EPERM;
     if (!tracee_owns_virtual_fd(active_tracee, fd)) return -EBADF;
     rc = guest_vsocket_bind_validate(&guest_sockets, fd, family, guest_path);
     if (rc != 0) return rc;
+    int verified_init_pid1 = tracee_is_verified_api10_init(active_tracee);
+    int verified_init_service_child =
+        tracee_is_verified_api10_init_service_child(active_tracee);
+    if (!guest_vsocket_bind_actor_allowed(verified_init_pid1,
+            verified_init_service_child, guest_path)) {
+        virtual_socket_calls++;
+        virtual_socket_rejected_count++;
+        printf("VIRTUAL GUEST SERVICE BIND DENIED: host-pid=%d guest-pid=%d parent-guest-pid=%d service=%s result=-EPERM; only verified PID1 property-service and verified init-child qemud binds are allowed; host bind API not called\n",
+               pid, active_tracee->guest_pid, active_tracee->guest_parent_pid,
+               guest_vsocket_path_is_qemud_service(guest_path) ? "qemud" :
+                   "property-service");
+        return -EPERM;
+    }
     rc = map_guest_path(guest_path, host_path, sizeof(host_path));
-    if (rc != 0 || !path_is_within(host_path, guest_root)) return rc != 0 ? rc : -EACCES;
+    if (rc != 0 || !path_is_within(host_path, guest_root)) {
+        rc = rc != 0 ? rc : -EACCES;
+        printf("VIRTUAL GUEST SERVICE BIND FAILED: guest-pid=%d service=%s stage=path-map result=%d; app-private containment required\n",
+               active_tracee->guest_pid,
+               guest_vsocket_path_is_qemud_service(guest_path) ? "qemud" :
+                   "property-service", rc);
+        return rc;
+    }
     rc = guest_socket_marker_create_app_private(host_path, guest_root);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        printf("VIRTUAL GUEST SERVICE BIND FAILED: guest-pid=%d service=%s stage=app-private-marker result=%d; no host socket created\n",
+               active_tracee->guest_pid,
+               guest_vsocket_path_is_qemud_service(guest_path) ? "qemud" :
+                   "property-service", rc);
+        return rc;
+    }
     rc = guest_vsocket_bind_commit_path(&guest_sockets, fd, guest_path);
     if (rc != 0) {
         (void)unlink(host_path);
@@ -2351,8 +2398,10 @@ static int virtual_guest_socket_bind(pid_t pid, int fd, uint32_t address,
         guest_qemud_socket_bind_count++;
     }
     virtual_socket_calls++;
-    printf("VIRTUAL GUEST SERVICE BIND: host-pid=%d guest-pid=1 fd=%d path=%s service=%s marker=app-private regular VFS placeholder; host bind API not called\n",
-           pid, fd, guest_path,
+    printf("VIRTUAL GUEST SERVICE BIND: host-pid=%d guest-pid=%d parent-guest-pid=%d actor=%s fd=%d path=%s service=%s marker=app-private regular VFS placeholder; host bind API not called\n",
+           pid, active_tracee->guest_pid, active_tracee->guest_parent_pid,
+           verified_init_service_child ? "verified-api10-init-service-child" :
+               "verified-api10-init-pid1", fd, guest_path,
            guest_vsocket_path_is_qemud_service(guest_path) ? "qemud" : "property-service");
     return 0;
 }
@@ -2384,12 +2433,19 @@ static int virtual_guest_socket_connect(pid_t pid, int fd, uint32_t address,
 static int virtual_guest_socket_listen(pid_t pid, int fd, int backlog) {
     if (!active_tracee || active_tracee->pid != pid ||
         !tracee_owns_virtual_fd(active_tracee, fd)) return -EBADF;
+    struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
+    if (entry && entry->kind == VIRTUAL_FD_QEMUD_LISTENER &&
+        (!tracee_is_verified_api10_qemud(active_tracee) ||
+         active_tracee->guest_euid != 0)) {
+        virtual_socket_calls++;
+        virtual_socket_rejected_count++;
+        return -EPERM;
+    }
     int rc = guest_vsocket_listen(&guest_sockets, fd, backlog);
     virtual_socket_calls++;
     if (rc == 0) {
-        struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
-        printf("VIRTUAL GUEST SERVICE LISTEN: guest-pid=%d fd=%d service=%s backlog=%d; qemud has no synthetic peer/client; host listen API not called\n",
-               active_tracee->guest_pid, fd,
+        printf("VIRTUAL GUEST SERVICE LISTEN: guest-pid=%d executable=%s fd=%d service=%s backlog=%d; no synthetic peer/client; host listen API not called\n",
+               active_tracee->guest_pid, active_tracee->exec_target, fd,
                entry && entry->kind == VIRTUAL_FD_QEMUD_LISTENER ? "qemud" : "property-service",
                backlog);
     }
@@ -2427,6 +2483,14 @@ static int virtual_guest_socket_accept(pid_t pid, int fd, uint32_t address,
                                        uint32_t address_length_pointer) {
     if (!active_tracee || active_tracee->pid != pid ||
         !tracee_owns_virtual_fd(active_tracee, fd)) return -EBADF;
+    struct guest_vsocket_fd *listener = guest_vsocket_fd_get(&guest_sockets, fd);
+    if (listener && listener->kind == VIRTUAL_FD_QEMUD_LISTENER &&
+        (!tracee_is_verified_api10_qemud(active_tracee) ||
+         active_tracee->guest_euid != 0)) {
+        virtual_socket_calls++;
+        virtual_socket_rejected_count++;
+        return -EPERM;
+    }
     uint32_t address_capacity = 0;
     if (address || address_length_pointer) {
         if (!address || !address_length_pointer ||
@@ -6864,8 +6928,8 @@ int main(int argc, char **argv) {
            guest_fb0_mmap_count, guest_fb0_pan_count,
            guest_fb0_model.software_base_update_acks,
            guest_frame_channel_ready, guest_frame_published_count);
-    printf("VIRTUAL PROPERTY/SIGNAL SOCKET SUMMARY: created=%lu binds=%lu connects=%lu accepts=%lu signal-pairs=%lu; host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv/sendto/recvfrom calls=0\n",
-           virtual_property_socket_count, virtual_property_bind_count,
+    printf("VIRTUAL AF_UNIX/SIGNAL SOCKET SUMMARY: created=%lu binds=%lu connects=%lu accepts=%lu signal-pairs=%lu; host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv/sendto/recvfrom calls=0\n",
+           virtual_af_unix_socket_count, virtual_property_bind_count,
            virtual_property_connect_count, virtual_property_accept_count,
            virtual_socketpair_count);
     if (strcmp(guest_program, "/init") == 0 && (trace_timed_out || trace_cancelled))

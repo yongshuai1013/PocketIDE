@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../app/src/main/cpp/guest_socket_virtual.h"
@@ -15,6 +16,72 @@ static size_t make_sockaddr(unsigned char out[110], const char *path) {
     assert(n <= 108);
     memcpy(out + sizeof(family), path, n);
     return sizeof(family) + n;
+}
+
+static void test_qemud_control_socket_service_child_handoff(void) {
+    assert(guest_vsocket_actor_is_verified_api10_init_pid1(1, 0, 0, 0, 1));
+    assert(!guest_vsocket_actor_is_verified_api10_init_pid1(1, 1, 0, 0, 1));
+    assert(!guest_vsocket_actor_is_verified_api10_init_pid1(1, 0, 1000, 0, 1));
+    assert(!guest_vsocket_actor_is_verified_api10_init_pid1(1, 0, 0, 1, 1));
+    assert(!guest_vsocket_actor_is_verified_api10_init_pid1(1, 0, 0, 0, 0));
+    assert(guest_vsocket_actor_is_verified_api10_init_service_child(
+        14, 1, 0, 0, 1));
+    assert(!guest_vsocket_actor_is_verified_api10_init_service_child(
+        1, 1, 0, 0, 1));
+    assert(!guest_vsocket_actor_is_verified_api10_init_service_child(
+        14, 2, 0, 0, 1));
+    assert(!guest_vsocket_actor_is_verified_api10_init_service_child(
+        14, 1, 1000, 0, 1));
+    assert(!guest_vsocket_actor_is_verified_api10_init_service_child(
+        14, 1, 0, 1, 1));
+    assert(!guest_vsocket_actor_is_verified_api10_init_service_child(
+        14, 1, 0, 0, 0));
+    assert(guest_vsocket_bind_actor_allowed(1, 0,
+        GUEST_VSOCKET_PROPERTY_PATH));
+    assert(!guest_vsocket_bind_actor_allowed(0, 1,
+        GUEST_VSOCKET_PROPERTY_PATH));
+    assert(guest_vsocket_bind_actor_allowed(0, 1,
+        GUEST_VSOCKET_QEMUD_PATH));
+    assert(!guest_vsocket_bind_actor_allowed(1, 0,
+        GUEST_VSOCKET_QEMUD_PATH));
+    assert(!guest_vsocket_bind_actor_allowed(0, 0,
+        GUEST_VSOCKET_QEMUD_PATH));
+    assert(!guest_vsocket_bind_actor_allowed(0, 1,
+        "/dev/socket/qemud/../property_service"));
+
+    struct guest_vsocket_table table;
+    guest_vsocket_table_init(&table);
+    int listener = guest_vsocket_create(&table, GUEST_VSOCKET_AF_UNIX,
+                                        GUEST_VSOCKET_SOCK_STREAM, 0);
+    assert(listener == GUEST_VSOCKET_FD_BASE);
+    assert(guest_vsocket_bind_validate(&table, listener,
+        GUEST_VSOCKET_AF_UNIX, GUEST_VSOCKET_QEMUD_PATH) == 0);
+    assert(guest_vsocket_bind_commit_path(&table, listener,
+        GUEST_VSOCKET_QEMUD_PATH) == 0);
+
+    int status_flags = 0, descriptor_flags = 0;
+    assert(guest_vsocket_fcntl(&table, listener, GUEST_VSOCKET_F_SETFD, 0,
+        &status_flags, &descriptor_flags) == 0);
+    assert(guest_vsocket_fcntl(&table, listener, GUEST_VSOCKET_F_GETFD, 0,
+        &status_flags, &descriptor_flags) == 0);
+    char environment[64];
+    snprintf(environment, sizeof(environment), "ANDROID_SOCKET_qemud=%d", listener);
+    char *value = strchr(environment, '=');
+    assert(value && strtol(value + 1, NULL, 10) == listener);
+
+    assert(guest_vsocket_listen(&table, listener, 4) == 0);
+    assert(guest_vsocket_poll_events(&table, listener,
+        GUEST_VSOCKET_POLLIN) == 0);
+    assert(guest_vsocket_accept(&table, listener) == -EAGAIN);
+    int client = guest_vsocket_create(&table, GUEST_VSOCKET_AF_UNIX,
+                                      GUEST_VSOCKET_SOCK_STREAM, 0);
+    assert(client >= 0);
+    assert(guest_vsocket_connect(&table, client, GUEST_VSOCKET_AF_UNIX,
+        GUEST_VSOCKET_QEMUD_PATH, 22, 0, 0) == -EOPNOTSUPP);
+    assert(table.connected == 0 && table.accepted == 0 &&
+           table.sent_bytes == 0 && table.received_bytes == 0);
+    assert(guest_vsocket_close_fd(&table, client) == 0);
+    assert(guest_vsocket_close_fd(&table, listener) == 0);
 }
 
 int main(void) {
@@ -135,6 +202,8 @@ int main(void) {
     assert(guest_vsocket_close_fd(&table, listener) == 0);
     assert(guest_vsocket_create(&table, GUEST_VSOCKET_AF_UNIX,
                                 GUEST_VSOCKET_SOCK_STREAM, 0) == listener);
+    test_qemud_control_socket_service_child_handoff();
+    puts("qemud control socket regression: PASS (verified init child only; ANDROID_SOCKET_qemud fd survives F_SETFD(0); listen; empty accept EAGAIN; no synthetic peer/data)");
 
     puts("guest AF_UNIX software socket regression: PASS (property listener/connect/send/accept/SO_PEERCRED/recv/close/poll; SIGCHLD socketpair; unsupported domains, paths, types, protocols and options fail closed)");
     return 0;
