@@ -265,6 +265,7 @@ assert 'guest_vsocket_bind_actor_allowed(verified_init_pid1,' in src
 assert 'VIRTUAL GUEST SERVICE BIND DENIED:' in src and 'stage=app-private-marker' in src
 assert 'VIRTUAL GUEST SERVICE LISTEN:' in src and 'executable=%s' in src
 assert 'VIRTUAL PROPERTY ACCEPT:' in src
+assert 'created=%lu property-binds=%lu property-connects=%lu property-accepts=%lu' in src
 assert src.count('tracee_is_verified_api10_qemud(active_tracee)') >= 2
 assert src.count('active_tracee->guest_euid != 0') >= 2
 assert 'guest_vsocket_bind_actor_allowed' in socket_model

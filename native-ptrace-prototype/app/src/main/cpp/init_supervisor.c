@@ -6928,7 +6928,7 @@ int main(int argc, char **argv) {
            guest_fb0_mmap_count, guest_fb0_pan_count,
            guest_fb0_model.software_base_update_acks,
            guest_frame_channel_ready, guest_frame_published_count);
-    printf("VIRTUAL AF_UNIX/SIGNAL SOCKET SUMMARY: created=%lu binds=%lu connects=%lu accepts=%lu signal-pairs=%lu; host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv/sendto/recvfrom calls=0\n",
+    printf("VIRTUAL AF_UNIX/SIGNAL SOCKET SUMMARY: created=%lu property-binds=%lu property-connects=%lu property-accepts=%lu signal-pairs=%lu; host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv/sendto/recvfrom calls=0\n",
            virtual_af_unix_socket_count, virtual_property_bind_count,
            virtual_property_connect_count, virtual_property_accept_count,
            virtual_socketpair_count);
