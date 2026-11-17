@@ -39,6 +39,7 @@
 #include "guest_network_virtual.h"
 #include "guest_pseudo_device.h"
 #include "guest_null_stdio.h"
+#include "guest_kmsg_virtual.h"
 #include "guest_path_fd.h"
 #include "guest_entry_probe.h"
 #include "guest_tracee_slots.h"
@@ -265,6 +266,18 @@
 
 struct compat_pt_regs { uint32_t uregs[18]; };
 struct guest_mount { char target[PATH_MAX]; char backing[PATH_MAX]; };
+struct guest_init_config_read_state {
+    int active;
+    int fd;
+    int size_known;
+    int start_seek_succeeded;
+    int32_t expected_file_size;
+    uint32_t read_calls;
+    uint32_t requested_bytes;
+    int32_t last_read_result;
+    uint64_t bytes_read;
+    char path[32];
+};
 struct tracee_state {
     pid_t pid;
     pid_t guest_pid;
@@ -276,6 +289,7 @@ struct tracee_state {
     uint64_t virtual_fd_mask;
     uint8_t virtual_fd_flags[MAX_VIRTUAL_FDS];
     uint8_t null_stdio_mask;
+    struct guest_init_config_read_state init_config_read;
     uint32_t guest_ruid;
     uint32_t guest_euid;
     uint32_t guest_rgid;
@@ -538,6 +552,9 @@ static unsigned long guest_script_exec_started_count;
 static unsigned long brokered_sigsys_suppressed;
 static struct guest_vsocket_table guest_sockets;
 static struct guest_null_stdio_runtime guest_null_stdio_runtime;
+static struct guest_kmsg_runtime guest_kmsg_runtime;
+static unsigned long guest_kmsg_diagnostics_emitted;
+static unsigned long virtual_fd_duplicate_denials;
 static unsigned long virtual_property_bind_count;
 static unsigned long virtual_property_socket_count;
 static unsigned long virtual_property_connect_count;
@@ -1807,8 +1824,11 @@ static void close_virtual_fds_on_exec(struct tracee_state *state) {
         uint64_t bit = UINT64_C(1) << (unsigned)slot;
         if (!(owned & bit) || !(state->virtual_fd_flags[slot] & GUEST_VSOCKET_FD_CLOEXEC))
             continue;
+        int fd = VIRTUAL_FD_BASE + slot;
         clear_virtual_fd_group(state, slot);
-        release_virtual_fd_if_unreferenced(VIRTUAL_FD_BASE + slot);
+        release_virtual_fd_if_unreferenced(fd);
+        guest_kmsg_note_fd_closed(&guest_kmsg_runtime, fd, 0,
+                                  virtual_fd_referenced(fd), 1);
     }
 }
 
@@ -2542,6 +2562,8 @@ static int virtual_guest_pseudo_device_io(pid_t pid, int fd,
             }
         }
         result = guest_pseudo_device_write(entry->kind, length);
+        if (entry->kind == VIRTUAL_FD_DEV_KMSG)
+            guest_kmsg_note_write(&guest_kmsg_runtime, fd, result);
         if (result > 0) {
             virtual_pseudo_device_io_count++;
             if (entry->kind == VIRTUAL_FD_DEV_KMSG && virtual_pseudo_device_io_count <= 32u)
@@ -3450,6 +3472,9 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
             if (strcmp(guest, GUEST_NULL_STDIO_PATH) == 0) {
                 if (!guest_null_stdio_runtime.node_present ||
                     guest_null_stdio_runtime.unlinked) return -ENOENT;
+            } else if (strcmp(guest, GUEST_KMSG_PATH) == 0) {
+                if (!guest_kmsg_runtime.node_present ||
+                    guest_kmsg_runtime.unlinked) return -ENOENT;
             } else {
                 rc = guest_pseudo_device_backing_present(guest);
                 if (rc != 0) return rc;
@@ -3506,6 +3531,52 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
         if (guest_null_stdio_diagnostics_emitted < 64u) {
             guest_null_stdio_diagnostics_emitted++;
             printf("GUEST NULL DEVICE OPEN: guest-pid=%d executable=%s path=%s flags=0x%x virtual-fd=%d mode=0600 rdev=1:3; app-private guest FD only, no host open/device\n",
+                   active_tracee->guest_pid, active_tracee->exec_target,
+                   guest, flags, fd);
+        }
+        return 0;
+    }
+    if ((nr == ARM_NR_OPEN || nr == ARM_NR_OPENAT) &&
+        strcmp(guest, GUEST_KMSG_PATH) == 0) {
+        if (nr != ARM_NR_OPEN) {
+            guest_kmsg_runtime.open_attempts++;
+            guest_kmsg_runtime.open_failed++;
+            return -EOPNOTSUPP;
+        }
+        if (!active_tracee || active_tracee->pid != pid) {
+            guest_kmsg_runtime.open_attempts++;
+            guest_kmsg_runtime.open_failed++;
+            return -EPERM;
+        }
+        unsigned flags = regs->uregs[1];
+        rc = guest_kmsg_open_validate(&guest_kmsg_runtime,
+            active_tracee->guest_pid, active_tracee->exec_target,
+            active_tracee->identity.euid, guest, flags);
+        if (rc != 0) return rc;
+        int fd = alloc_virtual_fd(VIRTUAL_FD_DEV_KMSG);
+        rc = guest_kmsg_open_complete(&guest_kmsg_runtime, fd);
+        if (rc < 0) {
+            if (fd >= 0) close_virtual_fd(active_tracee, fd);
+            return rc;
+        }
+        set_virtual_fd_open_flags(active_tracee, fd, flags);
+        struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
+        if (!entry) {
+            (void)close_virtual_fd(active_tracee, fd);
+            guest_kmsg_note_fd_closed(&guest_kmsg_runtime, fd, 0,
+                                      virtual_fd_referenced(fd), 0);
+            return -EBADF;
+        }
+        entry->device_mode = GUEST_KMSG_MODE;
+        entry->device_major = 1u;
+        entry->device_minor = 11u;
+        virtual_pseudo_device_open_count++;
+        virtual_device_count++;
+        *is_virtual = 1;
+        *pending_return = fd;
+        if (guest_kmsg_diagnostics_emitted < 64u) {
+            guest_kmsg_diagnostics_emitted++;
+            printf("GUEST KMSG OPEN: guest-pid=%d executable=%s path=%s flags=0x%x virtual-fd=%d mode=0600 rdev=1:11; exact API10 logger FD, no host file/device opened\n",
                    active_tracee->guest_pid, active_tracee->exec_target,
                    guest, flags, fd);
         }
@@ -3606,31 +3677,89 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
             if (flags & O_DIRECTORY) return -ENOTDIR;
             rc = guest_pseudo_device_backing_present(guest);
             if (rc != 0) return rc;
-            if (strcmp(guest, "/dev/__kmsg__") == 0) {
-                printf("GUEST TEMP DEVICE OPEN: guest-pid=%d path=%s; this unsupported API10 log node is app-private placeholder data only; host /dev is not used\n",
-                       active_tracee ? active_tracee->guest_pid : -1, guest);
-            } else {
-                int fd = alloc_virtual_fd(metadata.kind);
-                if (fd < 0) return fd;
-                set_virtual_fd_open_flags(active_tracee, fd, flags);
-                struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
-                if (entry) {
-                    entry->device_mode = metadata.mode;
-                    entry->device_major = metadata.major;
-                    entry->device_minor = metadata.minor;
-                }
-                virtual_pseudo_device_open_count++;
-                virtual_device_count++;
-                *is_virtual = 1;
-                *pending_return = fd;
-                printf("GUEST PSEUDO-DEVICE OPEN: guest-pid=%d executable=%s path=%s kind=%d mode=0%o rdev=%u:%u flags=0x%x fd=%d; app-private software descriptor, host /dev untouched\n",
-                       active_tracee ? active_tracee->guest_pid : -1,
-                       active_tracee ? active_tracee->exec_target : "<unknown>",
-                       guest, metadata.kind, metadata.mode & 07777u,
-                       metadata.major, metadata.minor, flags, fd);
-                return 0;
+            int fd = alloc_virtual_fd(metadata.kind);
+            if (fd < 0) return fd;
+            set_virtual_fd_open_flags(active_tracee, fd, flags);
+            struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
+            if (entry) {
+                entry->device_mode = metadata.mode;
+                entry->device_major = metadata.major;
+                entry->device_minor = metadata.minor;
             }
+            virtual_pseudo_device_open_count++;
+            virtual_device_count++;
+            *is_virtual = 1;
+            *pending_return = fd;
+            printf("GUEST PSEUDO-DEVICE OPEN: guest-pid=%d executable=%s path=%s kind=%d mode=0%o rdev=%u:%u flags=0x%x fd=%d; app-private software descriptor, host /dev untouched\n",
+                   active_tracee ? active_tracee->guest_pid : -1,
+                   active_tracee ? active_tracee->exec_target : "<unknown>",
+                   guest, metadata.kind, metadata.mode & 07777u,
+                   metadata.major, metadata.minor, flags, fd);
+            return 0;
         }
+    }
+    if ((nr == ARM_NR_MKNOD || nr == ARM_NR_MKNODAT) &&
+        strcmp(guest, GUEST_KMSG_PATH) == 0) {
+        unsigned mode_arg = nr == ARM_NR_MKNOD ? 1u : 2u;
+        unsigned device_arg = nr == ARM_NR_MKNOD ? 2u : 3u;
+        uint32_t requested_mode = regs->uregs[mode_arg];
+        uint32_t requested_device = regs->uregs[device_arg];
+        if (nr != ARM_NR_MKNOD) {
+            guest_kmsg_runtime.mknod_attempts++;
+            guest_kmsg_runtime.mknod_rejected++;
+            rc = -EOPNOTSUPP;
+        } else if (!active_tracee || active_tracee->pid != pid) {
+            guest_kmsg_runtime.mknod_attempts++;
+            guest_kmsg_runtime.mknod_rejected++;
+            rc = -EPERM;
+        } else {
+            rc = guest_kmsg_mknod(&guest_kmsg_runtime,
+                active_tracee->guest_pid, active_tracee->exec_target,
+                active_tracee->identity.euid, guest, requested_mode,
+                requested_device);
+        }
+        *is_virtual = 1;
+        *pending_return = rc;
+        virtual_device_count++;
+        if (guest_kmsg_diagnostics_emitted < 64u) {
+            guest_kmsg_diagnostics_emitted++;
+            printf("GUEST KMSG MKNOD: guest-pid=%d executable=%s syscall=%s path=%s mode=0%o rdev=%u:%u result=%d node-present=%d; exact PID1 API10 request, in-memory guest node, host mknod never called\n",
+                   active_tracee ? active_tracee->guest_pid : -1,
+                   active_tracee && active_tracee->exec_target[0]
+                       ? active_tracee->exec_target : "<unknown>",
+                   guest_diag_syscall_name(nr), guest, requested_mode,
+                   (requested_device >> 8) & 0xffu, requested_device & 0xffu,
+                   rc, guest_kmsg_runtime.node_present);
+        }
+        return 0;
+    }
+    if ((nr == ARM_NR_UNLINK || nr == ARM_NR_UNLINKAT) &&
+        strcmp(guest, GUEST_KMSG_PATH) == 0) {
+        if (nr != ARM_NR_UNLINK) {
+            guest_kmsg_runtime.unlink_attempts++;
+            rc = -EOPNOTSUPP;
+        } else if (!active_tracee || active_tracee->pid != pid) {
+            guest_kmsg_runtime.unlink_attempts++;
+            rc = -EPERM;
+        } else {
+            rc = guest_kmsg_unlink(&guest_kmsg_runtime,
+                active_tracee->guest_pid, active_tracee->exec_target,
+                active_tracee->identity.euid, guest);
+        }
+        *is_virtual = 1;
+        *pending_return = rc;
+        virtual_file_ops++;
+        if (guest_kmsg_diagnostics_emitted < 64u) {
+            guest_kmsg_diagnostics_emitted++;
+            printf("GUEST KMSG UNLINK: guest-pid=%d executable=%s syscall=%s path=%s result=%d node-present=%d open-fd-remains=%d; guest name removed in software only, host unlink never called\n",
+                   active_tracee ? active_tracee->guest_pid : -1,
+                   active_tracee && active_tracee->exec_target[0]
+                       ? active_tracee->exec_target : "<unknown>",
+                   guest_diag_syscall_name(nr), guest, rc,
+                   guest_kmsg_runtime.node_present,
+                   guest_kmsg_runtime.fd_open);
+        }
+        return 0;
     }
     if ((nr == ARM_NR_MKNOD || nr == ARM_NR_MKNODAT) &&
         strcmp(guest, GUEST_NULL_STDIO_PATH) == 0) {
@@ -3752,6 +3881,82 @@ static void record_guest_path_fd_result(struct tracee_state *state,
             guest_path_fd_remove(&guest_path_fds, table_id, target_fd);
     }
     (void)regs;
+}
+
+static void observe_guest_init_config_io(struct tracee_state *state,
+                                         int32_t syscall_result) {
+    if (!state || state->guest_pid != 1 || strcmp(state->exec_target, "/init") != 0)
+        return;
+    struct guest_init_config_read_state *track = &state->init_config_read;
+    if ((state->last_syscall == ARM_NR_OPEN ||
+         state->last_syscall == ARM_NR_OPENAT) &&
+        (strcmp(state->last_guest_path, "/init.rc") == 0 ||
+         strcmp(state->last_guest_path, "/init.goldfish.rc") == 0)) {
+        if (syscall_result < 0) {
+            printf("GUEST INIT CONFIG OPEN: guest-pid=1 path=%s result=%d; API10 parser input was not opened; caller may continue because init_parse_config_file return is ignored\n",
+                   state->last_guest_path, syscall_result);
+            memset(track, 0, sizeof(*track));
+            return;
+        }
+        memset(track, 0, sizeof(*track));
+        track->active = 1;
+        track->fd = syscall_result;
+        snprintf(track->path, sizeof(track->path), "%s", state->last_guest_path);
+        printf("GUEST INIT CONFIG OPEN: guest-pid=1 path=%s fd=%d result=0; original API10 config path resolved into the app-private guest root\n",
+               track->path, track->fd);
+        return;
+    }
+    if (!track->active) return;
+    if (state->last_syscall == ARM_NR_LSEEK &&
+        (int32_t)state->last_syscall_args[0] == track->fd &&
+        state->last_syscall_args[1] == 0u &&
+        state->last_syscall_args[2] == 2u) { /* lseek(fd, 0, SEEK_END) */
+        track->size_known = syscall_result >= 0;
+        track->expected_file_size = syscall_result;
+        printf("GUEST INIT CONFIG SEEK END: guest-pid=1 path=%s fd=%d result=%d; API10 read_file expected file length captured\n",
+               track->path, track->fd, syscall_result);
+        return;
+    }
+    if (state->last_syscall == ARM_NR_LSEEK &&
+        (int32_t)state->last_syscall_args[0] == track->fd &&
+        state->last_syscall_args[1] == 0u &&
+        state->last_syscall_args[2] == 0u) { /* lseek(fd, 0, SEEK_SET) */
+        track->start_seek_succeeded = syscall_result == 0;
+        printf("GUEST INIT CONFIG SEEK START: guest-pid=1 path=%s fd=%d result=%d; API10 read_file rewind status\n",
+               track->path, track->fd, syscall_result);
+        return;
+    }
+    if (state->last_syscall == ARM_NR_READ &&
+        (int32_t)state->last_syscall_args[0] == track->fd) {
+        track->read_calls++;
+        track->requested_bytes = state->last_syscall_args[2];
+        track->last_read_result = syscall_result;
+        if (syscall_result > 0) track->bytes_read += (uint32_t)syscall_result;
+        printf("GUEST INIT CONFIG READ: guest-pid=1 path=%s fd=%d call=%u requested=%u result=%d total-bytes=%llu; API10 read_file input bytes only, parser/action execution is not inferred from this syscall\n",
+               track->path, track->fd, track->read_calls,
+               track->requested_bytes, syscall_result,
+               (unsigned long long)track->bytes_read);
+        return;
+    }
+    if (state->last_syscall == ARM_NR_CLOSE &&
+        (int32_t)state->last_syscall_args[0] == track->fd) {
+        int full_read = track->size_known && track->start_seek_succeeded &&
+            track->expected_file_size >= 0 &&
+            track->read_calls == 1u &&
+            (uint32_t)track->expected_file_size == track->requested_bytes &&
+            track->last_read_result >= 0 &&
+            track->last_read_result == track->expected_file_size &&
+            track->bytes_read == (uint32_t)track->expected_file_size;
+        int file_input_complete = full_read && syscall_result == 0;
+        printf("GUEST INIT CONFIG FILE CLOSE: guest-pid=1 path=%s fd=%d expected-size=%d size-known=%d start-seek-ok=%d read-calls=%u requested=%u read-result=%d total-bytes=%llu close-result=%d file-size-read-close-complete=%d; source models read_file input only, not parsed actions or Android framework boot\n",
+               track->path, track->fd, track->expected_file_size,
+               track->size_known, track->start_seek_succeeded,
+               track->read_calls,
+               track->requested_bytes, track->last_read_result,
+               (unsigned long long)track->bytes_read, syscall_result,
+               file_input_complete);
+        memset(track, 0, sizeof(*track));
+    }
 }
 
 static int mediate_guest_kill(struct compat_pt_regs *regs) {
@@ -4551,8 +4756,19 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
     }
     if ((nr == ARM_NR_FCNTL || nr == ARM_NR_FCNTL64) &&
         is_virtual_fd_number((int32_t)regs->uregs[0])) {
-        *pending_return = virtual_fd_fcntl(active_tracee, (int32_t)regs->uregs[0],
-            (int)regs->uregs[1], (int)regs->uregs[2]);
+        int fd = (int32_t)regs->uregs[0];
+        int command = (int)regs->uregs[1];
+        int argument = (int)regs->uregs[2];
+        *pending_return = virtual_fd_fcntl(active_tracee, fd, command, argument);
+        guest_kmsg_note_fcntl(&guest_kmsg_runtime, fd, command, argument,
+                              *pending_return);
+        if (fd == guest_kmsg_runtime.fd && command == GUEST_KMSG_F_SETFD &&
+            guest_kmsg_diagnostics_emitted < 64u) {
+            guest_kmsg_diagnostics_emitted++;
+            printf("GUEST KMSG FD FLAGS: guest-pid=%d fd=%d command=F_SETFD value=0x%x result=%d cloexec=%d; guest descriptor-table state only\n",
+                   state ? state->guest_pid : -1, fd, argument,
+                   *pending_return, guest_kmsg_runtime.fd_cloexec);
+        }
         *fake = 1; return 0;
     }
     if (nr == ARM_NR_CLOSE && state) {
@@ -4575,6 +4791,8 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
     if (nr == ARM_NR_CLOSE && is_virtual_fd_number((int32_t)regs->uregs[0])) {
         int fd = (int32_t)regs->uregs[0];
         *pending_return = close_virtual_fd(active_tracee, fd);
+        guest_kmsg_note_fd_closed(&guest_kmsg_runtime, fd, *pending_return,
+                                  virtual_fd_referenced(fd), 0);
         if (*pending_return == 0 && fd == guest_null_stdio_runtime.source_fd &&
             !virtual_fd_referenced(fd))
             guest_null_stdio_source_fd_closed(&guest_null_stdio_runtime, fd);
@@ -4592,6 +4810,43 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         else if (command == F_GETFL) value = O_RDONLY;
         else if (command == F_SETFL) value = 0;
         *pending_return = value; *fake = 1; return 0;
+    }
+    if (nr == ARM_NR_DUP) {
+        int fd = (int32_t)regs->uregs[0];
+        int null_stdio_source = state && guest_null_stdio_fd_is_null(
+            state->null_stdio_mask, fd,
+            guest_null_stdio_virtual_fd_valid(state, fd));
+        if (is_virtual_fd_number(fd) || null_stdio_source) {
+            int live = state && is_virtual_fd(fd) && tracee_owns_virtual_fd(state, fd);
+            *pending_return = is_virtual_fd_number(fd)
+                ? (live ? -EOPNOTSUPP : -EBADF) : -EOPNOTSUPP;
+            *fake = 1;
+            virtual_fd_duplicate_denials++;
+            if (virtual_fd_duplicate_denials <= 64u)
+                printf("GUEST VIRTUAL FD DUP DENIED: guest-pid=%d syscall=dup source-fd=%d live=%d null-stdio=%d result=%d; duplication backend unsupported, no host dup called\n",
+                       state ? state->guest_pid : -1, fd, live, null_stdio_source,
+                       *pending_return);
+            return 0;
+        }
+    }
+    if (nr == ARM_NR_DUP2 &&
+        (is_virtual_fd_number((int32_t)regs->uregs[0]) ||
+         is_virtual_fd_number((int32_t)regs->uregs[1])) &&
+        !(state && guest_null_stdio_virtual_fd_valid(
+            state, (int32_t)regs->uregs[0]))) {
+        int old_fd = (int32_t)regs->uregs[0];
+        int new_fd = (int32_t)regs->uregs[1];
+        int source_live = state && is_virtual_fd(old_fd) &&
+            tracee_owns_virtual_fd(state, old_fd);
+        *pending_return = is_virtual_fd_number(old_fd) && !source_live
+            ? -EBADF : -EOPNOTSUPP;
+        *fake = 1;
+        virtual_fd_duplicate_denials++;
+        if (virtual_fd_duplicate_denials <= 64u)
+            printf("GUEST VIRTUAL FD DUP DENIED: guest-pid=%d syscall=dup2 source-fd=%d target-fd=%d source-live=%d result=%d; virtual duplication/overwrite unsupported, no host dup2 called\n",
+                   state ? state->guest_pid : -1, old_fd, new_fd,
+                   source_live, *pending_return);
+        return 0;
     }
     if (nr == ARM_NR_DUP2 && state) {
         int old_fd = (int32_t)regs->uregs[0];
@@ -5226,6 +5481,7 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     kill_all_tracees(); return -1;
                 }
                 record_guest_path_fd_result(state, &regs, syscall_result);
+                observe_guest_init_config_io(state, syscall_result);
                 if (state->fb_mmap_pending) {
                     if (state->last_syscall == ARM_NR_MMAP2 &&
                         !guest_arm32_syscall_result_is_error(syscall_result_bits)) {
@@ -5530,6 +5786,9 @@ int main(int argc, char **argv) {
     guest_vsocket_table_init(&guest_sockets);
     guest_null_stdio_runtime_init(&guest_null_stdio_runtime);
     guest_null_stdio_diagnostics_emitted = 0;
+    guest_kmsg_runtime_init(&guest_kmsg_runtime);
+    guest_kmsg_diagnostics_emitted = 0;
+    virtual_fd_duplicate_denials = 0;
     guest_uevent_queue_init(&guest_uevent_queue);
     guest_net_state_init(&guest_network_state);
     guest_path_fd_table_init(&guest_path_fds);
@@ -5700,6 +5959,27 @@ int main(int argc, char **argv) {
            guest_null_stdio_runtime.stdio_writes,
            guest_null_stdio_runtime.stdio_closes,
            guest_null_stdio_diagnostics_emitted);
+    printf("GUEST KMSG SUMMARY: node-present=%d unlinked=%d fd=%d fd-open=%d cloexec=%d mknod-attempts=%llu accepted=%llu rejected=%llu open-attempts=%llu succeeded=%llu failed=%llu fcntl-setfd=%llu/%llu unlink=%llu/%llu writes=%llu bytes=%llu closes=%llu close-on-exec=%llu diagnostics=%lu; API10 /init char 1:11 mode 0600, in-memory guest node/FD and discarded log bytes only; host /dev/kmsg untouched\n",
+           guest_kmsg_runtime.node_present, guest_kmsg_runtime.unlinked,
+           guest_kmsg_runtime.fd, guest_kmsg_runtime.fd_open,
+           guest_kmsg_runtime.fd_cloexec,
+           (unsigned long long)guest_kmsg_runtime.mknod_attempts,
+           (unsigned long long)guest_kmsg_runtime.mknod_accepted,
+           (unsigned long long)guest_kmsg_runtime.mknod_rejected,
+           (unsigned long long)guest_kmsg_runtime.open_attempts,
+           (unsigned long long)guest_kmsg_runtime.open_succeeded,
+           (unsigned long long)guest_kmsg_runtime.open_failed,
+           (unsigned long long)guest_kmsg_runtime.fcntl_setfd_succeeded,
+           (unsigned long long)guest_kmsg_runtime.fcntl_setfd_attempts,
+           (unsigned long long)guest_kmsg_runtime.unlink_succeeded,
+           (unsigned long long)guest_kmsg_runtime.unlink_attempts,
+           (unsigned long long)guest_kmsg_runtime.write_calls,
+           (unsigned long long)guest_kmsg_runtime.write_bytes,
+           (unsigned long long)guest_kmsg_runtime.close_calls,
+           (unsigned long long)guest_kmsg_runtime.close_on_exec_calls,
+           guest_kmsg_diagnostics_emitted);
+    printf("GUEST VIRTUAL FD DUP DENIALS: %lu; unsupported virtual descriptors fail closed, host dup/dup2 not used\n",
+           virtual_fd_duplicate_denials);
     printf("SIGSYS CONTEXT DIAGNOSTICS: emitted=%lu suppressed=%lu (limit=%u); non-placeholder SYS_SECCOMP records only; signal forwarding unchanged\n",
            sigsys_context_diagnostics_emitted, sigsys_context_diagnostics_suppressed,
            MAX_SIGSYS_CONTEXT_DIAGNOSTICS);

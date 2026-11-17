@@ -63,6 +63,11 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_null_stdio_test.c" -o "$TMP/guest_null_stdio_test"
 "$TMP/guest_null_stdio_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_init_post_stdio_test.c" -o "$TMP/guest_init_post_stdio_test"
+"$TMP/guest_init_post_stdio_test" \
+  "$GUEST_BASE/guest-root-staging/init.rc" \
+  "$GUEST_BASE/guest-root-staging/init.goldfish.rc"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_entry_probe_test.c" -o "$TMP/guest_entry_probe_test"
 "$TMP/guest_entry_probe_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -152,8 +157,13 @@ profile = Path(sys.argv[1]).with_name('guest_hardware_profile.h').read_text()
 pseudo_device = Path(sys.argv[1]).with_name('guest_pseudo_device.h').read_text()
 null_stdio = Path(sys.argv[1]).with_name('guest_null_stdio.h').read_text()
 null_stdio_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_null_stdio_test.c').read_text()
+kmsg_model = Path(sys.argv[1]).with_name('guest_kmsg_virtual.h').read_text()
+kmsg_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_init_post_stdio_test.c').read_text()
 path_syscall_start = src.index('static int path_syscall(')
 path_syscall_source = src[path_syscall_start:]
+dup_guard_start = src.index('if (nr == ARM_NR_DUP)')
+dup_guard_end = src.index('if (nr == ARM_NR_DUP2 && state)', dup_guard_start)
+dup_guard_source = src[dup_guard_start:dup_guard_end]
 tracee_slots = Path(sys.argv[1]).with_name('guest_tracee_slots.h').read_text()
 slots_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_tracee_slots_test.c').read_text()
 pending_child_stops = Path(sys.argv[1]).with_name('ptrace_child_stop_queue.h').read_text()
@@ -561,7 +571,7 @@ assert 'GUEST_MODE_IFCHR 0020000u' in pseudo_device
 assert 'GUEST PSEUDO-DEVICE STAT64:' in src and 'GUEST PSEUDO-DEVICE FSTAT64:' in src
 assert 'guest_pseudo_device_backing_present(guest)' in src
 assert 'guest_safe_file_open_beneath_root' in src and 'O_NOFOLLOW' in safe_dir
-assert 'GUEST TEMP DEVICE OPEN:' in src and 'app-private placeholder data only' in src
+assert 'GUEST TEMP DEVICE OPEN:' not in src
 assert '#include "guest_null_stdio.h"' in src
 for marker in ('GUEST NULL DEVICE MKNOD:', 'GUEST NULL DEVICE OPEN:',
                'GUEST NULL DEVICE UNLINK:', 'GUEST NULL STDIO DUP2:',
@@ -585,6 +595,38 @@ assert 'guest null-device init stdio state-machine regression: PASS' in null_std
 assert 'original guest binaries are not executed' in null_stdio_test
 assert path_syscall_source.index('strcmp(guest, GUEST_NULL_STDIO_PATH) == 0') < path_syscall_source.index('rewrite_path_arg(pid, regs, arg, guest')
 assert 'decoded exact-path broker requests, not all syscalls' in src
+assert '#include "guest_kmsg_virtual.h"' in src
+assert 'guest_kmsg_runtime_init(&guest_kmsg_runtime)' in src
+for marker in ('GUEST KMSG MKNOD:', 'GUEST KMSG OPEN:', 'GUEST KMSG FD FLAGS:',
+               'GUEST KMSG UNLINK:', 'GUEST KMSG WRITE:', 'GUEST KMSG SUMMARY:'):
+    assert marker in src, marker
+assert 'guest_kmsg_note_write(&guest_kmsg_runtime, fd, result)' in src
+assert 'guest_kmsg_note_fcntl(&guest_kmsg_runtime' in src
+assert 'guest_kmsg_note_fd_closed(&guest_kmsg_runtime' in src
+assert 'guest_kmsg_runtime.node_present' in src and 'guest_kmsg_runtime.unlinked' in src
+assert 'GUEST_KMSG_MODE 0020600u' in kmsg_model
+assert 'GUEST_KMSG_DEVICE 0x0000010bu' in kmsg_model
+assert 'guest_kmsg_is_api10_init' in kmsg_model and 'guest_kmsg_open_validate' in kmsg_model
+assert 'GUEST_KMSG_O_WRONLY' in kmsg_model and 'GUEST_KMSG_FD_CLOEXEC' in kmsg_model
+kmsg_code = re.sub(r'/\*.*?\*/|//[^\n]*', '', kmsg_model, flags=re.S)
+assert not re.search(r'(?<![A-Za-z0-9_])(mknod|open|unlink|write)\s*\(', kmsg_code)
+assert path_syscall_source.index('strcmp(guest, GUEST_KMSG_PATH)') < path_syscall_source.index('rewrite_path_arg(pid, regs, arg, guest')
+assert 'guest_kmsg_note_fd_closed' in src and 'virtual_fd_referenced(fd), 1' in src
+assert 'GUEST VIRTUAL FD DUP DENIED:' in src and 'no host dup2 called' in src
+assert 'if (nr == ARM_NR_DUP)' in src and 'is_virtual_fd_number(fd) || null_stdio_source' in src
+assert 'is_virtual_fd_number((int32_t)regs->uregs[1])' in src
+assert 'guest_null_stdio_virtual_fd_valid' in dup_guard_source
+assert 'guest_null_stdio_fd_is_null' in dup_guard_source
+assert 'guest_init_post_stdio_test.c' in network_test_runner
+assert 'GUEST INIT CONFIG SEEK END:' in src and 'GUEST INIT CONFIG SEEK START:' in src
+assert 'GUEST INIT CONFIG FILE CLOSE:' in src and 'file-size-read-close-complete=%d' in src
+assert 'track->expected_file_size' in src and 'ARM_NR_LSEEK' in src
+assert 'track->size_known' in src and 'track->start_seek_succeeded' in src
+assert 'parser/action execution is not inferred from this syscall' in src
+assert 'guest_init_config_read' in src and 'observe_guest_init_config_io(state, syscall_result)' in src
+assert 'test_continuous_post_stdio_path' in kmsg_test
+assert 'start ueventd' in kmsg_test
+assert 'service goldfish-setup /system/etc/init.goldfish.sh' in kmsg_test
 if api10_source_available:
     api10_null_stdio = api10_util_source.split('void open_devnull_stdio(void)', 1)[1].split('\n}', 1)[0]
     for operation in ('mknod(name, S_IFCHR | 0600, (1 << 8) | 3)',
@@ -592,10 +634,18 @@ if api10_source_available:
                       'dup2(fd, 1)', 'dup2(fd, 2)', 'exit(1)'):
         assert operation in api10_null_stdio, operation
     api10_log_init = api10_util_source.split('void log_init(void)', 1)[1].split('\n}', 1)[0]
-    assert 'mknod(name, S_IFCHR | 0600, (1 << 8) | 11)' in api10_log_init
+    for operation in ('mknod(name, S_IFCHR | 0600, (1 << 8) | 11)',
+                      'log_fd = open(name, O_WRONLY)',
+                      'fcntl(log_fd, F_SETFD, FD_CLOEXEC)', 'unlink(name)'):
+        assert operation in api10_log_init, operation
     assert 'exit(' not in api10_log_init
     api10_main = api10_init_source.split('int main(', 1)[1]
     assert api10_main.index('open_devnull_stdio();') < api10_main.index('log_init();') < api10_main.index('init_parse_config_file("/init.rc")')
+    assert api10_main.index('init_parse_config_file("/init.rc")') < api10_main.index('import_kernel_cmdline(0)') < api10_main.index('get_hardware_name(hardware, &revision)') < api10_main.index('init_parse_config_file(tmp)') < api10_main.index('action_for_each_trigger("early-init", action_add_queue_tail)')
+    api10_read_file = api10_util_source.split('void *read_file(const char *fn, unsigned *_sz)', 1)[1].split('\n}', 1)[0]
+    assert 'lseek(fd, 0, SEEK_END)' in api10_read_file
+    assert 'lseek(fd, 0, SEEK_SET)' in api10_read_file
+    assert 'read(fd, data, sz) != sz' in api10_read_file and 'close(fd)' in api10_read_file
     print('API10 AOSP init/util source contract: PASS')
 else:
     print('API10 AOSP init/util source contract: SKIP (source tree absent from this checkout; the local source-backed build runs these assertions when present)')
@@ -830,14 +880,14 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.25-test-signed-apk' in upload
-assert 'gingervm-v0.6.25-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 34" in gradle and "versionName '0.6.25'" in gradle
+assert 'gingervm-continuous-trace-v0.6.26-test-signed-apk' in upload
+assert 'gingervm-v0.6.26-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 35" in gradle and "versionName '0.6.26'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.25' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.26' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
