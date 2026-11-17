@@ -67,10 +67,10 @@ static inline enum guest_syscall_class guest_syscall_policy(int nr) {
         case 83: case 93: case 331:
             return GUEST_SYSCALL_FILE_OPERATION;
 
-        /* API10 property/signaling sockets plus the guest-only ueventd queue. */
+        /* API10 property/signaling sockets, guest ueventd queue, and qemud-only epoll. */
         case 102: case 281: case 282: case 283: case 284: case 285:
         case 288: case 289: case 290: case 291: case 292:
-        case 294: case 295: case 297:
+        case 250: case 251: case 252: case 294: case 295: case 297:
             return GUEST_SYSCALL_VIRTUAL_SOCKET;
 
         /* Guest mount table only: no host mount(2), umount(2), or pivot_root(2). */

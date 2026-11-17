@@ -31,6 +31,14 @@
 #define GUEST_PROFILE_PROC_STAT \
     "cpu  0 0 0 0\n" \
     "cpu0 0 0 0 0\n"
+/* Software-profile mapping only; the Goldfish kernel's alloc_chrdev_region
+ * runtime major has not been observed for this build. */
+#define GUEST_PROFILE_PROC_DEVICES \
+    "Character devices:\n" \
+    "  1 mem\n" \
+    "240 ttyS\n" \
+    "\n" \
+    "Block devices:\n"
 
 /* Values used by the original API10 Goldfish init.goldfish.sh, guest-only. */
 #define GUEST_PROFILE_NET_IFACE "eth0"

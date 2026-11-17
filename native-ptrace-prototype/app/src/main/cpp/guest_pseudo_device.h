@@ -3,6 +3,7 @@
 
 #include "guest_socket_virtual.h"
 #include "guest_framebuffer_virtual.h"
+#include "guest_goldfish_tty_virtual.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -54,7 +55,12 @@ static inline int guest_pseudo_device_metadata_for_path(
     } else if (strcmp(path, "/dev/__kmsg__") == 0) {
         value.kind = VIRTUAL_FD_DEV_KMSG; value.minor = 11u; value.mode = GUEST_MODE_IFCHR | 0600u;
     } else {
-        return 0;
+        uint32_t tty_minor = 0;
+        if (!guest_goldfish_tty_parse_device_path(path, &tty_minor)) return 0;
+        value.kind = VIRTUAL_FD_DEV_TTY;
+        value.mode = GUEST_GOLDFISH_TTY_MODE;
+        value.major = GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR;
+        value.minor = tty_minor;
     }
     *metadata = value;
     return 1;

@@ -4,11 +4,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <string.h>
 
 #include "guest_hardware_profile.h"
 #include "guest_framebuffer_virtual.h"
+#include "guest_goldfish_tty_virtual.h"
 
 #define GUEST_UEVENT_AF_NETLINK 16u
 #define GUEST_UEVENT_SOCK_DGRAM 2u
@@ -151,8 +153,11 @@ static inline int guest_uevent_enqueue_coldboot_add(
     static const char interface_name[] = "INTERFACE=" GUEST_PROFILE_NET_IFACE;
     static const char graphics_major[] = "MAJOR=29";
     static const char graphics_minor[] = "MINOR=0";
+    static const char tty_subsystem[] = "SUBSYSTEM=tty";
     const char *header = NULL, *devpath = NULL, *subsystem = NULL;
     const char *extra_one = NULL, *extra_two = NULL;
+    char tty_header[96], tty_devpath[96], tty_major[24], tty_minor_text[24], tty_devname[32];
+    uint32_t tty_minor = 0;
     if (!queue || !guest_attribute_path || (!bytes && length != 0)) return -EINVAL;
     if (!authorized_ueventd) { queue->rejected++; return -EPERM; }
     if (strcmp(guest_attribute_path, GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH) == 0) {
@@ -162,6 +167,23 @@ static inline int guest_uevent_enqueue_coldboot_add(
         header = graphics_header; devpath = graphics_devpath;
         subsystem = graphics_subsystem; extra_one = graphics_major;
         extra_two = graphics_minor;
+    } else if (guest_goldfish_tty_parse_sysfs_uevent_path(
+                   guest_attribute_path, &tty_minor)) {
+        int n = snprintf(tty_header, sizeof(tty_header), "add@%s%u",
+            GUEST_GOLDFISH_TTY_SYSFS_DEVICE_PREFIX, tty_minor);
+        if (n <= 0 || (size_t)n >= sizeof(tty_header)) return -ENAMETOOLONG;
+        n = snprintf(tty_devpath, sizeof(tty_devpath), "DEVPATH=%s%u",
+            GUEST_GOLDFISH_TTY_SYSFS_DEVICE_PREFIX, tty_minor);
+        if (n <= 0 || (size_t)n >= sizeof(tty_devpath)) return -ENAMETOOLONG;
+        n = snprintf(tty_major, sizeof(tty_major), "MAJOR=%u",
+            GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR);
+        if (n <= 0 || (size_t)n >= sizeof(tty_major)) return -ENAMETOOLONG;
+        n = snprintf(tty_minor_text, sizeof(tty_minor_text), "MINOR=%u", tty_minor);
+        if (n <= 0 || (size_t)n >= sizeof(tty_minor_text)) return -ENAMETOOLONG;
+        n = snprintf(tty_devname, sizeof(tty_devname), "DEVNAME=ttyS%u", tty_minor);
+        if (n <= 0 || (size_t)n >= sizeof(tty_devname)) return -ENAMETOOLONG;
+        header = tty_header; devpath = tty_devpath; subsystem = tty_subsystem;
+        extra_one = tty_major; extra_two = tty_minor_text;
     } else {
         queue->rejected++;
         return -ENOENT;
@@ -191,6 +213,8 @@ static inline int guest_uevent_enqueue_coldboot_add(
     GUEST_UEVENT_APPEND_FIELD(subsystem);
     if (extra_one) GUEST_UEVENT_APPEND_FIELD(extra_one);
     if (extra_two) GUEST_UEVENT_APPEND_FIELD(extra_two);
+    if (tty_minor < GUEST_GOLDFISH_TTY_LINE_COUNT &&
+        subsystem == tty_subsystem) GUEST_UEVENT_APPEND_FIELD(tty_devname);
 #undef GUEST_UEVENT_APPEND_FIELD
     event->length = offset;
     queue->count++;

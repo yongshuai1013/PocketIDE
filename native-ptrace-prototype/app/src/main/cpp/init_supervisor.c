@@ -26,6 +26,7 @@
 #include "guest_file_ops.h"
 #include "guest_symlink_ops.h"
 #include "guest_socket_virtual.h"
+#include "guest_goldfish_tty_virtual.h"
 #include "guest_socket_path_ops.h"
 #include "guest_diagnostics.h"
 #include "guest_sigsys_context.h"
@@ -35,6 +36,7 @@
 #include "guest_sigaction_compat.h"
 #include "guest_process_compat.h"
 #include "guest_safe_dir.h"
+#include "guest_goldfish_tty_fs.h"
 #include "guest_hardware_profile.h"
 #include "guest_qemud_diagnostics.h"
 #include "guest_network_virtual.h"
@@ -148,6 +150,9 @@
 #define ARM_NR_FCHOWN 95
 #define ARM_NR_SOCKETCALL 102
 #define ARM_NR_POLL 168
+#define ARM_NR_EPOLL_CREATE 250
+#define ARM_NR_EPOLL_CTL 251
+#define ARM_NR_EPOLL_WAIT 252
 #define ARM_NR_SOCKET 281
 #define ARM_NR_BIND 282
 #define ARM_NR_CONNECT 283
@@ -441,6 +446,10 @@ static unsigned long guest_fb0_mmap_count;
 static unsigned long guest_fb0_pan_count;
 static int guest_fb0_graphics_uevent_received;
 static int guest_fb0_node_created;
+static struct guest_goldfish_tty_runtime guest_goldfish_tty_runtime;
+static struct guest_goldfish_tty_epoll_table guest_goldfish_tty_epolls;
+static unsigned long guest_qemud_socket_bind_count;
+static unsigned guest_goldfish_tty_diagnostics_emitted;
 
 static const char *guest_frame_channel_scope_name(
         enum guest_frame_channel_validation_scope scope) {
@@ -1092,6 +1101,16 @@ static int path_is_within(const char *path, const char *root) {
     return strncmp(path, root, n) == 0 && (path[n] == '\0' || path[n] == '/');
 }
 
+static int tracee_is_verified_api10_qemud(const struct tracee_state *state) {
+    return state && state->guest_pid > 1 && state->guest_parent_pid == 1 &&
+        strcmp(state->exec_target, "/system/bin/qemud") == 0 &&
+        state->exec_image_committed && state->target_elf_entry_valid &&
+        state->target_elf_type == ET_EXEC && state->exec_backing_path[0] &&
+        ((guest_root[0] && path_is_within(state->exec_backing_path, guest_root)) ||
+         (native_guest_root[0] &&
+          path_is_within(state->exec_backing_path, native_guest_root)));
+}
+
 static int guest_path_uses_native_payload(const char *guest) {
     static const char *const roots[] = {"/system/lib", "/system/bin", "/system/xbin", NULL};
     for (size_t i = 0; roots[i]; ++i) {
@@ -1516,11 +1535,46 @@ static int seed_regular_file(const char *dir, const char *name, const char *cont
                                                  contents, strlen(contents), 0600);
 }
 
+static int seed_virtual_tty_sysfs_tree(const char *backing) {
+    char class_tty[PATH_MAX];
+    int n = snprintf(class_tty, sizeof(class_tty), "%s/class/tty", backing);
+    if (n <= 0 || (size_t)n >= sizeof(class_tty)) return -ENAMETOOLONG;
+    for (uint32_t minor = 0; minor < GUEST_GOLDFISH_TTY_LINE_COUNT; ++minor) {
+        char tty_name[16], device_path[PATH_MAX], dev_text[32], link_target[64];
+        n = snprintf(tty_name, sizeof(tty_name), "ttyS%u", minor);
+        if (n <= 0 || (size_t)n >= sizeof(tty_name)) return -ENAMETOOLONG;
+        n = snprintf(device_path, sizeof(device_path),
+            "%s/devices/virtual/tty/%s", backing, tty_name);
+        if (n <= 0 || (size_t)n >= sizeof(device_path)) return -ENAMETOOLONG;
+        int directory_fd = guest_safe_dir_open_beneath_root(
+            guest_root, device_path, 1, 0700);
+        if (directory_fd < 0) return directory_fd;
+        close(directory_fd);
+        n = snprintf(dev_text, sizeof(dev_text), "%u:%u\n",
+            GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR, minor);
+        if (n <= 0 || (size_t)n >= sizeof(dev_text)) return -ENAMETOOLONG;
+        int rc = seed_regular_file(device_path, "dev", dev_text);
+        if (rc != 0) return rc;
+        rc = seed_regular_file(device_path, "uevent", "");
+        if (rc != 0) return rc;
+        n = snprintf(link_target, sizeof(link_target),
+            "../../devices/virtual/tty/%s", tty_name);
+        if (n <= 0 || (size_t)n >= sizeof(link_target)) return -ENAMETOOLONG;
+        rc = guest_safe_symlink_beneath_root(guest_root, class_tty,
+            tty_name, link_target);
+        if (rc != 0) return rc;
+    }
+    printf("GUEST GOLDFISH TTY PROFILE: lines=%u class=/sys/class/tty/ttyS0-ttyS7 sysfs=/sys/devices/virtual/tty/ttyS0-ttyS7 dev-text=%u:<minor> major-is-synthetic=1 qemud-line=ttyS1; no Goldfish runtime kernel or host tty used\n",
+           GUEST_GOLDFISH_TTY_LINE_COUNT, GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR);
+    return 0;
+}
+
 static int seed_virtual_sysfs_tree(const char *backing) {
     static const char *const suffixes[] = {
-        "class", "class/net", "class/graphics", "block", "devices",
+        "class", "class/net", "class/graphics", "class/tty", "block", "devices",
         "devices/virtual", "devices/virtual/net", "devices/virtual/net/eth0",
-        "devices/virtual/graphics", "devices/virtual/graphics/fb0", NULL,
+        "devices/virtual/graphics", "devices/virtual/graphics/fb0",
+        "devices/virtual/tty", NULL,
     };
     if (!backing) return -EACCES;
     int backing_fd = guest_safe_dir_open_beneath_root(guest_root, backing, 1, 0700);
@@ -1551,7 +1605,9 @@ static int seed_virtual_sysfs_tree(const char *backing) {
     if (rc != 0) return rc;
     n = snprintf(device, sizeof(device), "%s/devices/virtual/graphics/fb0", backing);
     if (n <= 0 || (size_t)n >= sizeof(device)) return -ENAMETOOLONG;
-    return seed_regular_file(device, "uevent", "");
+    rc = seed_regular_file(device, "uevent", "");
+    if (rc != 0) return rc;
+    return seed_virtual_tty_sysfs_tree(backing);
 }
 
 static int seed_virtual_proc_tree(const char *backing) {
@@ -1568,6 +1624,8 @@ static int seed_virtual_proc_tree(const char *backing) {
     rc = seed_regular_file(backing, "meminfo", GUEST_PROFILE_PROC_MEMINFO);
     if (rc != 0) return rc;
     rc = seed_regular_file(backing, "stat", GUEST_PROFILE_PROC_STAT);
+    if (rc != 0) return rc;
+    rc = seed_regular_file(backing, "devices", GUEST_PROFILE_PROC_DEVICES);
     if (rc != 0) return rc;
     rc = seed_regular_file(netdir, "route",
         "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n");
@@ -1896,6 +1954,15 @@ static void close_virtual_fds_on_exec(struct tracee_state *state) {
 
 static void release_virtual_fd_if_unreferenced(int fd) {
     if (virtual_fd_referenced(fd)) return;
+    struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
+    if (entry && (entry->kind == VIRTUAL_FD_DEV_TTY ||
+                  entry->kind == VIRTUAL_FD_QEMUD_LISTENER))
+        guest_goldfish_tty_epoll_remove_watched_fd(&guest_goldfish_tty_epolls, fd);
+    if (entry && entry->kind == VIRTUAL_FD_DEV_TTY &&
+        guest_goldfish_tty_runtime.tty_fd == fd)
+        (void)guest_goldfish_tty_note_close(&guest_goldfish_tty_runtime, fd);
+    if (entry && entry->kind == VIRTUAL_FD_EPOLL)
+        (void)guest_goldfish_tty_epoll_close(&guest_goldfish_tty_epolls, fd);
     if (guest_vsocket_close_fd(&guest_sockets, fd) != 0) return;
     if (virtual_uevent_fd == fd) {
         virtual_uevent_fd = -1;
@@ -2272,15 +2339,20 @@ static int virtual_guest_socket_bind(pid_t pid, int fd, uint32_t address,
     if (rc != 0 || !path_is_within(host_path, guest_root)) return rc != 0 ? rc : -EACCES;
     rc = guest_socket_marker_create_app_private(host_path, guest_root);
     if (rc != 0) return rc;
-    rc = guest_vsocket_bind_commit(&guest_sockets, fd);
+    rc = guest_vsocket_bind_commit_path(&guest_sockets, fd, guest_path);
     if (rc != 0) {
         (void)unlink(host_path);
         return rc;
     }
-    virtual_property_bind_count++;
+    if (guest_vsocket_path_is_property_service(guest_path)) {
+        virtual_property_bind_count++;
+    } else {
+        guest_qemud_socket_bind_count++;
+    }
     virtual_socket_calls++;
-    printf("VIRTUAL PROPERTY BIND: host-pid=%d guest-pid=1 fd=%d path=%s marker=app-private regular VFS placeholder; host bind API not called\n",
-           pid, fd, guest_path);
+    printf("VIRTUAL GUEST SERVICE BIND: host-pid=%d guest-pid=1 fd=%d path=%s service=%s marker=app-private regular VFS placeholder; host bind API not called\n",
+           pid, fd, guest_path,
+           guest_vsocket_path_is_qemud_service(guest_path) ? "qemud" : "property-service");
     return 0;
 }
 
@@ -2313,9 +2385,13 @@ static int virtual_guest_socket_listen(pid_t pid, int fd, int backlog) {
         !tracee_owns_virtual_fd(active_tracee, fd)) return -EBADF;
     int rc = guest_vsocket_listen(&guest_sockets, fd, backlog);
     virtual_socket_calls++;
-    if (rc == 0)
-        printf("VIRTUAL PROPERTY LISTEN: fd=%d backlog=%d; listener readiness comes only from software client queue; host listen API not called\n",
-               fd, backlog);
+    if (rc == 0) {
+        struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
+        printf("VIRTUAL GUEST SERVICE LISTEN: guest-pid=%d fd=%d service=%s backlog=%d; qemud has no synthetic peer/client; host listen API not called\n",
+               active_tracee->guest_pid, fd,
+               entry && entry->kind == VIRTUAL_FD_QEMUD_LISTENER ? "qemud" : "property-service",
+               backlog);
+    }
     else
         virtual_socket_rejected_count++;
     return rc;
@@ -2449,6 +2525,9 @@ static int virtual_uevent_recvmsg(pid_t pid, const struct compat_pt_regs *regs) 
     int is_graphics_fb0_event =
         memmem(event->data, event->length, "DEVPATH=" GUEST_FB0_SYSFS_DEVICE_PATH,
                sizeof("DEVPATH=" GUEST_FB0_SYSFS_DEVICE_PATH) - 1u) != NULL;
+    uint32_t tty_event_minor = 0;
+    int is_goldfish_tty_event = guest_goldfish_tty_event_matches(
+        event->data, event->length, &tty_event_minor);
     size_t copied = event->length;
     int32_t returned_flags = 0;
     if (capacity < copied) {
@@ -2486,6 +2565,12 @@ static int virtual_uevent_recvmsg(pid_t pid, const struct compat_pt_regs *regs) 
         guest_fb0_graphics_uevent_received = 1;
         puts("GUEST FB0 GRAPHICS UEVENT RECEIVED: ueventd consumed add event with DEVPATH=/devices/virtual/graphics/fb0 MAJOR=29 MINOR=0; node may now be created only through guest mknod mediation");
     }
+    if (is_goldfish_tty_event && guest_goldfish_tty_note_event(
+            &guest_goldfish_tty_runtime, event->data, event->length,
+            &tty_event_minor))
+        printf("GUEST GOLDFISH TTY UEVENT RECEIVED: guest-pid=%d action=add path=/devices/virtual/tty/ttyS%u subsystem=tty dev=synthetic:%u:%u; authorized ueventd consumed app-private event, no runtime-kernel dev_t claimed\n",
+               state->guest_pid, tty_event_minor,
+               GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR, tty_event_minor);
     virtual_uevent_recvmsg_count++;
     virtual_socket_calls++;
     printf("GUEST UEVENT RECVMSG: host-pid=%d guest-pid=%d fd=%d bytes=%zu source={nl_pid=0,nl_groups=1} SCM_CREDENTIALS={pid=0,uid=0,gid=0} flags=0x%x queue=%zu; app-private queue only\n",
@@ -2508,8 +2593,17 @@ static int virtual_guest_socket_stream_io(pid_t pid, int fd, uint32_t buffer_add
         if (length > sizeof(request) || (length != 0 && buffer_address == 0))
             return -EINVAL;
         if (length && read_remote(pid, buffer_address, request, length) != 0) return -EFAULT;
-        const char *attribute_path = entry->device_major == GUEST_FB0_MAJOR
-            ? GUEST_FB0_SYSFS_ATTRIBUTE_PATH : GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH;
+        char tty_attribute_path[PATH_MAX];
+        const char *attribute_path = GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH;
+        if (entry->device_major == GUEST_FB0_MAJOR) {
+            attribute_path = GUEST_FB0_SYSFS_ATTRIBUTE_PATH;
+        } else if (entry->device_major == GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR) {
+            int n = snprintf(tty_attribute_path, sizeof(tty_attribute_path),
+                "%s%u/uevent", GUEST_GOLDFISH_TTY_SYSFS_ATTRIBUTE_PREFIX,
+                entry->device_minor);
+            if (n <= 0 || (size_t)n >= sizeof(tty_attribute_path)) return -ENAMETOOLONG;
+            attribute_path = tty_attribute_path;
+        }
         int result = guest_uevent_enqueue_coldboot_add(&guest_uevent_queue, 1,
             attribute_path, request, length);
         virtual_socket_calls++;
@@ -3626,6 +3720,12 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
             } else if (strcmp(guest, GUEST_KMSG_PATH) == 0) {
                 if (!guest_kmsg_runtime.node_present ||
                     guest_kmsg_runtime.unlinked) return -ENOENT;
+            } else if (metadata.kind == VIRTUAL_FD_DEV_TTY) {
+                if (metadata.minor >= GUEST_GOLDFISH_TTY_LINE_COUNT ||
+                    (guest_goldfish_tty_runtime.node_mask &
+                     (uint8_t)(1u << metadata.minor)) == 0) return -ENOENT;
+                rc = guest_pseudo_device_backing_present(guest);
+                if (rc != 0) return rc;
             } else {
                 rc = guest_pseudo_device_backing_present(guest);
                 if (rc != 0) return rc;
@@ -3640,10 +3740,12 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
             *is_virtual = 1;
             *pending_return = 0;
             virtual_file_ops++;
-            const char *stat_source = strcmp(guest, GUEST_NULL_STDIO_PATH) == 0
+            const char *stat_source = metadata.kind == VIRTUAL_FD_DEV_TTY
+                ? "uevent-created app-private placeholder; synthetic dev_t"
+                : strcmp(guest, GUEST_NULL_STDIO_PATH) == 0
                 ? "in-memory guest node state"
                 : "app-private placeholder verified no-follow";
-            printf("GUEST PSEUDO-DEVICE STAT64: guest-pid=%d path=%s mode=0%o rdev=%u:%u source=%s; ARM32 guest metadata\n",
+            printf("GUEST PSEUDO-DEVICE STAT64: guest-pid=%d path=%s mode=0%o rdev=%u:%u source=%s; ARM32 guest metadata, synthetic Goldfish TTY major is not a runtime observation\n",
                    active_tracee ? active_tracee->guest_pid : -1, guest,
                    metadata.mode & 07777u, metadata.major, metadata.minor,
                    stat_source);
@@ -3815,9 +3917,12 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
             return -EOPNOTSUPP;
         }
     }
+    uint32_t tty_minor = 0;
+    int tty_sysfs_uevent = guest_goldfish_tty_parse_sysfs_uevent_path(
+        guest, &tty_minor);
     if (nr == ARM_NR_OPENAT &&
         (strcmp(guest, GUEST_UEVENT_SYSFS_ATTRIBUTE_PATH) == 0 ||
-         strcmp(guest, GUEST_FB0_SYSFS_ATTRIBUTE_PATH) == 0)) {
+         strcmp(guest, GUEST_FB0_SYSFS_ATTRIBUTE_PATH) == 0 || tty_sysfs_uevent)) {
         unsigned flags = regs->uregs[2];
         if (!is_guest_ueventd(pid)) return -EPERM;
         if ((flags & 3u) != O_WRONLY || (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0)
@@ -3827,18 +3932,69 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
         int fd = alloc_virtual_fd(VIRTUAL_FD_SYSFS_UEVENT);
         if (fd < 0) return fd;
         struct guest_vsocket_fd *sysfs_fd = guest_vsocket_fd_get(&guest_sockets, fd);
-        if (sysfs_fd && strcmp(guest, GUEST_FB0_SYSFS_ATTRIBUTE_PATH) == 0)
-            sysfs_fd->device_major = GUEST_FB0_MAJOR;
+        if (sysfs_fd) {
+            if (strcmp(guest, GUEST_FB0_SYSFS_ATTRIBUTE_PATH) == 0)
+                sysfs_fd->device_major = GUEST_FB0_MAJOR;
+            else if (tty_sysfs_uevent) {
+                sysfs_fd->device_major = GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR;
+                sysfs_fd->device_minor = tty_minor;
+            }
+        }
         *is_virtual = 1;
         *pending_return = fd;
         virtual_file_ops++;
         printf("GUEST SYSFS UEVENT OPEN: guest-pid=%d guest-path=%s device=%s dirfd=%d flags=0x%x virtual-fd=%d; no backing file/device accessed\n",
                active_tracee->guest_pid, guest,
-               sysfs_fd && sysfs_fd->device_major == GUEST_FB0_MAJOR ? "graphics-fb0" : "net-eth0",
+               sysfs_fd && sysfs_fd->device_major == GUEST_FB0_MAJOR ? "graphics-fb0" :
+                   sysfs_fd && sysfs_fd->device_major == GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR
+                       ? "goldfish-tty-synthetic" : "net-eth0",
                (int32_t)regs->uregs[0], flags, fd);
         return 0;
     }
     if (nr == ARM_NR_OPEN || nr == ARM_NR_OPENAT) {
+        uint32_t tty_minor = 0;
+        if (guest_goldfish_tty_parse_device_path(guest, &tty_minor)) {
+            unsigned flags = regs->uregs[nr == ARM_NR_OPEN ? 1u : 2u];
+            guest_goldfish_tty_runtime.open_attempts++;
+            int rc = guest_goldfish_tty_open_validate(
+                &guest_goldfish_tty_runtime,
+                active_tracee && active_tracee->pid == pid &&
+                    tracee_is_verified_api10_qemud(active_tracee) &&
+                    active_tracee->identity.euid == 0,
+                guest, flags, &tty_minor);
+            if (rc == 0) rc = guest_pseudo_device_backing_present(guest);
+            int fd = -1;
+            if (rc == 0) {
+                fd = alloc_virtual_fd(VIRTUAL_FD_DEV_TTY);
+                if (fd < 0) rc = fd;
+            }
+            if (rc == 0) {
+                rc = guest_goldfish_tty_note_open(&guest_goldfish_tty_runtime,
+                                                   tty_minor, fd);
+                if (rc != 0) (void)close_virtual_fd(active_tracee, fd);
+            }
+            if (rc == 0) {
+                set_virtual_fd_open_flags(active_tracee, fd, flags);
+                struct guest_vsocket_fd *tty_fd = guest_vsocket_fd_get(
+                    &guest_sockets, fd);
+                if (tty_fd) {
+                    tty_fd->device_mode = GUEST_GOLDFISH_TTY_MODE;
+                    tty_fd->device_major = GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR;
+                    tty_fd->device_minor = tty_minor;
+                }
+                virtual_pseudo_device_open_count++;
+                virtual_device_count++;
+                *is_virtual = 1;
+                *pending_return = fd;
+            }
+            printf("GUEST GOLDFISH TTY OPEN: guest-pid=%d executable=%s image-verified=%d path=%s flags=0x%x synthetic-dev=%u:%u fd=%d result=%d; qemud-only ttyS1 software endpoint, no host tty or Goldfish runtime dev_t used\n",
+                   active_tracee ? active_tracee->guest_pid : -1,
+                   active_tracee ? active_tracee->exec_target : "<unknown>",
+                   active_tracee ? tracee_is_verified_api10_qemud(active_tracee) : 0,
+                   guest, flags, GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR,
+                   tty_minor, fd, rc);
+            return rc == 0 ? 0 : rc;
+        }
         struct guest_pseudo_device_metadata metadata;
         int recognized = guest_pseudo_device_metadata_for_path(guest, &metadata);
         if (recognized < 0) return recognized;
@@ -3865,6 +4021,44 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
                    active_tracee ? active_tracee->exec_target : "<unknown>",
                    guest, metadata.kind, metadata.mode & 07777u,
                    metadata.major, metadata.minor, flags, fd);
+            return 0;
+        }
+    }
+    if ((nr == ARM_NR_MKNOD || nr == ARM_NR_MKNODAT)) {
+        uint32_t tty_minor = 0;
+        if (guest_goldfish_tty_parse_device_path(guest, &tty_minor)) {
+            unsigned mode_arg = nr == ARM_NR_MKNOD ? 1u : 2u;
+            unsigned device_arg = nr == ARM_NR_MKNOD ? 2u : 3u;
+            uint32_t requested_mode = regs->uregs[mode_arg];
+            uint32_t requested_device = regs->uregs[device_arg];
+            int32_t result = -EOPNOTSUPP;
+            char backing[PATH_MAX] = "<unmapped>";
+            int map_rc = nr == ARM_NR_MKNOD
+                ? map_guest_path(guest, backing, sizeof(backing)) : -EOPNOTSUPP;
+            if (nr == ARM_NR_MKNOD && map_rc == 0 &&
+                active_tracee && active_tracee->pid == pid)
+                result = guest_goldfish_tty_create_app_private_placeholder(
+                    guest_root, guest, backing, &guest_goldfish_tty_runtime,
+                    is_guest_ueventd(pid), requested_mode, requested_device,
+                    &tty_minor);
+            else if (nr == ARM_NR_MKNOD && map_rc != 0)
+                result = map_rc;
+            else if (nr == ARM_NR_MKNOD)
+                result = -EPERM;
+            else
+                guest_goldfish_tty_runtime.mknod_attempts++;
+            if (result < 0) guest_goldfish_tty_runtime.unsupported++;
+            *is_virtual = 1;
+            *pending_return = result;
+            virtual_device_count++;
+            printf("GUEST GOLDFISH TTY MKNOD: guest-pid=%d parent-guest-pid=%d executable=%s actor-verified-ueventd=%d syscall=%s path=%s mode=0%o synthetic-dev=%u:%u result=%d node-mask=0x%02x backing=%s; app-private regular placeholder only, host mknod never called\n",
+                   active_tracee ? active_tracee->guest_pid : -1,
+                   active_tracee ? active_tracee->guest_parent_pid : -1,
+                   active_tracee ? active_tracee->exec_target : "<unknown>",
+                   is_guest_ueventd(pid), guest_diag_syscall_name(nr), guest,
+                   requested_mode, GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR,
+                   tty_minor, result, guest_goldfish_tty_runtime.node_mask,
+                   backing);
             return 0;
         }
     }
@@ -4527,6 +4721,57 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
             virtual_device_count++;
             return 0;
         }
+        int tty_fd_number = (int32_t)regs->uregs[0];
+        struct guest_vsocket_fd *tty_fd = guest_vsocket_fd_get(
+            &guest_sockets, tty_fd_number);
+        if (tty_fd && tty_fd->kind == VIRTUAL_FD_DEV_TTY) {
+            uint32_t request = regs->uregs[1];
+            uint32_t guest_buffer = regs->uregs[2];
+            struct guest_arm32_termios termios;
+            int verified_qemud = state && state->pid == pid &&
+                tracee_is_verified_api10_qemud(state) &&
+                state->identity.euid == 0;
+            int tty_result = 0;
+            if (!state || !tracee_owns_virtual_fd(state, tty_fd_number)) {
+                tty_result = -EBADF;
+            } else if (!verified_qemud) {
+                tty_result = -EPERM;
+            } else if (request == GUEST_GOLDFISH_TTY_TCGETS) {
+                if (guest_buffer == 0) {
+                    tty_result = -EFAULT;
+                } else {
+                    tty_result = guest_goldfish_tty_ioctl(
+                        &guest_goldfish_tty_runtime, verified_qemud,
+                        tty_fd_number, request, &termios, sizeof(termios));
+                    if (tty_result == 0 && write_remote(pid, guest_buffer,
+                            &termios, sizeof(termios)) != 0) tty_result = -EFAULT;
+                }
+            } else if (request == GUEST_GOLDFISH_TTY_TCSETS) {
+                if (guest_buffer == 0 || read_remote(pid, guest_buffer,
+                        &termios, sizeof(termios)) != 0) {
+                    tty_result = -EFAULT;
+                } else {
+                    tty_result = guest_goldfish_tty_ioctl(
+                        &guest_goldfish_tty_runtime, verified_qemud,
+                        tty_fd_number, request, &termios, sizeof(termios));
+                }
+            } else {
+                tty_result = -ENOTTY;
+            }
+            if (tty_result < 0) guest_goldfish_tty_runtime.unsupported++;
+            *pending_return = tty_result;
+            *fake = 1;
+            virtual_device_count++;
+            if (guest_goldfish_tty_diagnostics_emitted < 64u) {
+                guest_goldfish_tty_diagnostics_emitted++;
+                printf("GUEST GOLDFISH TTY IOCTL: guest-pid=%d executable=%s fd=%d request=0x%x guest-buffer=0x%08x verified-root-qemud=%d result=%d termios-bytes=%u; API10 ARM32 software termios only, host ioctl never called\n",
+                       state ? state->guest_pid : -1,
+                       state ? state->exec_target : "<unknown>",
+                       tty_fd_number, request, guest_buffer, verified_qemud,
+                       tty_result, GUEST_GOLDFISH_TTY_TERMios_BYTES);
+            }
+            return 0;
+        }
     }
     if (nr == ARM_NR_MMAP2) {
         int binder_map_result = mediate_guest_binder_mmap(state, regs);
@@ -4802,6 +5047,105 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
     if (nr == ARM_NR_KILL) {
         *pending_return = mediate_guest_kill(regs); *fake = 1; return 0;
     }
+    if (nr == ARM_NR_EPOLL_CREATE) {
+        int32_t size = (int32_t)regs->uregs[0];
+        int verified_qemud = state && state->pid == pid &&
+            tracee_is_verified_api10_qemud(state) && state->identity.euid == 0;
+        int fd = verified_qemud
+            ? guest_goldfish_tty_epoll_create(&guest_goldfish_tty_epolls,
+                &guest_sockets, size, state->virtual_fd_table_id)
+            : -EPERM;
+        guest_goldfish_tty_runtime.epoll_creates++;
+        if (fd >= 0) track_virtual_fd_for_group(state, fd);
+        else guest_goldfish_tty_runtime.unsupported++;
+        *pending_return = fd;
+        *fake = 1;
+        virtual_device_count++;
+        if (guest_goldfish_tty_diagnostics_emitted < 64u) {
+            guest_goldfish_tty_diagnostics_emitted++;
+            printf("GUEST QEMUD VIRTUAL EPOLL CREATE: guest-pid=%d executable=%s size=%d verified-root-qemud=%d fd=%d result=%d; guest descriptor table only, host epoll_create never called\n",
+                   state ? state->guest_pid : -1,
+                   state ? state->exec_target : "<unknown>", size,
+                   verified_qemud, fd >= 0 ? fd : -1, fd);
+        }
+        return 0;
+    }
+    if (nr == ARM_NR_EPOLL_CTL) {
+        int epfd = (int32_t)regs->uregs[0];
+        int operation = (int32_t)regs->uregs[1];
+        int watched_fd = (int32_t)regs->uregs[2];
+        uint32_t event_pointer = regs->uregs[3];
+        int verified_qemud = state && state->pid == pid &&
+            tracee_is_verified_api10_qemud(state) && state->identity.euid == 0;
+        struct guest_arm32_epoll_event event = {0};
+        int ctl_result;
+        if (!verified_qemud) {
+            ctl_result = -EPERM;
+        } else if (!tracee_owns_virtual_fd(state, epfd) ||
+                   !tracee_owns_virtual_fd(state, watched_fd)) {
+            ctl_result = -EBADF;
+        } else if (operation != GUEST_GOLDFISH_TTY_EPOLL_CTL_DEL &&
+                   (event_pointer == 0 || read_remote(pid, event_pointer,
+                       &event, sizeof(event)) != 0)) {
+            ctl_result = -EFAULT;
+        } else {
+            ctl_result = guest_goldfish_tty_epoll_ctl(
+                &guest_goldfish_tty_epolls, &guest_sockets, verified_qemud,
+                state->virtual_fd_table_id, epfd, operation, watched_fd,
+                event.events, event.data, guest_goldfish_tty_runtime.tty_fd,
+                guest_sockets.qemud_listener_fd);
+        }
+        guest_goldfish_tty_runtime.epoll_controls++;
+        if (ctl_result < 0) guest_goldfish_tty_runtime.unsupported++;
+        *pending_return = ctl_result;
+        *fake = 1;
+        virtual_device_count++;
+        if (guest_goldfish_tty_diagnostics_emitted < 64u) {
+            guest_goldfish_tty_diagnostics_emitted++;
+            printf("GUEST QEMUD VIRTUAL EPOLL CTL: guest-pid=%d executable=%s epfd=%d op=%d fd=%d events=0x%x data=0x%016llx verified-root-qemud=%d tty-fd=%d listener-fd=%d result=%d; no host epoll object or event source\n",
+                   state ? state->guest_pid : -1,
+                   state ? state->exec_target : "<unknown>", epfd, operation, watched_fd,
+                   event.events, (unsigned long long)event.data,
+                   verified_qemud, guest_goldfish_tty_runtime.tty_fd,
+                   guest_sockets.qemud_listener_fd, ctl_result);
+        }
+        return 0;
+    }
+    if (nr == ARM_NR_EPOLL_WAIT) {
+        int epfd = (int32_t)regs->uregs[0];
+        int32_t maxevents = (int32_t)regs->uregs[2];
+        int32_t timeout_ms = (int32_t)regs->uregs[3];
+        int verified_qemud = state && state->pid == pid &&
+            tracee_is_verified_api10_qemud(state) && state->identity.euid == 0;
+        int wait_result = !verified_qemud ? -EPERM :
+            (!tracee_owns_virtual_fd(state, epfd) ? -EBADF :
+             guest_goldfish_tty_epoll_wait_result(&guest_goldfish_tty_epolls,
+                state->virtual_fd_table_id, epfd, maxevents, timeout_ms));
+        if (wait_result == GUEST_GOLDFISH_TTY_EPOLL_WAIT_PARK) {
+            guest_goldfish_tty_runtime.epoll_empty_waits++;
+            *fake = 2; /* keep the verified qemud tracee ptrace-stopped: no event exists */
+            if (guest_goldfish_tty_diagnostics_emitted < 64u) {
+                guest_goldfish_tty_diagnostics_emitted++;
+                printf("GUEST QEMUD VIRTUAL EPOLL WAIT PARKED: guest-pid=%d executable=%s epfd=%d maxevents=%d timeout=%d watches=%zu result=parked-no-peer; qemud tty input and listener queue are empty, no synthetic bytes/event and no host epoll_wait\n",
+                       state->guest_pid, state->exec_target, epfd, maxevents, timeout_ms,
+                       guest_goldfish_tty_epoll_watch_count(
+                           &guest_goldfish_tty_epolls, epfd));
+            }
+            return 0;
+        }
+        if (wait_result < 0) guest_goldfish_tty_runtime.unsupported++;
+        *pending_return = wait_result;
+        *fake = 1;
+        virtual_device_count++;
+        if (guest_goldfish_tty_diagnostics_emitted < 64u) {
+            guest_goldfish_tty_diagnostics_emitted++;
+            printf("GUEST QEMUD VIRTUAL EPOLL WAIT: guest-pid=%d executable=%s epfd=%d maxevents=%d timeout=%d result=%d; no queued peer events, no host epoll_wait\n",
+                   state ? state->guest_pid : -1,
+                   state ? state->exec_target : "<unknown>", epfd, maxevents,
+                   timeout_ms, wait_result);
+        }
+        return 0;
+    }
     if (nr == ARM_NR_MOUNT) {
         *pending_return = virtual_mount(pid, regs); *fake = 1; return 0;
     }
@@ -4932,7 +5276,46 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         is_virtual_fd_number((int32_t)regs->uregs[0])) {
         int fd = (int32_t)regs->uregs[0];
         struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
-        if (entry && entry->kind == VIRTUAL_FD_DEV_BINDER) {
+        if (entry && entry->kind == VIRTUAL_FD_DEV_TTY) {
+            int verified_qemud = state && state->pid == pid &&
+                tracee_is_verified_api10_qemud(state) && state->identity.euid == 0;
+            int32_t tty_result = 0;
+            if (!state || !tracee_owns_virtual_fd(state, fd)) {
+                tty_result = -EBADF;
+            } else if (!verified_qemud) {
+                tty_result = -EPERM;
+            } else if (regs->uregs[2] == 0) {
+                tty_result = 0;
+            } else if (nr == ARM_NR_READ) {
+                tty_result = guest_goldfish_tty_read_result(
+                    &guest_goldfish_tty_runtime, fd, entry->nonblocking);
+            } else {
+                tty_result = guest_goldfish_tty_write_result(
+                    &guest_goldfish_tty_runtime, fd, regs->uregs[2]);
+            }
+            virtual_device_count++;
+            if (tty_result == GUEST_GOLDFISH_TTY_READ_PARK) {
+                *fake = 2;
+                if (guest_goldfish_tty_diagnostics_emitted < 64u) {
+                    guest_goldfish_tty_diagnostics_emitted++;
+                    printf("GUEST GOLDFISH TTY READ PARKED: guest-pid=%d fd=%d count=%u nonblocking=%d result=parked-no-peer; no bytes fabricated and no host read\n",
+                           state->guest_pid, fd, regs->uregs[2],
+                           entry->nonblocking);
+                }
+                return 0;
+            }
+            *pending_return = tty_result;
+            *fake = 1;
+            if (guest_goldfish_tty_diagnostics_emitted < 64u) {
+                guest_goldfish_tty_diagnostics_emitted++;
+                printf("GUEST GOLDFISH TTY IO: guest-pid=%d executable=%s fd=%d operation=%s count=%u nonblocking=%d result=%d; no serial peer modeled, no host read/write\n",
+                       state ? state->guest_pid : -1,
+                       state ? state->exec_target : "<unknown>", fd,
+                       nr == ARM_NR_READ ? "read" : "write", regs->uregs[2],
+                       entry->nonblocking, tty_result);
+            }
+            return 0;
+        } else if (entry && entry->kind == VIRTUAL_FD_DEV_BINDER) {
             *pending_return = -EOPNOTSUPP;
             printf("GUEST BINDER STREAM IO DENIED: guest-pid=%d fd=%d syscall=%s result=-EOPNOTSUPP; API10 backend accepts only version/context-manager/loop ioctls, no raw stream or host fd\n",
                    state->guest_pid, fd, guest_diag_syscall_name(nr));
@@ -5673,10 +6056,14 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 if (fake == 2) {
                     state->pending = 0;
                     state->expect_exit = 0;
+                    const char *blocked_kind = state->last_syscall == ARM_NR_EPOLL_WAIT
+                        ? "guest-software-blocked-epoll-wait"
+                        : "guest-software-blocked-read";
                     if (syscall_stops <= MAX_TRACE_LINES)
-                        printf("TRACE pid=%d entry #%lu: ARM syscall=%d class=%d guest-software-blocked-read (tracee remains ptrace-stopped; no syscall forwarded)\n",
+                        printf("TRACE pid=%d entry #%lu: ARM syscall=%d class=%d %s (tracee remains ptrace-stopped; no syscall forwarded)\n",
                                waited, syscall_stops, state->last_syscall,
-                               (int)guest_syscall_policy(state->last_syscall));
+                               (int)guest_syscall_policy(state->last_syscall),
+                               blocked_kind);
                     stops++;
                     continue;
                 }
@@ -6143,6 +6530,10 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
 int main(int argc, char **argv) {
     (void)setvbuf(stdout, NULL, _IOLBF, 0);
     guest_vsocket_table_init(&guest_sockets);
+    guest_goldfish_tty_runtime_init(&guest_goldfish_tty_runtime);
+    guest_goldfish_tty_epoll_table_init(&guest_goldfish_tty_epolls);
+    guest_qemud_socket_bind_count = 0;
+    guest_goldfish_tty_diagnostics_emitted = 0;
     guest_null_stdio_runtime_init(&guest_null_stdio_runtime);
     guest_null_stdio_diagnostics_emitted = 0;
     guest_ueventd_exec_image_validated_count = 0;
@@ -6417,6 +6808,29 @@ int main(int argc, char **argv) {
            coldboot_marker_runtime.last_lstat_observed &&
                coldboot_marker_runtime.last_lstat_result == 0
                    ? (long long)coldboot_marker_runtime.last_lstat.st_size : 0ll);
+    printf("GUEST GOLDFISH TTY SUMMARY: profile=synthetic dev=%u:0-%u qemud=/dev/ttyS1 qemud-service-binds=%lu listener-fd=%d synthetic-dev=%u:%u events=%lu event-mask=0x%02x mknod-attempts=%lu nodes-created=%lu node-mask=0x%02x opens=%lu tty-open=%d TCGETS=%lu TCSETS=%lu empty-reads=%lu writes-without-peer=%lu epoll-create-attempts=%lu epoll-ctl=%lu empty-waits=%lu unsupported=%lu diagnostics-emitted=%u; Goldfish runtime major is unknown/not claimed; no serial peer/data or emulator reply is modeled; host tty/mknod/epoll calls=0\n",
+           GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR,
+           GUEST_GOLDFISH_TTY_LINE_COUNT - 1u,
+           guest_qemud_socket_bind_count,
+           guest_sockets.qemud_listener_fd,
+           GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR,
+           GUEST_GOLDFISH_TTY_QEMUD_MINOR,
+           guest_goldfish_tty_runtime.events_received,
+           guest_goldfish_tty_runtime.uevent_mask,
+           guest_goldfish_tty_runtime.mknod_attempts,
+           guest_goldfish_tty_runtime.nodes_created,
+           guest_goldfish_tty_runtime.node_mask,
+           guest_goldfish_tty_runtime.open_attempts,
+           guest_goldfish_tty_runtime.tty_fd >= 0,
+           guest_goldfish_tty_runtime.ioctl_gets,
+           guest_goldfish_tty_runtime.ioctl_sets,
+           guest_goldfish_tty_runtime.empty_reads,
+           guest_goldfish_tty_runtime.writes_without_peer,
+           guest_goldfish_tty_runtime.epoll_creates,
+           guest_goldfish_tty_runtime.epoll_controls,
+           guest_goldfish_tty_runtime.epoll_empty_waits,
+           guest_goldfish_tty_runtime.unsupported,
+           guest_goldfish_tty_diagnostics_emitted);
     printf("VIRTUAL PROPERTY STREAM SUMMARY: ARM sendto=%lu bytes=%lu recvfrom=%lu bytes=%lu errors=%lu diagnostics-emitted=%lu (limit=64); fixed API10 setprop request size=128 bytes; sendto/recvfrom supported only with flags=0 and NULL address outputs/inputs\n",
            virtual_property_sendto_count, virtual_property_sendto_bytes,
            virtual_property_recvfrom_count, virtual_property_recvfrom_bytes,

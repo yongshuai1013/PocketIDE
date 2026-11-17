@@ -9,6 +9,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/init_broker_policy_test.c" -o "$TMP/init_broker_policy_test"
 "$TMP/init_broker_policy_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_goldfish_tty_regression.c" -o "$TMP/guest_goldfish_tty_regression"
+"$TMP/guest_goldfish_tty_regression" "$TMP/goldfish-tty-test-root"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/broker_sigsys_state_test.c" -o "$TMP/broker_sigsys_state_test"
 "$TMP/broker_sigsys_state_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -159,6 +162,9 @@ script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
 profile = Path(sys.argv[1]).with_name('guest_hardware_profile.h').read_text()
 qemud_diagnostics = Path(sys.argv[1]).with_name('guest_qemud_diagnostics.h').read_text()
 qemud_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_qemud_diagnostics_test.c').read_text()
+tty_model = Path(sys.argv[1]).with_name('guest_goldfish_tty_virtual.h').read_text()
+tty_fs = Path(sys.argv[1]).with_name('guest_goldfish_tty_fs.h').read_text()
+tty_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_goldfish_tty_regression.c').read_text()
 pseudo_device = Path(sys.argv[1]).with_name('guest_pseudo_device.h').read_text()
 null_stdio = Path(sys.argv[1]).with_name('guest_null_stdio.h').read_text()
 null_stdio_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_null_stdio_test.c').read_text()
@@ -250,8 +256,8 @@ assert 'GUEST POLL DIAGNOSTIC:' in src and 'virtual_fd_source(fds[i].fd)' in src
 assert 'timeout-ms=%d' in src and 'revents-in=0x%04x revents-out=0x%04x' in src
 assert 'empty guest-only uevent queue' in src
 assert 'guest_vsocket_poll_events(' in src and '&guest_sockets, fd, fds[i].events' in src
-assert 'VIRTUAL PROPERTY SOCKET CREATE:' in src and 'VIRTUAL PROPERTY BIND:' in src
-assert 'VIRTUAL PROPERTY LISTEN:' in src and 'VIRTUAL PROPERTY ACCEPT:' in src
+assert 'VIRTUAL PROPERTY SOCKET CREATE:' in src and 'VIRTUAL GUEST SERVICE BIND:' in src
+assert 'VIRTUAL GUEST SERVICE LISTEN:' in src and 'VIRTUAL PROPERTY ACCEPT:' in src
 assert 'VIRTUAL PROPERTY CONNECT:' in src and 'VIRTUAL PROPERTY SO_PEERCRED:' in src
 assert '#define ARM_NR_SENDTO 290' in src and '#define ARM_NR_RECVFROM 292' in src
 assert 'virtual_guest_property_stream_io' in src and 'VIRTUAL PROPERTY STREAM SYSCALL:' in src
@@ -412,6 +418,37 @@ assert 'guest_qemud_diag_safe_port_label(diag)' in src
 assert 'guest_qemud_diag_claim_cmdline_observation' in src
 assert 'guest_qemud_diag_dup_fd' in src
 assert 'ARM_NR_FCNTL64' in src
+assert '#define ARM_NR_EPOLL_CREATE 250' in src
+assert '#define ARM_NR_EPOLL_CTL 251' in src
+assert '#define ARM_NR_EPOLL_WAIT 252' in src
+assert 'if (nr == ARM_NR_EPOLL_CREATE)' in src and 'guest_goldfish_tty_epoll_create' in src
+assert 'if (nr == ARM_NR_EPOLL_CTL)' in src and 'guest_goldfish_tty_epoll_ctl' in src
+assert 'if (nr == ARM_NR_EPOLL_WAIT)' in src and 'guest_goldfish_tty_epoll_wait_result' in src
+assert 'guest_goldfish_tty_epoll_remove_watched_fd' in src
+assert 'GUEST QEMUD VIRTUAL EPOLL WAIT PARKED:' in src
+assert 'GUEST GOLDFISH TTY SUMMARY:' in src
+assert 'guest-software-blocked-epoll-wait' in src
+assert 'no serial peer/data or emulator reply is modeled' in src
+assert 'guest_goldfish_tty_read_result' in src and 'guest_goldfish_tty_write_result' in src
+assert 'GUEST GOLDFISH TTY IOCTL:' in src and 'GUEST_GOLDFISH_TTY_TCGETS' in src
+assert 'GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR 240u' in tty_model
+assert 'this is not the Goldfish runtime major' in tty_model
+assert 'GUEST_GOLDFISH_TTY_QEMUD_MINOR 1u' in tty_model
+assert 'GUEST_GOLDFISH_TTY_O_LARGEFILE 0400000u' in tty_model
+assert 'guest_goldfish_tty_create_app_private_placeholder' in tty_fs
+assert 'AT_SYMLINK_NOFOLLOW' in tty_fs and 'O_NOFOLLOW' in tty_fs
+assert 'guest_goldfish_tty_open_validate' in src and 'active_tracee->identity.euid == 0' in src
+assert 'guest_goldfish_tty_ioctl' in src and 'guest_goldfish_tty_epoll_wait_result' in src
+assert 'test_event_mknod_open_termios_epoll_lifecycle' in tty_test
+assert 'test_symlinked_node_and_outside_containment' in tty_test
+assert '0x1122334455667788' in tty_test and 'GUEST_GOLDFISH_TTY_READ_PARK' in tty_test
+assert 'guest_goldfish_tty_regression.c' in network_test_runner
+for host_primitive in ('epoll_create', 'epoll_ctl', 'epoll_wait', 'mknod'):
+    assert not re.search(r'(?<![A-Za-z0-9_])' + host_primitive + r'\s*\(', src), host_primitive
+for tty_policy in ('guest_syscall_policy(250) == GUEST_SYSCALL_VIRTUAL_SOCKET',
+                   'guest_syscall_policy(251) == GUEST_SYSCALL_VIRTUAL_SOCKET',
+                   'guest_syscall_policy(252) == GUEST_SYSCALL_VIRTUAL_SOCKET'):
+    assert tty_policy in policy_test, tty_policy
 assert 'case 221: return "fcntl64";' in Path(sys.argv[1]).with_name('guest_diagnostics.h').read_text()
 assert 'state->last_syscall == ARM_NR_CLOSE && syscall_result == 0' in src
 assert 'guest_qemud_diag_is_tty_s_path' in qemud_diagnostics
@@ -528,6 +565,9 @@ assert 'GUEST_PROFILE_NET_ADDRESS "10.0.2.15"' in profile
 assert 'GUEST_PROFILE_NET_NETMASK "255.255.255.0"' in profile
 assert 'GUEST_PROFILE_NET_GATEWAY "10.0.2.2"' in profile
 assert 'GUEST_PROFILE_NET_DNS1 "10.0.2.3"' in profile
+assert 'runtime major has not been observed' in profile
+assert '/dev/ttyS' not in ueventd_rc
+assert 'GUEST_GOLDFISH_TTY_MODE 0020600u' in tty_model
 for literal in ('ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up',
                 'route add default gw 10.0.2.2 dev eth0',
                 'net.eth0.dns1 10.0.2.3'):
@@ -714,6 +754,8 @@ if api10_source_available:
     assert api10_ueventd_main.index('open_devnull_stdio();') < api10_ueventd_main.index('log_init();') < api10_ueventd_main.index('device_init();')
     api10_device_init = api10_devices_source.split('void device_init(void)', 1)[1].split('\n}', 1)[0]
     assert api10_device_init.index('open_uevent_socket()') < api10_device_init.index('coldboot("/sys/class")') < api10_device_init.index('open(coldboot_done, O_WRONLY|O_CREAT, 0000)') < api10_device_init.index('close(fd)')
+    assert 'return 0600;' in api10_devices_source and '*uid = 0;' in api10_devices_source and '*gid = 0;' in api10_devices_source
+    assert 'mknod(path, mode, dev);' in api10_devices_source
     api10_main = api10_init_source.split('int main(', 1)[1]
     assert api10_main.index('open_devnull_stdio();') < api10_main.index('log_init();') < api10_main.index('init_parse_config_file("/init.rc")')
     assert api10_main.index('init_parse_config_file("/init.rc")') < api10_main.index('import_kernel_cmdline(0)') < api10_main.index('get_hardware_name(hardware, &revision)') < api10_main.index('init_parse_config_file(tmp)') < api10_main.index('action_for_each_trigger("early-init", action_add_queue_tail)')
@@ -955,16 +997,17 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.29-test-signed-apk' in upload
-assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.29-apk.sha256"' in workflow
-assert '${{ runner.temp }}/gingervm-v0.6.29-apk.sha256' in upload
+assert 'Build GingerVM v0.6.30 test-signed Android APK' in workflow
+assert 'gingervm-continuous-trace-v0.6.30-test-signed-apk' in upload
+assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.30-apk.sha256"' in workflow
+assert '${{ runner.temp }}/gingervm-v0.6.30-apk.sha256' in upload
 assert '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 38" in gradle and "versionName '0.6.29'" in gradle
+assert "versionCode 39" in gradle and "versionName '0.6.30'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.29' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.30' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

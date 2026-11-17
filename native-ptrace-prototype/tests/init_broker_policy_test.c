@@ -50,6 +50,9 @@ int main(void) {
     assert(guest_syscall_policy(294) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* setsockopt */
     assert(guest_syscall_policy(295) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* getsockopt */
     assert(guest_syscall_policy(297) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* recvmsg for ueventd only */
+    assert(guest_syscall_policy(250) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* qemud-only epoll_create */
+    assert(guest_syscall_policy(251) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* owned guest epoll_ctl */
+    assert(guest_syscall_policy(252) == GUEST_SYSCALL_VIRTUAL_SOCKET); /* guest wait or no-peer park */
     assert(guest_syscall_policy(286) == GUEST_SYSCALL_DENY); /* getpeername */
     assert(guest_syscall_policy(287) == GUEST_SYSCALL_DENY); /* getsockname */
     assert(guest_syscall_policy(293) == GUEST_SYSCALL_DENY); /* shutdown not implemented */
