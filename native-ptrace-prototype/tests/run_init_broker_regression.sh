@@ -30,6 +30,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_network_virtual_test.c" -o "$TMP/guest_network_virtual_test"
 "$TMP/guest_network_virtual_test" "$GUEST_BASE/system-tree/etc/init.goldfish.sh"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_qemud_diagnostics_test.c" -o "$TMP/guest_qemud_diagnostics_test"
+"$TMP/guest_qemud_diagnostics_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_identity_compat_test.c" -o "$TMP/guest_identity_compat_test"
 "$TMP/guest_identity_compat_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -154,6 +157,8 @@ diagnostics = Path(sys.argv[1]).with_name('guest_diagnostics.h').read_text()
 sigsys_context = Path(sys.argv[1]).with_name('guest_sigsys_context.h').read_text()
 script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
 profile = Path(sys.argv[1]).with_name('guest_hardware_profile.h').read_text()
+qemud_diagnostics = Path(sys.argv[1]).with_name('guest_qemud_diagnostics.h').read_text()
+qemud_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_qemud_diagnostics_test.c').read_text()
 pseudo_device = Path(sys.argv[1]).with_name('guest_pseudo_device.h').read_text()
 null_stdio = Path(sys.argv[1]).with_name('guest_null_stdio.h').read_text()
 null_stdio_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_null_stdio_test.c').read_text()
@@ -380,6 +385,34 @@ assert '#define ARM_NR_WAIT4 114' in src and 'ARM_NR_WAITPID' not in src
 assert 'guest_syscall_policy(7) == GUEST_SYSCALL_DENY' in Path(sys.argv[1]).parents[4].joinpath('tests/init_broker_policy_test.c').read_text()
 assert 'GUEST EMULATOR SERVICE EXEC:' in src and 'GUEST EMULATOR SERVICE EXIT:' in src
 assert 'guest_qemud_exec_count' in src and 'guest_qemu_props_exec_count' in src
+assert '#include "guest_qemud_diagnostics.h"' in src
+assert 'GUEST QEMUD TRANSPORT PROFILE:' in src
+assert 'GUEST QEMUD SYSCALL:' in src and 'GUEST QEMUD STARTUP DIAGNOSTICS:' in src
+assert 'guest_qemud_diag_begin' in src and 'guest_qemud_diag_finish' in src
+assert 'guest_qemud_diag_note_cmdline_read' in src and 'guest_qemud_diag_note_open' in src
+assert 'GUEST_QEMUD_DIAG_MAX_RECORDS 96u' in qemud_diagnostics
+assert 'GUEST_QEMUD_DIAG_RUN_MAX_LINES 256u' in qemud_diagnostics
+assert 'result < 0' in qemud_diagnostics and 'records_suppressed++' in qemud_diagnostics
+assert 'guest_qemud_diag_fd_path' in qemud_diagnostics
+assert 'guest_qemud_diag_token_value' in qemud_diagnostics
+assert 'guest_qemud_diag_run_budget_take' in src
+assert 'guest_qemud_diag_safe_port_label(diag)' in src
+assert 'guest_qemud_diag_claim_cmdline_observation' in src
+assert 'guest_qemud_diag_dup_fd' in src
+assert 'ARM_NR_FCNTL64' in src
+assert 'case 221: return "fcntl64";' in Path(sys.argv[1]).with_name('guest_diagnostics.h').read_text()
+assert 'state->last_syscall == ARM_NR_CLOSE && syscall_result == 0' in src
+assert 'guest_qemud_diag_is_tty_s_path' in qemud_diagnostics
+assert 'else guest_qemud_diag_untrack_fd(state, new_fd)' in qemud_diagnostics
+assert 'case 221: /* fcntl64 */' in qemud_diagnostics
+assert 'test_source_backed_profile_tokens' in qemud_test
+assert 'test_selected_calls_and_failed_unselected_calls' in qemud_test
+assert 'test_cmdline_fd_and_parameter_observation' in qemud_test
+assert 'test_record_budget_is_hard_bounded' in qemud_test
+assert 'guest_qemud_diag_run_budget_take' in qemud_test
+assert 'guest_qemud_diag_safe_port_label' in qemud_test
+assert 'guest_qemud_diag_syscall_selected(221)' in qemud_test
+assert 'guest_qemud_diag_is_tty_s_path("/dev/ttyS1-extra")' in qemud_test
 assert 'PROCESS TREE LIMIT: refusing child host-pid=' in src
 assert 'guest_tracee_slot_allocate(&tracee_slot_pool)' in src
 assert 'guest_tracee_slot_mark_reaped(&tracee_slot_pool' in src
@@ -461,6 +494,7 @@ assert 'queue.enqueued == 1 && queue.delivered == 1 && queue.count == 0' in cold
 assert 'O_WRONLY | O_CREAT' in coldboot_test and 'after.st_ino == opened.st_ino' in coldboot_test
 assert 'API10 guest-only uevent/coldboot sequence-model regression: PASS' in coldboot_test
 assert '#define GUEST_PROFILE_HARDWARE "goldfish"' in profile
+assert '"qemu=1 android.qemud=ttyS1 androidboot.hardware=" GUEST_PROFILE_HARDWARE' in profile
 assert '#define GUEST_PROFILE_CPU_COUNT 1u' in profile
 assert 'explicit GingerVM synthetic defaults' in profile
 assert 'androidboot.hardware=" GUEST_PROFILE_HARDWARE "\\n' in profile
@@ -906,16 +940,16 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.27-test-signed-apk' in upload
-assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.27-apk.sha256"' in workflow
-assert '${{ runner.temp }}/gingervm-v0.6.27-apk.sha256' in upload
+assert 'gingervm-continuous-trace-v0.6.28-test-signed-apk' in upload
+assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.28-apk.sha256"' in workflow
+assert '${{ runner.temp }}/gingervm-v0.6.28-apk.sha256' in upload
 assert '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 36" in gradle and "versionName '0.6.27'" in gradle
+assert "versionCode 37" in gradle and "versionName '0.6.28'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.27' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.28' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

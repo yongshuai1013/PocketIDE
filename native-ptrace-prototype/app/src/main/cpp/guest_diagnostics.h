@@ -56,6 +56,7 @@ static inline int guest_diag_escape(const char *input, char *output, size_t capa
 
 static inline const char *guest_diag_syscall_name(int number) {
     switch (number) {
+        case 1: return "exit";
         case 2: return "fork";
         case 7: return "waitpid";
         case 3: return "read";
@@ -63,15 +64,23 @@ static inline const char *guest_diag_syscall_name(int number) {
         case 5: return "open";
         case 6: return "close";
         case 11: return "execve";
+        case 14: return "mknod";
         case 21: return "mount";
         case 26: return "ptrace";
+        case 33: return "access";
         case 37: return "kill";
+        case 41: return "dup";
         case 52: return "umount2";
+        case 54: return "ioctl";
+        case 55: return "fcntl";
+        case 221: return "fcntl64";
         case 57: return "setpgid";
+        case 63: return "dup2";
         case 67: return "sigaction";
         case 79: return "settimeofday";
         case 75: return "setrlimit";
         case 83: return "symlink";
+        case 85: return "readlink";
         case 93: return "ftruncate";
         case 102: return "socketcall";
         case 114: return "wait4";
@@ -80,10 +89,15 @@ static inline const char *guest_diag_syscall_name(int number) {
         case 126: return "sigprocmask";
         case 133: return "fchdir";
         case 162: return "nanosleep";
+        case 142: return "select";
         case 168: return "poll";
         case 174: return "rt_sigaction";
         case 175: return "rt_sigprocmask";
         case 202: return "getegid32";
+        case 248: return "exit_group";
+        case 250: return "epoll_create";
+        case 251: return "epoll_ctl";
+        case 252: return "epoll_wait";
         case 195: return "stat64";
         case 196: return "lstat64";
         case 197: return "fstat64";

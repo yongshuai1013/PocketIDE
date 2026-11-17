@@ -36,6 +36,7 @@
 #include "guest_process_compat.h"
 #include "guest_safe_dir.h"
 #include "guest_hardware_profile.h"
+#include "guest_qemud_diagnostics.h"
 #include "guest_network_virtual.h"
 #include "guest_pseudo_device.h"
 #include "guest_null_stdio.h"
@@ -319,6 +320,7 @@ struct tracee_state {
     uint32_t fb_mapping_length;
     int fb_mapping_valid;
     struct guest_process_compat_state process_compat;
+    struct guest_qemud_diag_state qemud_diag;
     int alive;
     int is_thread;
     int guest_reaped;
@@ -352,6 +354,49 @@ struct tracee_state {
     uint16_t target_elf_type;
     uint32_t target_elf_entry;
 };
+
+static struct guest_qemud_diag_run_budget guest_qemud_diag_run_budget;
+
+static void log_guest_qemud_syscall(pid_t host_pid, const struct tracee_state *state,
+        const struct guest_qemud_diag_record *record) {
+    char safe_path[GUEST_QEMUD_DIAG_PATH_CAP * 4u];
+    char safe_fd_path[GUEST_QEMUD_DIAG_PATH_CAP * 4u];
+    int path_truncated = guest_diag_escape(record->path, safe_path, sizeof(safe_path));
+    int fd_path_truncated = guest_diag_escape(record->fd_path, safe_fd_path,
+                                               sizeof(safe_fd_path));
+    int error_number = record->result < 0 && record->result >= -4095
+        ? -record->result : 0;
+    printf("GUEST QEMUD SYSCALL: host-pid=%d guest-pid=%d seq=%u syscall=%d(%s) pc=0x%08x args=%u,%u,%u,%u,%u,%u path=\"%s\" path-truncated=%d fd-path=\"%s\" fd-path-truncated=%d result=%d errno=%d(%s); diagnostic-only, guest result unchanged, no host device/socket substitute\n",
+           host_pid, state->guest_pid, record->sequence, record->syscall_number,
+           guest_diag_syscall_name(record->syscall_number), record->pc,
+           record->args[0], record->args[1], record->args[2], record->args[3],
+           record->args[4], record->args[5], safe_path, path_truncated,
+           safe_fd_path, fd_path_truncated, record->result, error_number,
+           error_number ? guest_diag_errno_name(error_number) : "none");
+}
+
+static void log_guest_qemud_startup_diagnostics(const struct tracee_state *state,
+        const char *wait_kind, int wait_status) {
+    const struct guest_qemud_diag_state *diag = &state->qemud_diag;
+    char safe_tty_path[GUEST_QEMUD_DIAG_PATH_CAP * 4u];
+    int tty_path_truncated = guest_diag_escape(diag->tty_open_path,
+        safe_tty_path, sizeof(safe_tty_path));
+    printf("GUEST QEMUD STARTUP DIAGNOSTICS: guest-pid=%d wait=%s status=%d observed-syscalls=%u records-selected=%u per-process-records-dropped=%u pending=%d cmdline-open-count=%u cmdline-read-data-observations=%u cmdline-read-observed-bytes=%u observed-qemu-1=%d observed-android.qemud=%d observed-port=%s tty-open-attempts=%u tty-open-path=\"%s\" tty-open-path-truncated=%d tty-open-result=%d exit-request-seen=%d exit-syscall=%d(%s) requested-status=%u exit-pc=0x%08x target-text-PC-seen=%d target-e_entry-PC-seen=%d; read data redacted, no broker behavior inferred from log-device failures\n",
+           state->guest_pid, wait_kind, wait_status, diag->syscall_count,
+           diag->records_emitted, diag->records_suppressed, diag->pending,
+           diag->cmdline_open_count, diag->cmdline_read_calls,
+           diag->cmdline_read_bytes, diag->cmdline_qemu_enabled,
+           diag->cmdline_qemud_parameter_present,
+           guest_qemud_diag_safe_port_label(diag),
+           diag->tty_open_attempts, safe_tty_path, tty_path_truncated,
+           diag->tty_open_result, diag->exit_request_seen,
+           diag->exit_request_syscall,
+           diag->exit_request_seen
+               ? guest_diag_syscall_name(diag->exit_request_syscall) : "none",
+           diag->exit_request_status, diag->exit_request_pc,
+           state->target_elf_text_seen, state->target_elf_entry_pc_seen);
+}
+
 struct guest_coldboot_marker_runtime {
     char backing_path[PATH_MAX];
     pid_t host_pid;
@@ -5318,10 +5363,13 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                        WEXITSTATUS(status), unreaped);
             }
             if (strcmp(state->exec_target, "/system/bin/qemud") == 0) {
+                if (guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                    log_guest_qemud_startup_diagnostics(state, "exited", WEXITSTATUS(status));
                 guest_qemud_exit_count++;
                 guest_qemud_last_exit_code = WEXITSTATUS(status);
-                printf("GUEST EMULATOR SERVICE EXIT: guest-pid=%d service=qemud code=%d; no host emulator pipe was accessed\n",
-                       state->guest_pid, guest_qemud_last_exit_code);
+                if (guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                    printf("GUEST EMULATOR SERVICE EXIT: guest-pid=%d service=qemud code=%d; no host emulator pipe was accessed\n",
+                           state->guest_pid, guest_qemud_last_exit_code);
             } else if (strcmp(state->exec_target, "/system/bin/qemu-props") == 0) {
                 printf("GUEST EMULATOR SERVICE EXIT: guest-pid=%d service=qemu-props code=%d; boot-properties protocol completion not assumed\n",
                        state->guest_pid, WEXITSTATUS(status));
@@ -5343,10 +5391,13 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                        WTERMSIG(status), unreaped);
             }
             if (strcmp(state->exec_target, "/system/bin/qemud") == 0) {
+                if (guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                    log_guest_qemud_startup_diagnostics(state, "signaled", WTERMSIG(status));
                 guest_qemud_exit_count++;
                 guest_qemud_last_exit_code = -WTERMSIG(status);
-                printf("GUEST EMULATOR SERVICE EXIT: guest-pid=%d service=qemud signal=%d\n",
-                       state->guest_pid, WTERMSIG(status));
+                if (guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                    printf("GUEST EMULATOR SERVICE EXIT: guest-pid=%d service=qemud signal=%d\n",
+                           state->guest_pid, WTERMSIG(status));
             } else if (strcmp(state->exec_target, "/system/bin/qemu-props") == 0) {
                 printf("GUEST EMULATOR SERVICE EXIT: guest-pid=%d service=qemu-props signal=%d\n",
                        state->guest_pid, WTERMSIG(status));
@@ -5531,9 +5582,26 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             state->target_elf_text_pc = 0;
             state->target_elf_text_file_offset = 0;
             if (strcmp(state->exec_target, "/system/bin/qemud") == 0) {
+                guest_qemud_diag_state_init(&state->qemud_diag);
+                char profile_qemu[16] = "";
+                char profile_qemud[GUEST_QEMUD_DIAG_PORT_CAP] = "";
+                int profile_qemu_present = guest_qemud_diag_token_value(
+                    GUEST_PROFILE_PROC_CMDLINE, "qemu", profile_qemu,
+                    sizeof(profile_qemu));
+                int profile_qemud_present = guest_qemud_diag_token_value(
+                    GUEST_PROFILE_PROC_CMDLINE, "android.qemud", profile_qemud,
+                    sizeof(profile_qemud));
+                if (guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                    printf("GUEST QEMUD TRANSPORT PROFILE: guest-pid=%d seeded-proc-cmdline=1 qemu-token=%s android.qemud-token=%s expected-port=ttyS1 hardware=%s; API10 source documents the selector and paired binary contains /proc/cmdline, android.qemud= and serial-path format strings; profile audit only, runtime branch/open not observed\n",
+                       state->guest_pid,
+                       profile_qemu_present && strcmp(profile_qemu, "1") == 0
+                           ? "qemu=1" : "missing-or-not-1",
+                       profile_qemud_present ? profile_qemud : "missing",
+                       GUEST_PROFILE_HARDWARE);
                 guest_qemud_exec_count++;
-                printf("GUEST EMULATOR SERVICE EXEC: guest-pid=%d service=qemud target=%s linker-entry follows; Goldfish qemu_pipe backend remains explicitly unsupported\n",
-                       state->guest_pid, state->exec_target);
+                if (guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                    printf("GUEST EMULATOR SERVICE EXEC: guest-pid=%d service=qemud target=%s linker-entry follows; Goldfish qemu_pipe backend remains explicitly unsupported\n",
+                           state->guest_pid, state->exec_target);
             } else if (strcmp(state->exec_target, "/system/bin/qemu-props") == 0) {
                 guest_qemu_props_exec_count++;
                 printf("GUEST EMULATOR SERVICE EXEC: guest-pid=%d service=qemu-props target=%s linker-entry follows; boot-properties require the external emulator pipe protocol, not host substitution\n",
@@ -5610,6 +5678,19 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     stops++;
                     continue;
                 }
+                if (strcmp(state->exec_target, "/system/bin/qemud") == 0) {
+                    const char *fd_path = guest_qemud_diag_fd_path(
+                        &state->qemud_diag, (int32_t)state->last_syscall_args[0]);
+                    guest_qemud_diag_begin(&state->qemud_diag,
+                        state->last_syscall, state->last_syscall_args,
+                        regs.uregs[15], state->last_guest_path, fd_path);
+                    if ((state->last_syscall == 1 || state->last_syscall == 248) &&
+                        guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                        printf("GUEST QEMUD EXIT REQUEST: guest-pid=%d syscall=%d(%s) requested-status=%u pc=0x%08x; wait status will verify actual exit\n",
+                               state->guest_pid, state->last_syscall,
+                               guest_diag_syscall_name(state->last_syscall),
+                               state->last_syscall_args[0], regs.uregs[15]);
+                }
                 if (fake) {
                     if (fake_entry(waited, &regs, result, &state->pending_return) != 0) { fprintf(stderr, "could not cancel syscall %d pid=%d: errno=%d\n", state->last_syscall, waited, errno); kill_all_tracees(); return -1; }
                     state->pending = 1;
@@ -5641,6 +5722,68 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 uint32_t syscall_result_bits = state->pending
                     ? (uint32_t)state->pending_return : (uint32_t)regs.uregs[0];
                 int32_t syscall_result = (int32_t)syscall_result_bits;
+                if (strcmp(state->exec_target, "/system/bin/qemud") == 0) {
+                    struct guest_qemud_diag_state *diag = &state->qemud_diag;
+                    if (state->last_syscall == ARM_NR_OPEN ||
+                        state->last_syscall == ARM_NR_OPENAT)
+                        guest_qemud_diag_note_open(diag, state->last_guest_path,
+                                                   syscall_result);
+                    if (state->last_syscall == ARM_NR_READ &&
+                        strcmp(diag->pending_fd_path, "/proc/cmdline") == 0 &&
+                        syscall_result > 0) {
+                        unsigned char cmdline_bytes[GUEST_QEMUD_DIAG_CMDLINE_CAP - 1u];
+                        size_t amount = (size_t)syscall_result;
+                        if (amount > state->last_syscall_args[2])
+                            amount = state->last_syscall_args[2];
+                        if (amount > sizeof(cmdline_bytes)) amount = sizeof(cmdline_bytes);
+                        if (amount && read_remote(waited,
+                                state->last_syscall_args[1], cmdline_bytes,
+                                amount) == 0) {
+                            guest_qemud_diag_note_cmdline_read(diag,
+                                cmdline_bytes, amount);
+                            if (guest_qemud_diag_claim_cmdline_observation(diag) &&
+                                guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                                printf("GUEST QEMUD CMDLINE READ: guest-pid=%d fd=%u result=%d observed-bytes=%zu qemu-1=%d android.qemud-present=%d port=%s; raw command line omitted\n",
+                                       state->guest_pid, state->last_syscall_args[0],
+                                       syscall_result, amount,
+                                       diag->cmdline_qemu_enabled,
+                                       diag->cmdline_qemud_parameter_present,
+                                       guest_qemud_diag_safe_port_label(diag));
+                        } else {
+                            if (guest_qemud_diag_claim_cmdline_observation(diag) &&
+                                guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                                printf("GUEST QEMUD CMDLINE READ: guest-pid=%d fd=%u result=%d observed-bytes=unavailable ptrace-read-failed=1; raw command line omitted\n",
+                                       state->guest_pid, state->last_syscall_args[0],
+                                       syscall_result);
+                        }
+                    }
+                    struct guest_qemud_diag_record qemud_record;
+                    int qemud_record_result = guest_qemud_diag_finish(diag,
+                        syscall_result, &qemud_record);
+                    if (qemud_record_result > 0 &&
+                        guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                        log_guest_qemud_syscall(waited, state, &qemud_record);
+                    if (qemud_record_result == -1 && diag->records_suppressed == 1u &&
+                        guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+                        printf("GUEST QEMUD DIAGNOSTIC LIMIT: guest-pid=%d record-cap=%u; further records counted but suppressed\n",
+                               state->guest_pid, GUEST_QEMUD_DIAG_MAX_RECORDS);
+                    if (state->last_syscall == ARM_NR_CLOSE && syscall_result == 0)
+                        guest_qemud_diag_untrack_fd(diag,
+                            (int32_t)state->last_syscall_args[0]);
+                    if (state->last_syscall == 41 && syscall_result >= 0)
+                        guest_qemud_diag_dup_fd(diag,
+                            (int32_t)state->last_syscall_args[0], syscall_result);
+                    if (state->last_syscall == ARM_NR_DUP2 && syscall_result >= 0)
+                        guest_qemud_diag_dup_fd(diag,
+                            (int32_t)state->last_syscall_args[0],
+                            (int32_t)state->last_syscall_args[1]);
+                    if ((state->last_syscall == ARM_NR_FCNTL ||
+                         state->last_syscall == ARM_NR_FCNTL64) && syscall_result >= 0 &&
+                        (state->last_syscall_args[1] == 0u ||
+                         state->last_syscall_args[1] == 1030u))
+                        guest_qemud_diag_dup_fd(diag,
+                            (int32_t)state->last_syscall_args[0], syscall_result);
+                }
                 if (complete_guest_sigaction(waited, state, &regs, &syscall_result) != 0) {
                     fprintf(stderr, "cannot complete guest legacy sigaction translation pid=%d; terminating traced tree\n",
                             waited);
@@ -6311,6 +6454,12 @@ int main(int argc, char **argv) {
     else if (exit_code >= 0) printf("STOP: root /init exited with code %d\n", exit_code);
     else if (dynamic_exec_blocked) printf("STOP: unsupported dynamic guest exec; process tree stopped fail-closed\n");
     else printf("STOP: supervisor error\n");
+    if (guest_qemud_exec_count)
+        printf("GUEST QEMUD DIAGNOSTIC RUN BUDGET: emitted=%u suppressed=%u maximum=%u per-process-record-cap=%u; suppressed details are counted, not replayed\n",
+               guest_qemud_diag_run_budget.emitted,
+               guest_qemud_diag_run_budget.suppressed,
+               GUEST_QEMUD_DIAG_RUN_MAX_LINES,
+               GUEST_QEMUD_DIAG_MAX_RECORDS);
     printf("HOST PRIVILEGED MOUNTS: 0 (host mount/umount were never invoked)\n");
     if (guest_frame_directory_fd >= 0) {
         if (close(guest_frame_directory_fd) != 0)

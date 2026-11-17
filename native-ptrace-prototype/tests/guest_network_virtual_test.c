@@ -21,6 +21,8 @@ static void test_profile_socket_and_abi(void) {
     assert(sizeof(struct guest_arm32_rtentry) == 84u);
     assert(offsetof(struct guest_arm32_rtentry, device_pointer) == 68u);
     assert(strstr(GUEST_PROFILE_PROC_CMDLINE, "androidboot.hardware=goldfish") != NULL);
+    assert(strstr(GUEST_PROFILE_PROC_CMDLINE, "qemu=1") != NULL);
+    assert(strstr(GUEST_PROFILE_PROC_CMDLINE, "android.qemud=ttyS1") != NULL);
     assert(strstr(GUEST_PROFILE_PROC_CPUINFO, "Hardware : goldfish") != NULL);
     assert(strstr(GUEST_PROFILE_PROC_MEMINFO, "MemTotal:       262144 kB") != NULL);
     assert(GUEST_PROFILE_CPU_COUNT == 1u);

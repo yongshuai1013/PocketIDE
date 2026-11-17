@@ -20,7 +20,7 @@
 #define GUEST_PROFILE_DISPLAY_DENSITY_DPI 240u
 
 #define GUEST_PROFILE_PROC_CMDLINE \
-    "androidboot.hardware=" GUEST_PROFILE_HARDWARE "\n"
+    "qemu=1 android.qemud=ttyS1 androidboot.hardware=" GUEST_PROFILE_HARDWARE "\n"
 #define GUEST_PROFILE_PROC_CPUINFO \
     "processor : 0\n" \
     "Processor : ARMv7 Processor rev 0 (v7l)\n" \
