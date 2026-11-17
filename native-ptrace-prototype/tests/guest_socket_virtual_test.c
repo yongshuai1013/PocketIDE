@@ -101,6 +101,17 @@ int main(void) {
                                      GUEST_VSOCKET_SOCK_STREAM, 0, pair) == 0);
     int status_flags = 0, descriptor_flags = 0;
     assert(guest_vsocket_fcntl(&table, pair[0], GUEST_VSOCKET_F_SETFD,
+                               GUEST_VSOCKET_FD_CLOEXEC | GUEST_VSOCKET_O_NONBLOCK,
+                               &status_flags,
+                               &descriptor_flags) == 0);
+    assert(guest_vsocket_fcntl(&table, pair[0], GUEST_VSOCKET_F_GETFD, 0,
+                               &status_flags, &descriptor_flags) == GUEST_VSOCKET_FD_CLOEXEC);
+    assert(guest_vsocket_fcntl(&table, pair[0], GUEST_VSOCKET_F_SETFD,
+                               GUEST_VSOCKET_O_NONBLOCK, &status_flags,
+                               &descriptor_flags) == 0);
+    assert(guest_vsocket_fcntl(&table, pair[0], GUEST_VSOCKET_F_GETFD, 0,
+                               &status_flags, &descriptor_flags) == 0);
+    assert(guest_vsocket_fcntl(&table, pair[0], GUEST_VSOCKET_F_SETFD,
                                GUEST_VSOCKET_FD_CLOEXEC, &status_flags,
                                &descriptor_flags) == 0);
     assert(guest_vsocket_fcntl(&table, pair[0], GUEST_VSOCKET_F_GETFD, 0,

@@ -565,8 +565,8 @@ static inline int guest_vsocket_fcntl(struct guest_vsocket_table *table, int fd,
     if (!status_flags || !descriptor_flags) return -EINVAL;
     if (command == GUEST_VSOCKET_F_GETFD) return *descriptor_flags;
     if (command == GUEST_VSOCKET_F_SETFD) {
-        if ((argument & ~GUEST_VSOCKET_FD_CLOEXEC) != 0) return -EINVAL;
-        *descriptor_flags = argument;
+        /* Linux 2.6.29 masks F_SETFD to FD_CLOEXEC and returns success. */
+        *descriptor_flags = argument & GUEST_VSOCKET_FD_CLOEXEC;
         return 0;
     }
     if (command == GUEST_VSOCKET_F_GETFL) {

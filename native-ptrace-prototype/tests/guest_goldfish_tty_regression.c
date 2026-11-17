@@ -134,6 +134,19 @@ static void test_event_mknod_open_termios_epoll_lifecycle(const char *base) {
     tty_entry->device_minor = 1u;
     tty_entry->open_flags = qemud_flags;
     assert(guest_goldfish_tty_note_open(&runtime, 1u, tty_fd) == 0);
+    int tty_status_flags = 0, tty_descriptor_flags = 0;
+    assert(guest_vsocket_fcntl(&sockets, tty_fd, GUEST_VSOCKET_F_GETFD, 0,
+        &tty_status_flags, &tty_descriptor_flags) == 0);
+    assert(guest_vsocket_fcntl(&sockets, tty_fd, GUEST_VSOCKET_F_SETFD,
+        GUEST_VSOCKET_O_NONBLOCK, &tty_status_flags,
+        &tty_descriptor_flags) == 0);
+    assert(guest_vsocket_fcntl(&sockets, tty_fd, GUEST_VSOCKET_F_GETFD, 0,
+        &tty_status_flags, &tty_descriptor_flags) == 0);
+    assert(guest_vsocket_fcntl(&sockets, tty_fd, GUEST_VSOCKET_F_SETFD,
+        GUEST_VSOCKET_O_NONBLOCK | GUEST_VSOCKET_FD_CLOEXEC,
+        &tty_status_flags, &tty_descriptor_flags) == 0);
+    assert(guest_vsocket_fcntl(&sockets, tty_fd, GUEST_VSOCKET_F_GETFD, 0,
+        &tty_status_flags, &tty_descriptor_flags) == GUEST_VSOCKET_FD_CLOEXEC);
     assert(guest_goldfish_tty_open_validate(&runtime, 1, "/dev/ttyS1",
         qemud_flags, &minor) == -EBUSY);
 
