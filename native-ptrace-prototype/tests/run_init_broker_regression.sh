@@ -388,10 +388,22 @@ assert 'guest_qemud_exec_count' in src and 'guest_qemu_props_exec_count' in src
 assert '#include "guest_qemud_diagnostics.h"' in src
 assert 'GUEST QEMUD TRANSPORT PROFILE:' in src
 assert 'GUEST QEMUD SYSCALL:' in src and 'GUEST QEMUD STARTUP DIAGNOSTICS:' in src
+assert 'GUEST QEMUD STDERR PREVIEW (escaped guest bytes):' in src
+assert 'guest_qemud_diag_claim_stderr_preview' in src
+assert 'guest_qemud_diag_escape_bytes' in src and 'read_remote(waited' in src
+assert 'guest_qemud_diag_guest_range_valid' in src and 'if (read_ok)' in src
+assert 'no guest bytes logged' in src
+assert 'strcmp(state->exec_target, "/system/bin/qemud") == 0' in src
+assert 'regs.uregs[14]' in src and 'exit_request_lr' in qemud_diagnostics
 assert 'guest_qemud_diag_begin' in src and 'guest_qemud_diag_finish' in src
 assert 'guest_qemud_diag_note_cmdline_read' in src and 'guest_qemud_diag_note_open' in src
 assert 'GUEST_QEMUD_DIAG_MAX_RECORDS 96u' in qemud_diagnostics
 assert 'GUEST_QEMUD_DIAG_RUN_MAX_LINES 256u' in qemud_diagnostics
+assert 'GUEST_QEMUD_DIAG_STDERR_MAX_CHUNKS 4u' in qemud_diagnostics
+assert 'GUEST_QEMUD_DIAG_STDERR_MAX_BYTES 96u' in qemud_diagnostics
+assert 'guest_qemud_diag_is_selected_tty_path' in qemud_diagnostics
+assert 'address_space_end - (uint64_t)address' in qemud_diagnostics
+assert 'record->lr = state->pending_lr;' in qemud_diagnostics
 assert 'result < 0' in qemud_diagnostics and 'records_suppressed++' in qemud_diagnostics
 assert 'guest_qemud_diag_fd_path' in qemud_diagnostics
 assert 'guest_qemud_diag_token_value' in qemud_diagnostics
@@ -408,6 +420,9 @@ assert 'case 221: /* fcntl64 */' in qemud_diagnostics
 assert 'test_source_backed_profile_tokens' in qemud_test
 assert 'test_selected_calls_and_failed_unselected_calls' in qemud_test
 assert 'test_cmdline_fd_and_parameter_observation' in qemud_test
+assert 'test_failure_armed_stderr_preview_is_bounded_and_escaped' in qemud_test
+assert 'guest_qemud_diag_guest_range_valid(UINT32_MAX, 1u)' in qemud_test
+assert 'guest_qemud_diag_is_selected_tty_path(&state, "/dev/ttyS2")' in qemud_test
 assert 'test_record_budget_is_hard_bounded' in qemud_test
 assert 'guest_qemud_diag_run_budget_take' in qemud_test
 assert 'guest_qemud_diag_safe_port_label' in qemud_test
@@ -940,16 +955,16 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.28-test-signed-apk' in upload
-assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.28-apk.sha256"' in workflow
-assert '${{ runner.temp }}/gingervm-v0.6.28-apk.sha256' in upload
+assert 'gingervm-continuous-trace-v0.6.29-test-signed-apk' in upload
+assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.29-apk.sha256"' in workflow
+assert '${{ runner.temp }}/gingervm-v0.6.29-apk.sha256' in upload
 assert '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 37" in gradle and "versionName '0.6.28'" in gradle
+assert "versionCode 38" in gradle and "versionName '0.6.29'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.28' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.29' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

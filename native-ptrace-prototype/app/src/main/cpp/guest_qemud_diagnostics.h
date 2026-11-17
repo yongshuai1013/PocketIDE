@@ -11,6 +11,9 @@
 #define GUEST_QEMUD_DIAG_PATH_CAP 128u
 #define GUEST_QEMUD_DIAG_CMDLINE_CAP 512u
 #define GUEST_QEMUD_DIAG_PORT_CAP 32u
+#define GUEST_QEMUD_DIAG_STDERR_MAX_CHUNKS 4u
+#define GUEST_QEMUD_DIAG_STDERR_MAX_BYTES 96u
+#define GUEST_QEMUD_DIAG_STDERR_ESCAPED_CAP (GUEST_QEMUD_DIAG_STDERR_MAX_BYTES * 4u + 1u)
 
 struct guest_qemud_diag_fd {
     int used;
@@ -22,6 +25,7 @@ struct guest_qemud_diag_record {
     uint32_t sequence;
     int syscall_number;
     uint32_t pc;
+    uint32_t lr;
     uint32_t args[6];
     int32_t result;
     char path[GUEST_QEMUD_DIAG_PATH_CAP];
@@ -37,6 +41,7 @@ struct guest_qemud_diag_state {
     uint32_t pending_sequence;
     int pending_syscall_number;
     uint32_t pending_pc;
+    uint32_t pending_lr;
     uint32_t pending_args[6];
     char pending_path[GUEST_QEMUD_DIAG_PATH_CAP];
     char pending_fd_path[GUEST_QEMUD_DIAG_PATH_CAP];
@@ -58,6 +63,9 @@ struct guest_qemud_diag_state {
     int exit_request_syscall;
     uint32_t exit_request_status;
     uint32_t exit_request_pc;
+    uint32_t exit_request_lr;
+    int stderr_capture_armed;
+    uint32_t stderr_preview_chunks;
 };
 
 struct guest_qemud_diag_run_budget {
@@ -136,7 +144,7 @@ static inline void guest_qemud_diag_copy(char *output, size_t capacity,
 }
 
 static inline void guest_qemud_diag_begin(struct guest_qemud_diag_state *state,
-        int syscall_number, const uint32_t args[6], uint32_t pc,
+        int syscall_number, const uint32_t args[6], uint32_t pc, uint32_t lr,
         const char *path, const char *fd_path) {
     if (!state) return;
     if (state->syscall_count < UINT32_MAX) state->syscall_count++;
@@ -145,6 +153,7 @@ static inline void guest_qemud_diag_begin(struct guest_qemud_diag_state *state,
     state->pending_sequence = state->syscall_count;
     state->pending_syscall_number = syscall_number;
     state->pending_pc = pc;
+    state->pending_lr = lr;
     if (args) memcpy(state->pending_args, args, sizeof(state->pending_args));
     else memset(state->pending_args, 0, sizeof(state->pending_args));
     guest_qemud_diag_copy(state->pending_path, sizeof(state->pending_path), path);
@@ -154,6 +163,7 @@ static inline void guest_qemud_diag_begin(struct guest_qemud_diag_state *state,
         state->exit_request_syscall = syscall_number;
         state->exit_request_status = state->pending_args[0];
         state->exit_request_pc = pc;
+        state->exit_request_lr = lr;
     }
 }
 
@@ -164,6 +174,8 @@ static inline void guest_qemud_diag_begin(struct guest_qemud_diag_state *state,
 static inline int guest_qemud_diag_finish(struct guest_qemud_diag_state *state,
         int32_t result, struct guest_qemud_diag_record *record) {
     if (!state || !state->pending) return 0;
+    if (state->pending_syscall_number == 250 && result < 0)
+        state->stderr_capture_armed = 1;
     int retain = state->pending_selected || result < 0;
     if (!retain) {
         state->pending = 0;
@@ -179,6 +191,7 @@ static inline int guest_qemud_diag_finish(struct guest_qemud_diag_state *state,
         record->sequence = state->pending_sequence;
         record->syscall_number = state->pending_syscall_number;
         record->pc = state->pending_pc;
+        record->lr = state->pending_lr;
         memcpy(record->args, state->pending_args, sizeof(record->args));
         record->result = result;
         guest_qemud_diag_copy(record->path, sizeof(record->path), state->pending_path);
@@ -188,6 +201,80 @@ static inline int guest_qemud_diag_finish(struct guest_qemud_diag_state *state,
     state->records_emitted++;
     state->pending = 0;
     return 1;
+}
+
+static inline int guest_qemud_diag_claim_stderr_preview(
+        struct guest_qemud_diag_state *state, int fd, int32_t result,
+        uint32_t requested, size_t *capture_length) {
+    /* The fixed cap counts attempts, including a failed ptrace read, so a
+     * damaged guest pointer cannot cause unbounded repeated diagnostics. */
+    if (capture_length) *capture_length = 0;
+    if (!state || !capture_length || !state->stderr_capture_armed ||
+        fd != 2 || result <= 0 || requested == 0 ||
+        state->stderr_preview_chunks >= GUEST_QEMUD_DIAG_STDERR_MAX_CHUNKS)
+        return 0;
+    size_t amount = (size_t)result;
+    if (amount > requested) amount = requested;
+    if (amount > GUEST_QEMUD_DIAG_STDERR_MAX_BYTES)
+        amount = GUEST_QEMUD_DIAG_STDERR_MAX_BYTES;
+    if (amount == 0) return 0;
+    state->stderr_preview_chunks++;
+    *capture_length = amount;
+    return 1;
+}
+
+static inline int guest_qemud_diag_guest_range_valid(uint32_t address,
+        size_t length) {
+    const uint64_t address_space_end = (uint64_t)UINT32_MAX + 1u;
+    return (uint64_t)length <= address_space_end - (uint64_t)address;
+}
+
+/* Escapes an explicit byte span, including embedded NULs, before it is placed
+ * inside a line-oriented log. The output never contains raw control/high bytes. */
+static inline int guest_qemud_diag_escape_bytes(const unsigned char *input,
+        size_t input_length, char *output, size_t capacity) {
+    static const char hex[] = "0123456789abcdef";
+    size_t used = 0;
+    int truncated = 0;
+    if (!output || capacity == 0) return 1;
+    output[0] = '\0';
+    if (!input && input_length) return 1;
+    for (size_t i = 0; i < input_length; ++i) {
+        unsigned char c = input[i];
+        char piece[4];
+        size_t length;
+        if (c >= 0x20 && c <= 0x7e && c != '\\' && c != '"') {
+            piece[0] = (char)c;
+            length = 1;
+        } else if (c == '\\' || c == '"') {
+            piece[0] = '\\';
+            piece[1] = (char)c;
+            length = 2;
+        } else {
+            piece[0] = '\\';
+            piece[1] = 'x';
+            piece[2] = hex[c >> 4];
+            piece[3] = hex[c & 0x0f];
+            length = 4;
+        }
+        if (length > capacity - 1u - used) {
+            truncated = 1;
+            break;
+        }
+        memcpy(output + used, piece, length);
+        used += length;
+    }
+    if (truncated) {
+        if (capacity >= 4u) {
+            if (used > capacity - 4u) used = capacity - 4u;
+            memcpy(output + used, "...", 3u);
+            used += 3u;
+        } else {
+            used = 0;
+        }
+    }
+    output[used] = '\0';
+    return truncated;
 }
 
 static inline void guest_qemud_diag_track_fd(struct guest_qemud_diag_state *state,
@@ -281,6 +368,13 @@ static inline int guest_qemud_diag_is_tty_s_path(const char *path) {
     return *suffix == '\0';
 }
 
+static inline int guest_qemud_diag_is_selected_tty_path(
+        const struct guest_qemud_diag_state *state, const char *path) {
+    return state && state->cmdline_qemud_parameter_present &&
+        strcmp(state->cmdline_qemud_port, "ttyS1") == 0 && path &&
+        strcmp(path, "/dev/ttyS1") == 0;
+}
+
 static inline void guest_qemud_diag_note_open(struct guest_qemud_diag_state *state,
         const char *path, int result) {
     if (!state || !path || !path[0]) return;
@@ -295,6 +389,8 @@ static inline void guest_qemud_diag_note_open(struct guest_qemud_diag_state *sta
         state->tty_open_attempts++;
         state->tty_open_result = result;
         guest_qemud_diag_copy(state->tty_open_path, sizeof(state->tty_open_path), path);
+        if (result < 0 && guest_qemud_diag_is_selected_tty_path(state, path))
+            state->stderr_capture_armed = 1;
         if (result >= 0) guest_qemud_diag_track_fd(state, result, path);
     } else if (result >= 0 && strncmp(path, "/dev/log/", 9u) == 0) {
         guest_qemud_diag_track_fd(state, result, path);
