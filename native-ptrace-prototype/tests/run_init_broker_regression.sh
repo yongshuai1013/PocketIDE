@@ -189,9 +189,14 @@ guest_image = repo_root / 'guest-image/google-api10-android-2.3.7'
 aosp_source_root = Path(os.environ.get('GINGERVM_AOSP_SOURCE_ROOT', repo_root.parent / 'build/aosp'))
 api10_init_path = aosp_source_root / 'system-core/init/init.c'
 api10_util_path = aosp_source_root / 'system-core/init/util.c'
-api10_source_available = api10_init_path.is_file() and api10_util_path.is_file()
+api10_ueventd_path = aosp_source_root / 'system-core/init/ueventd.c'
+api10_devices_path = aosp_source_root / 'system-core/init/devices.c'
+api10_source_available = all(path.is_file() for path in
+    (api10_init_path, api10_util_path, api10_ueventd_path, api10_devices_path))
 api10_init_source = api10_init_path.read_text() if api10_source_available else ''
 api10_util_source = api10_util_path.read_text() if api10_source_available else ''
+api10_ueventd_source = api10_ueventd_path.read_text() if api10_source_available else ''
+api10_devices_source = api10_devices_path.read_text() if api10_source_available else ''
 system_build_prop = (guest_image / 'system-tree/build.prop').read_text()
 ramdisk_default_prop = (guest_image / 'ramdisk-root/default.prop').read_text()
 goldfish_rc = (guest_image / 'ramdisk-root/init.goldfish.rc').read_text()
@@ -227,7 +232,11 @@ assert 'GUEST VFS SYMLINK:' in src and 'guest_symlink_create_app_private' in src
 assert 'VIRTUAL SYMLINK OPS:' in src and 'rewrite_symlink' not in src
 assert 'path_is_within(link_host, guest_root)' in src
 assert 'path_is_within(target_host, native_guest_root)' in src
-assert 'strcmp(active_tracee->exec_target, "/sbin/ueventd") == 0' in src
+assert 'guest_null_stdio_actor_for_tracee(active_tracee) ==' in src
+assert 'GUEST_NULL_STDIO_ACTOR_UEVENTD' in src
+assert 'GUEST UEVENTD EXEC IMAGE VALIDATED:' in src
+assert 'GUEST UEVENTD NULL STDIO READY:' in src
+assert 'guest_parent_pid == 1' in null_stdio
 assert 'VIRTUAL UEVENT SOCKET:' in src and 'GUEST SOCKET ARGS:' in src
 assert 'VIRTUAL UEVENT BIND:' in src and 'VIRTUAL UEVENT SETSOCKOPT:' in src
 assert 'host socket API not called' in src and 'host bind API not called' in src
@@ -434,6 +443,8 @@ assert 'GUEST COLD-BOOT MARKER OPEN:' in src
 assert 'GUEST UEVENTD COLD-BOOT MARKER PRECHECK:' in src
 assert 'GUEST COLD-BOOT PID1 STAT:' in src
 assert 'INIT COLD-BOOT WAIT CONDITION OBSERVED:' in src
+assert 'INIT COLD-BOOT WAIT RELEASED:' in src
+assert 'function return is source-inferred rather than directly traced' in src
 assert 'ARM_NR_FSTATAT64' in src and 'pid1_stat_succeeded_after_marker' in src
 assert 'guest_uevent_note_marker_open' not in src
 assert 'GUEST COLD-BOOT MARKER FILE SUMMARY:' in src
@@ -577,6 +588,14 @@ for marker in ('GUEST NULL DEVICE MKNOD:', 'GUEST NULL DEVICE OPEN:',
                'GUEST NULL DEVICE UNLINK:', 'GUEST NULL STDIO DUP2:',
                'GUEST NULL STDIO IO:', 'GUEST NULL STDIO SUMMARY:'):
     assert marker in src, marker
+assert 'GUEST UEVENTD EXEC IMAGE VALIDATED:' in src
+assert 'GUEST UEVENTD NULL STDIO READY:' in src
+assert 'GUEST UEVENTD NULL STDIO SUMMARY:' in src
+assert 'INIT COLD-BOOT WAIT RELEASED:' in src
+assert 'guest_null_stdio_actor_for_identity' in src
+assert 'exec_image_committed' in src and 'backing_path_approved' in src
+assert 'guest_parent_pid == 1' in null_stdio and '"/sbin/ueventd"' in null_stdio
+assert 'guest_ueventd_null_stdio_note_step' in src
 assert 'guest_null_stdio_virtual_fd_valid' in src and 'child_state->null_stdio_mask = state->null_stdio_mask' in src
 assert 'set_guest_null_stdio_mask_for_group' in src and 'guest_null_stdio_source_fd_closed' in src
 assert 'guest_null_stdio_runtime_init(&guest_null_stdio_runtime)' in src
@@ -589,10 +608,11 @@ assert 'guest_null_stdio_io' in null_stdio and 'guest_null_stdio_close' in null_
 null_stdio_code = re.sub(r'/\*.*?\*/|//[^\n]*', '', null_stdio, flags=re.S)
 assert not re.search(r'(?<![A-Za-z0-9_])(mknod|open|unlink)\s*\(', null_stdio_code)
 assert 'test_exact_init_sequence' in null_stdio_test and 'test_open_failure_still_unlinks' in null_stdio_test
-assert 'test_mknod_open_unlink_and_dup_fail_closed' in null_stdio_test
+assert 'test_ueventd_identity_and_stdio_sequence' in null_stdio_test
+assert 'backing_path_approved = 0' in null_stdio_test and 'guest_parent_pid = 9' in null_stdio_test
 assert '"/dev/__kmsg__"' in null_stdio_test and '"/dev/__null__/../null"' in null_stdio_test
-assert 'guest null-device init stdio state-machine regression: PASS' in null_stdio_test
-assert 'original guest binaries are not executed' in null_stdio_test
+assert 'guest null-device init/ueventd stdio state-machine regression: PASS' in null_stdio_test
+assert 'guest binaries are not executed' in null_stdio_test
 assert path_syscall_source.index('strcmp(guest, GUEST_NULL_STDIO_PATH) == 0') < path_syscall_source.index('rewrite_path_arg(pid, regs, arg, guest')
 assert 'decoded exact-path broker requests, not all syscalls' in src
 assert '#include "guest_kmsg_virtual.h"' in src
@@ -624,9 +644,11 @@ assert 'track->expected_file_size' in src and 'ARM_NR_LSEEK' in src
 assert 'track->size_known' in src and 'track->start_seek_succeeded' in src
 assert 'parser/action execution is not inferred from this syscall' in src
 assert 'guest_init_config_read' in src and 'observe_guest_init_config_io(state, syscall_result)' in src
-assert 'test_continuous_post_stdio_path' in kmsg_test
+assert 'test_continuous_init_to_ueventd_coldboot_model' in kmsg_test
 assert 'start ueventd' in kmsg_test
 assert 'service goldfish-setup /system/etc/init.goldfish.sh' in kmsg_test
+assert 'guest_uevent_socket_args_valid' in kmsg_test and 'guest_uevent_bind_args_valid' in kmsg_test
+assert 'GUEST_COLD_BOOT_MARKER_PATH' in kmsg_test and 'marker_stat_pair_observed' in kmsg_test
 if api10_source_available:
     api10_null_stdio = api10_util_source.split('void open_devnull_stdio(void)', 1)[1].split('\n}', 1)[0]
     for operation in ('mknod(name, S_IFCHR | 0600, (1 << 8) | 3)',
@@ -639,6 +661,10 @@ if api10_source_available:
                       'fcntl(log_fd, F_SETFD, FD_CLOEXEC)', 'unlink(name)'):
         assert operation in api10_log_init, operation
     assert 'exit(' not in api10_log_init
+    api10_ueventd_main = api10_ueventd_source.split('int ueventd_main(', 1)[1].split('\n}', 1)[0]
+    assert api10_ueventd_main.index('open_devnull_stdio();') < api10_ueventd_main.index('log_init();') < api10_ueventd_main.index('device_init();')
+    api10_device_init = api10_devices_source.split('void device_init(void)', 1)[1].split('\n}', 1)[0]
+    assert api10_device_init.index('open_uevent_socket()') < api10_device_init.index('coldboot("/sys/class")') < api10_device_init.index('open(coldboot_done, O_WRONLY|O_CREAT, 0000)') < api10_device_init.index('close(fd)')
     api10_main = api10_init_source.split('int main(', 1)[1]
     assert api10_main.index('open_devnull_stdio();') < api10_main.index('log_init();') < api10_main.index('init_parse_config_file("/init.rc")')
     assert api10_main.index('init_parse_config_file("/init.rc")') < api10_main.index('import_kernel_cmdline(0)') < api10_main.index('get_hardware_name(hardware, &revision)') < api10_main.index('init_parse_config_file(tmp)') < api10_main.index('action_for_each_trigger("early-init", action_add_queue_tail)')
@@ -646,9 +672,9 @@ if api10_source_available:
     assert 'lseek(fd, 0, SEEK_END)' in api10_read_file
     assert 'lseek(fd, 0, SEEK_SET)' in api10_read_file
     assert 'read(fd, data, sz) != sz' in api10_read_file and 'close(fd)' in api10_read_file
-    print('API10 AOSP init/util source contract: PASS')
+    print('API10 AOSP init/ueventd/devices/util source contract: PASS')
 else:
-    print('API10 AOSP init/util source contract: SKIP (source tree absent from this checkout; the local source-backed build runs these assertions when present)')
+    print('API10 AOSP init/ueventd/devices/util source contract: SKIP (source tree absent from this checkout; the local source-backed build runs these assertions when present)')
 assert 'GUEST NULL STDIO SUMMARY:' in src
 assert 'GUEST HARDWARE PROFILE:' in src and 'not host-phone data' in src
 assert 'packet I/O=unavailable, host network calls=0' in src
@@ -880,14 +906,16 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.26-test-signed-apk' in upload
-assert 'gingervm-v0.6.26-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 35" in gradle and "versionName '0.6.26'" in gradle
+assert 'gingervm-continuous-trace-v0.6.27-test-signed-apk' in upload
+assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.27-apk.sha256"' in workflow
+assert '${{ runner.temp }}/gingervm-v0.6.27-apk.sha256' in upload
+assert '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 36" in gradle and "versionName '0.6.27'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.26' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.27' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

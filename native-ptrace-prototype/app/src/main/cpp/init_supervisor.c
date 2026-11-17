@@ -278,6 +278,15 @@ struct guest_init_config_read_state {
     uint64_t bytes_read;
     char path[32];
 };
+struct guest_null_stdio_exec_progress {
+    int mknod_succeeded;
+    int open_succeeded;
+    int unlink_succeeded;
+    int source_fd;
+    uint8_t dup2_mask;
+    int source_closed;
+    int ready_logged;
+};
 struct tracee_state {
     pid_t pid;
     pid_t guest_pid;
@@ -289,6 +298,7 @@ struct tracee_state {
     uint64_t virtual_fd_mask;
     uint8_t virtual_fd_flags[MAX_VIRTUAL_FDS];
     uint8_t null_stdio_mask;
+    struct guest_null_stdio_exec_progress null_stdio_exec;
     struct guest_init_config_read_state init_config_read;
     uint32_t guest_ruid;
     uint32_t guest_euid;
@@ -337,6 +347,7 @@ struct tracee_state {
     uint32_t target_elf_text_pc;
     uint64_t target_elf_text_file_offset;
     int target_elf_entry_valid;
+    int exec_image_committed;
     int target_elf_entry_pc_seen;
     uint16_t target_elf_type;
     uint32_t target_elf_entry;
@@ -353,6 +364,7 @@ struct guest_coldboot_marker_runtime {
     uint32_t open_mode;
     int close_seen;
     int32_t close_result;
+    int wait_release_logged;
     unsigned long write_calls;
     unsigned long fsync_calls;
     unsigned long fdatasync_calls;
@@ -602,6 +614,9 @@ static unsigned long guest_target_elf_text_entry_count;
 static unsigned long guest_target_elf_declared_entry_pc_count;
 static unsigned long guest_app_process_declared_entry_pc_count;
 static unsigned long guest_ueventd_declared_entry_pc_count;
+static unsigned long guest_ueventd_exec_image_validated_count;
+static unsigned long guest_ueventd_null_stdio_ready_count;
+static unsigned long guest_null_stdio_alias_replaced_count;
 static unsigned long guest_other_declared_entry_pc_count;
 static unsigned long guest_shell_elf_text_entry_count;
 static unsigned long guest_app_process_elf_text_entry_count;
@@ -1923,16 +1938,94 @@ static int guest_null_stdio_virtual_fd_valid(const struct tracee_state *state,
            (entry->open_flags & GUEST_ARM32_O_ACCMODE) == GUEST_ARM32_O_RDWR;
 }
 
+static struct guest_null_stdio_identity guest_null_stdio_identity_for_tracee(
+        const struct tracee_state *state) {
+    struct guest_null_stdio_identity identity;
+    memset(&identity, 0, sizeof(identity));
+    if (!state) return identity;
+    identity.guest_pid = state->guest_pid;
+    identity.guest_parent_pid = state->guest_parent_pid;
+    identity.guest_euid = state->identity.euid;
+    identity.executable = state->exec_target;
+    identity.exec_image_committed = state->exec_image_committed &&
+        state->pending_exec_target[0] == '\0' &&
+        state->pending_exec_backing_path[0] == '\0';
+    identity.arm32_elf_valid = state->target_elf_entry_valid;
+    identity.backing_path_approved = state->exec_backing_path[0] != '\0' &&
+        ((guest_root[0] && path_is_within(state->exec_backing_path, guest_root)) ||
+         (native_guest_root[0] &&
+          path_is_within(state->exec_backing_path, native_guest_root)));
+    return identity;
+}
+
+static enum guest_null_stdio_actor guest_null_stdio_actor_for_tracee(
+        const struct tracee_state *state) {
+    struct guest_null_stdio_identity identity =
+        guest_null_stdio_identity_for_tracee(state);
+    return guest_null_stdio_actor_for_identity(&identity);
+}
+
+enum guest_ueventd_stdio_step {
+    GUEST_UEVENTD_STDIO_MKNOD,
+    GUEST_UEVENTD_STDIO_OPEN,
+    GUEST_UEVENTD_STDIO_UNLINK,
+    GUEST_UEVENTD_STDIO_DUP2,
+    GUEST_UEVENTD_STDIO_SOURCE_CLOSE
+};
+
+static void guest_ueventd_null_stdio_note_step(struct tracee_state *state,
+        enum guest_ueventd_stdio_step step, int value, int32_t result) {
+    if (!state || guest_null_stdio_actor_for_tracee(state) !=
+                      GUEST_NULL_STDIO_ACTOR_UEVENTD || result < 0)
+        return;
+    struct guest_null_stdio_exec_progress *progress = &state->null_stdio_exec;
+    switch (step) {
+        case GUEST_UEVENTD_STDIO_MKNOD:
+            if (result == 0) progress->mknod_succeeded = 1;
+            break;
+        case GUEST_UEVENTD_STDIO_OPEN:
+            progress->open_succeeded = 1;
+            progress->source_fd = value;
+            break;
+        case GUEST_UEVENTD_STDIO_UNLINK:
+            if (result == 0) progress->unlink_succeeded = 1;
+            break;
+        case GUEST_UEVENTD_STDIO_DUP2:
+            if (value == progress->source_fd && result >= 0 && result <= 2)
+                progress->dup2_mask |= (uint8_t)(1u << (unsigned)result);
+            break;
+        case GUEST_UEVENTD_STDIO_SOURCE_CLOSE:
+            if (value == progress->source_fd && result == 0)
+                progress->source_closed = 1;
+            break;
+    }
+    if (!progress->ready_logged && progress->mknod_succeeded &&
+        progress->open_succeeded && progress->unlink_succeeded &&
+        progress->dup2_mask == GUEST_NULL_STDIO_FD_MASK &&
+        progress->source_closed) {
+        progress->ready_logged = 1;
+        guest_ueventd_null_stdio_ready_count++;
+        printf("GUEST UEVENTD NULL STDIO READY: guest-pid=%d parent-guest-pid=%d executable=%s backing=%s image=verified steps=mknod-1:3/0600,open-rw,unlink,dup2-0/1/2,close-source-fd; guest-only descriptor semantics, no host device\n",
+               state->guest_pid, state->guest_parent_pid, state->exec_target,
+               state->exec_backing_path);
+    }
+}
+
 static int is_guest_ueventd(pid_t pid) {
     return active_tracee && active_tracee->pid == pid &&
-           strcmp(active_tracee->exec_target, "/sbin/ueventd") == 0;
+           guest_null_stdio_actor_for_tracee(active_tracee) ==
+               GUEST_NULL_STDIO_ACTOR_UEVENTD;
 }
 
 static int virtual_uevent_socket(pid_t pid, const struct compat_pt_regs *regs) {
     uint32_t domain = regs->uregs[0], type = regs->uregs[1], protocol = regs->uregs[2];
-    printf("GUEST SOCKET ARGS: host-pid=%d guest-pid=%d target=%s syscall=%d domain=%u type=%u protocol=%u\n",
+    printf("GUEST SOCKET ARGS: host-pid=%d guest-pid=%d parent-guest-pid=%d target=%s backing=%s exec-image-validated=%d syscall=%d domain=%u type=%u protocol=%u\n",
            pid, active_tracee ? active_tracee->guest_pid : -1,
+           active_tracee ? active_tracee->guest_parent_pid : -1,
            active_tracee && active_tracee->exec_target[0] ? active_tracee->exec_target : "unknown",
+           active_tracee && active_tracee->exec_backing_path[0]
+               ? active_tracee->exec_backing_path : "<unknown>",
+           is_guest_ueventd(pid),
            ARM_NR_SOCKET, domain, type, protocol);
     if (!is_guest_ueventd(pid) || !guest_uevent_socket_args_valid(domain, type, protocol))
         return -EAFNOSUPPORT;
@@ -1964,8 +2057,10 @@ static int virtual_uevent_bind(pid_t pid, const struct compat_pt_regs *regs) {
     virtual_uevent_bound = 1;
     virtual_uevent_bind_count++;
     virtual_socket_calls++;
-    printf("VIRTUAL UEVENT BIND: fd=%d nl_family=%u nl_pid=%u guest-pid=%d nl_groups=0x%08x; host bind API not called\n",
-           fd, (unsigned)addr.family, addr.pid, active_tracee->guest_pid, addr.groups);
+    printf("VIRTUAL UEVENT BIND: fd=%d nl_family=%u nl_pid=%u guest-pid=%d parent-guest-pid=%d target=%s backing=%s exec-image-validated=1 nl_groups=0x%08x; host bind API not called\n",
+           fd, (unsigned)addr.family, addr.pid, active_tracee->guest_pid,
+           active_tracee->guest_parent_pid, active_tracee->exec_target,
+           active_tracee->exec_backing_path, addr.groups);
     return 0;
 }
 
@@ -3443,19 +3538,28 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
             guest_null_stdio_runtime.unlink_attempts++;
             rc = -EPERM;
         } else {
+            struct guest_null_stdio_identity identity =
+                guest_null_stdio_identity_for_tracee(active_tracee);
             rc = guest_null_stdio_unlink(&guest_null_stdio_runtime,
-                active_tracee->guest_pid, active_tracee->exec_target,
-                active_tracee->identity.euid, guest);
+                &identity, guest);
+            guest_ueventd_null_stdio_note_step(active_tracee,
+                GUEST_UEVENTD_STDIO_UNLINK, 0, rc);
         }
         *is_virtual = 1;
         *pending_return = rc;
         virtual_file_ops++;
         if (guest_null_stdio_diagnostics_emitted < 64u) {
             guest_null_stdio_diagnostics_emitted++;
-            printf("GUEST NULL DEVICE UNLINK: guest-pid=%d executable=%s path=%s result=%d node-present=%d opened-fd=%d source-fd-open=%d; app-private software namespace only, no host unlink/device node\n",
+            printf("GUEST NULL DEVICE UNLINK: guest-pid=%d parent-guest-pid=%d executable=%s actor=%s image-verified=%d backing=%s path=%s result=%d node-present=%d opened-fd=%d source-fd-open=%d; app-private software namespace only, no host unlink/device node\n",
                    active_tracee ? active_tracee->guest_pid : -1,
+                   active_tracee ? active_tracee->guest_parent_pid : -1,
                    active_tracee && active_tracee->exec_target[0]
                        ? active_tracee->exec_target : "<unknown>",
+                   guest_null_stdio_actor_for_tracee(active_tracee) == GUEST_NULL_STDIO_ACTOR_INIT ? "init" :
+                       guest_null_stdio_actor_for_tracee(active_tracee) == GUEST_NULL_STDIO_ACTOR_UEVENTD ? "ueventd" : "denied",
+                   guest_null_stdio_actor_for_tracee(active_tracee) != GUEST_NULL_STDIO_ACTOR_DENIED,
+                   active_tracee && active_tracee->exec_backing_path[0]
+                       ? active_tracee->exec_backing_path : "<unverified>",
                    guest, rc, guest_null_stdio_runtime.node_present,
                    guest_null_stdio_runtime.source_fd,
                    guest_null_stdio_runtime.source_fd_open);
@@ -3507,10 +3611,25 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
             return -EPERM;
         }
         unsigned flags = regs->uregs[nr == ARM_NR_OPEN ? 1u : 2u];
+        struct guest_null_stdio_identity identity =
+            guest_null_stdio_identity_for_tracee(active_tracee);
         rc = guest_null_stdio_open_validate(&guest_null_stdio_runtime,
-            active_tracee->guest_pid, active_tracee->exec_target,
-            active_tracee->identity.euid, guest, flags);
-        if (rc != 0) return rc;
+            &identity, guest, flags);
+        if (rc != 0) {
+            if (guest_null_stdio_diagnostics_emitted < 64u) {
+                guest_null_stdio_diagnostics_emitted++;
+                enum guest_null_stdio_actor actor =
+                    guest_null_stdio_actor_for_identity(&identity);
+                printf("GUEST NULL DEVICE OPEN: guest-pid=%d parent-guest-pid=%d executable=%s actor=%s image-verified=%d backing=%s path=%s flags=0x%x result=%d; rejected by guest-only null-device policy, no host open/device\n",
+                       active_tracee->guest_pid, active_tracee->guest_parent_pid,
+                       active_tracee->exec_target, guest_null_stdio_actor_name(actor),
+                       actor != GUEST_NULL_STDIO_ACTOR_DENIED,
+                       active_tracee->exec_backing_path[0]
+                           ? active_tracee->exec_backing_path : "<unverified>",
+                       guest, flags, rc);
+            }
+            return rc;
+        }
         int fd = alloc_virtual_fd(VIRTUAL_FD_DEV_NULL);
         rc = guest_null_stdio_open_complete(&guest_null_stdio_runtime, fd);
         if (rc < 0) {
@@ -3528,11 +3647,15 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
         virtual_device_count++;
         *is_virtual = 1;
         *pending_return = fd;
+        guest_ueventd_null_stdio_note_step(active_tracee,
+            GUEST_UEVENTD_STDIO_OPEN, fd, fd);
         if (guest_null_stdio_diagnostics_emitted < 64u) {
             guest_null_stdio_diagnostics_emitted++;
-            printf("GUEST NULL DEVICE OPEN: guest-pid=%d executable=%s path=%s flags=0x%x virtual-fd=%d mode=0600 rdev=1:3; app-private guest FD only, no host open/device\n",
-                   active_tracee->guest_pid, active_tracee->exec_target,
-                   guest, flags, fd);
+            printf("GUEST NULL DEVICE OPEN: guest-pid=%d parent-guest-pid=%d executable=%s actor=%s image-verified=1 backing=%s path=%s flags=0x%x virtual-fd=%d mode=0600 rdev=1:3; app-private guest FD only, no host open/device\n",
+                   active_tracee->guest_pid, active_tracee->guest_parent_pid,
+                   active_tracee->exec_target,
+                   guest_null_stdio_actor_name(guest_null_stdio_actor_for_identity(&identity)),
+                   active_tracee->exec_backing_path, guest, flags, fd);
         }
         return 0;
     }
@@ -3772,20 +3895,29 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
             guest_null_stdio_runtime.mknod_rejected++;
             rc = -EPERM;
         } else {
+            struct guest_null_stdio_identity identity =
+                guest_null_stdio_identity_for_tracee(active_tracee);
             rc = guest_null_stdio_mknod(&guest_null_stdio_runtime,
-                active_tracee->guest_pid, active_tracee->exec_target,
-                active_tracee->identity.euid, guest, requested_mode,
-                requested_device);
+                &identity, guest, requested_mode, requested_device);
+            guest_ueventd_null_stdio_note_step(active_tracee,
+                GUEST_UEVENTD_STDIO_MKNOD, 0, rc);
         }
         *is_virtual = 1;
         *pending_return = rc;
         virtual_device_count++;
         if (guest_null_stdio_diagnostics_emitted < 64u) {
             guest_null_stdio_diagnostics_emitted++;
-            printf("GUEST NULL DEVICE MKNOD: guest-pid=%d executable=%s syscall=%s path=%s mode=0%o device=0x%08x result=%d node-present=%d; exact API10 init request only, in-memory guest node, host mknod never called\n",
+            enum guest_null_stdio_actor actor =
+                guest_null_stdio_actor_for_tracee(active_tracee);
+            printf("GUEST NULL DEVICE MKNOD: guest-pid=%d parent-guest-pid=%d executable=%s actor=%s image-verified=%d backing=%s syscall=%s path=%s mode=0%o device=0x%08x result=%d node-present=%d; exact API10 PID1/verified-ueventd request only, in-memory guest node, host mknod never called\n",
                    active_tracee ? active_tracee->guest_pid : -1,
+                   active_tracee ? active_tracee->guest_parent_pid : -1,
                    active_tracee && active_tracee->exec_target[0]
                        ? active_tracee->exec_target : "<unknown>",
+                   guest_null_stdio_actor_name(actor),
+                   actor != GUEST_NULL_STDIO_ACTOR_DENIED,
+                   active_tracee && active_tracee->exec_backing_path[0]
+                       ? active_tracee->exec_backing_path : "<unverified>",
                    guest_diag_syscall_name(nr), guest, requested_mode,
                    requested_device, rc, guest_null_stdio_runtime.node_present);
         }
@@ -3879,6 +4011,18 @@ static void record_guest_path_fd_result(struct tracee_state *state,
             (void)guest_path_fd_track(&guest_path_fds, table_id, target_fd, path);
         else
             guest_path_fd_remove(&guest_path_fds, table_id, target_fd);
+        int source_is_modeled_null = guest_null_stdio_fd_is_null(
+            state->null_stdio_mask, source_fd,
+            guest_null_stdio_virtual_fd_valid(state, source_fd));
+        if (guest_null_stdio_note_dup2_result(&state->null_stdio_mask,
+                target_fd, source_is_modeled_null, result)) {
+            set_guest_null_stdio_mask_for_group(state, state->null_stdio_mask);
+            guest_null_stdio_alias_replaced_count++;
+            if (guest_null_stdio_alias_replaced_count <= 64u)
+                printf("GUEST NULL STDIO REPLACED: guest-pid=%d source-fd=%d target-fd=%d result=%d null-source=%d; successful ordinary dup2 cleared the stale software null alias\n",
+                       state->guest_pid, source_fd, target_fd, result,
+                       source_is_modeled_null);
+        }
     }
     (void)regs;
 }
@@ -4794,8 +4938,11 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         guest_kmsg_note_fd_closed(&guest_kmsg_runtime, fd, *pending_return,
                                   virtual_fd_referenced(fd), 0);
         if (*pending_return == 0 && fd == guest_null_stdio_runtime.source_fd &&
-            !virtual_fd_referenced(fd))
+            !virtual_fd_referenced(fd)) {
             guest_null_stdio_source_fd_closed(&guest_null_stdio_runtime, fd);
+            guest_ueventd_null_stdio_note_step(state,
+                GUEST_UEVENTD_STDIO_SOURCE_CLOSE, fd, *pending_return);
+        }
         *fake = 1; return 0;
     }
     if (nr == ARM_NR_CLOSE && (int32_t)regs->uregs[0] == GUEST_LINKER_FD) {
@@ -4856,7 +5003,11 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         int source_is_virtual_null = guest_null_stdio_virtual_fd_valid(state, old_fd);
         if (guest_null_stdio_dup2(&guest_null_stdio_runtime, &mask,
                 old_fd, new_fd, source_is_virtual_null, &dup_result)) {
-            if (dup_result >= 0) set_guest_null_stdio_mask_for_group(state, mask);
+            if (dup_result >= 0) {
+                set_guest_null_stdio_mask_for_group(state, mask);
+                guest_ueventd_null_stdio_note_step(state,
+                    GUEST_UEVENTD_STDIO_DUP2, old_fd, dup_result);
+            }
             *pending_return = dup_result;
             *fake = 1;
             if (guest_null_stdio_diagnostics_emitted < 64u) {
@@ -5077,6 +5228,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
     root->target_elf_entry_valid = guest_elf32_arm_entrypoint(
         root->exec_backing_path, &root->target_elf_type,
         &root->target_elf_entry) == 0;
+    root->exec_image_committed = root->target_elf_entry_valid;
+    root->null_stdio_exec.source_fd = -1;
     printf("CONTINUOUS TRACE START: original static ARM32 /init pid=%d\n", pid);
     if (set_guest_trace_options(pid) != 0 || resume_trace(pid, 0) != 0) {
         fprintf(stderr, "ptrace setup failed: errno=%d\n", errno); kill_all_tracees(); return -1;
@@ -5280,6 +5433,7 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                          sizeof(child_state->exec_backing_path), "%s",
                          state->exec_backing_path);
                 child_state->target_elf_entry_valid = state->target_elf_entry_valid;
+                child_state->exec_image_committed = state->exec_image_committed;
                 child_state->target_elf_type = state->target_elf_type;
                 child_state->target_elf_entry = state->target_elf_entry;
                 snprintf(child_state->exec_target, sizeof(child_state->exec_target), "%s",
@@ -5338,7 +5492,19 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             state->target_elf_entry_valid =
                 guest_elf32_arm_entrypoint(state->exec_backing_path,
                     &state->target_elf_type, &state->target_elf_entry) == 0;
+            state->exec_image_committed = state->target_elf_entry_valid;
+            memset(&state->null_stdio_exec, 0,
+                   sizeof(state->null_stdio_exec));
+            state->null_stdio_exec.source_fd = -1;
             state->target_elf_entry_pc_seen = 0;
+            if (guest_null_stdio_actor_for_tracee(state) ==
+                    GUEST_NULL_STDIO_ACTOR_UEVENTD) {
+                guest_ueventd_exec_image_validated_count++;
+                printf("GUEST UEVENTD EXEC IMAGE VALIDATED: guest-pid=%d parent-guest-pid=%d executable=%s backing=%s image=ARM32-ELF-verified euid=%u; exact API10 direct child of PID1, app-private payload only\n",
+                       state->guest_pid, state->guest_parent_pid,
+                       state->exec_target, state->exec_backing_path,
+                       state->identity.euid);
+            }
             if (state->exec_target[0] == '/')
                 printf("GUEST TARGET ELF ENTRY METADATA: guest-pid=%d target=%s backing=%s ELF32-ARM type=%s e_entry=0x%08x; metadata only, execution at e_entry/C-main not inferred\n",
                        state->guest_pid, state->exec_target,
@@ -5541,7 +5707,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 int marker_release_observed = 0;
                 if (state->last_syscall == ARM_NR_OPEN &&
                     strcmp(state->last_guest_path, GUEST_COLD_BOOT_MARKER_PATH) == 0 &&
-                    strcmp(state->exec_target, "/sbin/ueventd") == 0) {
+                    guest_null_stdio_actor_for_tracee(state) ==
+                        GUEST_NULL_STDIO_ACTOR_UEVENTD) {
                     uint32_t marker_flags = state->last_syscall_args[1];
                     uint32_t marker_mode = state->last_syscall_args[2];
                     int was_observed = coldboot_observation.marker_opened_by_ueventd;
@@ -5593,7 +5760,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                         coldboot_marker_runtime.close_result = syscall_result;
                         (void)guest_coldboot_note_marker_close(
                             &coldboot_observation,
-                            strcmp(state->exec_target, "/sbin/ueventd") == 0,
+                            guest_null_stdio_actor_for_tracee(state) ==
+                                GUEST_NULL_STDIO_ACTOR_UEVENTD,
                             (int32_t)state->last_syscall_args[0], syscall_result);
                         log_guest_coldboot_marker_snapshot(
                             "GUEST COLD-BOOT MARKER CLOSE", state->guest_pid,
@@ -5606,7 +5774,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     state->last_syscall == ARM_NR_FSTATAT64;
                 if (marker_stat_syscall &&
                     strcmp(state->last_guest_path, GUEST_COLD_BOOT_MARKER_PATH) == 0 &&
-                    strcmp(state->exec_target, "/sbin/ueventd") == 0) {
+                    guest_null_stdio_actor_for_tracee(state) ==
+                        GUEST_NULL_STDIO_ACTOR_UEVENTD) {
                     printf("GUEST UEVENTD COLD-BOOT MARKER PRECHECK: syscall=%d(%s) result=%d path=%s; API10 device_init checks this before walking /sys\n",
                            state->last_syscall,
                            guest_diag_syscall_name(state->last_syscall),
@@ -5651,8 +5820,15 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                             pid1_map_rc == 0 ? pid1_marker_backing : NULL,
                             same_open_backing);
                 }
-                if (marker_release_observed)
+                if (marker_release_observed &&
+                    !coldboot_marker_runtime.wait_release_logged) {
+                    coldboot_marker_runtime.wait_release_logged = 1;
                     puts("INIT COLD-BOOT WAIT CONDITION OBSERVED: source-shaped ueventd O_WRONLY|O_CREAT mode-0000 marker open succeeded and API10 wait_for_file's PID1 stat(/dev/.coldboot_done) returned 0; the loop condition is satisfied, builtin return itself is not directly traced");
+                    printf("INIT COLD-BOOT WAIT RELEASED: guest-pid=1 path=%s stat-result=0 marker-open-by-verified-ueventd=1 marker-close-seen=%d marker-close-result=%d; API10 wait_for_file predicate is satisfied, function return is source-inferred rather than directly traced\n",
+                           GUEST_COLD_BOOT_MARKER_PATH,
+                           coldboot_marker_runtime.close_seen,
+                           coldboot_marker_runtime.close_result);
+                }
                 if (state->pending) regs.uregs[0] = (uint32_t)state->pending_return;
                 if (state->pending && set_regs(waited, &regs) != 0) { fprintf(stderr, "cannot set virtual return value pid=%d: errno=%d\n", waited, errno); kill_all_tracees(); return -1; }
                 if (state->pending) {
@@ -5786,6 +5962,9 @@ int main(int argc, char **argv) {
     guest_vsocket_table_init(&guest_sockets);
     guest_null_stdio_runtime_init(&guest_null_stdio_runtime);
     guest_null_stdio_diagnostics_emitted = 0;
+    guest_ueventd_exec_image_validated_count = 0;
+    guest_ueventd_null_stdio_ready_count = 0;
+    guest_null_stdio_alias_replaced_count = 0;
     guest_kmsg_runtime_init(&guest_kmsg_runtime);
     guest_kmsg_diagnostics_emitted = 0;
     virtual_fd_duplicate_denials = 0;
@@ -5939,7 +6118,7 @@ int main(int argc, char **argv) {
            exec_failure_diagnostics_suppressed, MAX_EXEC_FAILURE_DIAGNOSTICS);
     printf("GUEST MKNOD DIAGNOSTICS: emitted=%lu suppressed=%lu (limit=64); fb0 node is counted only for exact guest path, root:graphics identity, consumed add event and API10 mode/device tuple\n",
            guest_mknod_diagnostics_emitted, guest_mknod_diagnostics_suppressed);
-    printf("GUEST NULL STDIO SUMMARY: node-present=%d unlinked=%d decoded-null-path-mknod-requests=%u accepted=%u rejected=%u decoded-null-path-open-requests=%u succeeded=%u failed=%u source-fd=%d source-fd-open=%d source-fd-closes=%u decoded-null-path-unlink-requests=%u succeeded=%u validated-null-dup2=%u succeeded=%u stdio-mask-last=0x%x reads=%u writes=%u closes=%u diagnostics=%lu; counters cover decoded exact-path broker requests, not all syscalls; API10 /init char 1:3 mode 0600; in-memory guest FD state only, no host mknod/open/unlink/device\n",
+    printf("GUEST NULL STDIO SUMMARY: node-present=%d unlinked=%d decoded-null-path-mknod-requests=%u accepted=%u rejected=%u decoded-null-path-open-requests=%u succeeded=%u failed=%u source-fd=%d source-fd-open=%d source-fd-closes=%u decoded-null-path-unlink-requests=%u succeeded=%u validated-null-dup2=%u succeeded=%u ordinary-dup2-cleared-null-alias=%lu stdio-mask-last=0x%x reads=%u writes=%u closes=%u diagnostics=%lu; counters cover decoded exact-path broker requests, not all syscalls; API10 /init char 1:3 mode 0600; in-memory guest FD state only, no host mknod/open/unlink/device\n",
            guest_null_stdio_runtime.node_present, guest_null_stdio_runtime.unlinked,
            guest_null_stdio_runtime.mknod_attempts,
            guest_null_stdio_runtime.mknod_accepted,
@@ -5954,11 +6133,15 @@ int main(int argc, char **argv) {
            guest_null_stdio_runtime.unlink_succeeded,
            guest_null_stdio_runtime.dup2_attempts,
            guest_null_stdio_runtime.dup2_succeeded,
+           guest_null_stdio_alias_replaced_count,
            guest_null_stdio_runtime.stdio_mask_last,
            guest_null_stdio_runtime.stdio_reads,
            guest_null_stdio_runtime.stdio_writes,
            guest_null_stdio_runtime.stdio_closes,
            guest_null_stdio_diagnostics_emitted);
+    printf("GUEST UEVENTD NULL STDIO SUMMARY: verified-exec-images=%lu complete-sequences=%lu; actor requires committed ARM32 ELF at app-private backing path, euid=0, guest parent PID1 and /sbin/ueventd; completion requires exact mknod/open/unlink/dup2-0,1,2/close-source-FD, no host device\n",
+           guest_ueventd_exec_image_validated_count,
+           guest_ueventd_null_stdio_ready_count);
     printf("GUEST KMSG SUMMARY: node-present=%d unlinked=%d fd=%d fd-open=%d cloexec=%d mknod-attempts=%llu accepted=%llu rejected=%llu open-attempts=%llu succeeded=%llu failed=%llu fcntl-setfd=%llu/%llu unlink=%llu/%llu writes=%llu bytes=%llu closes=%llu close-on-exec=%llu diagnostics=%lu; API10 /init char 1:11 mode 0600, in-memory guest node/FD and discarded log bytes only; host /dev/kmsg untouched\n",
            guest_kmsg_runtime.node_present, guest_kmsg_runtime.unlinked,
            guest_kmsg_runtime.fd, guest_kmsg_runtime.fd_open,

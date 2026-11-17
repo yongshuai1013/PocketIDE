@@ -6,8 +6,8 @@
 #include <string.h>
 
 /* Android 2.3.7/API10 init.c util.c creates this transient guest node with
- * mknod(path, S_IFCHR | 0600, (1 << 8) | 3).  These values are ARM32 guest
- * ABI values; they are not used to create a host filesystem device. */
+ * mknod(path, S_IFCHR | 0600, (1 << 8) | 3). These are ARM32 guest ABI
+ * values; they are never used to create a host filesystem device. */
 #define GUEST_NULL_STDIO_PATH "/dev/__null__"
 #define GUEST_NULL_STDIO_MODE 020600u
 #define GUEST_NULL_STDIO_DEVICE 0x00000103u
@@ -15,6 +15,26 @@
 #define GUEST_ARM32_O_RDWR 00000002u
 #define GUEST_ARM32_O_LARGEFILE 0400000u
 #define GUEST_NULL_STDIO_FD_MASK 0x07u
+
+enum guest_null_stdio_actor {
+    GUEST_NULL_STDIO_ACTOR_DENIED = 0,
+    GUEST_NULL_STDIO_ACTOR_INIT = 1,
+    GUEST_NULL_STDIO_ACTOR_UEVENTD = 2
+};
+
+/* The supervisor derives these facts from the committed guest exec event (or
+ * its separately verified initial /init launch), the guest PID/parent table,
+ * virtual uid, ARM ELF validation, and an already admitted app-private guest
+ * root (staged guest tree or packaged native payload). */
+struct guest_null_stdio_identity {
+    int32_t guest_pid;
+    int32_t guest_parent_pid;
+    uint32_t guest_euid;
+    const char *executable;
+    int exec_image_committed;
+    int arm32_elf_valid;
+    int backing_path_approved;
+};
 
 struct guest_null_stdio_runtime {
     int node_present;
@@ -45,23 +65,43 @@ static inline void guest_null_stdio_runtime_init(
     runtime->source_fd = -1;
 }
 
-static inline int guest_null_stdio_is_original_init(
-        int guest_pid, const char *executable, uint32_t guest_euid) {
-    return guest_pid == 1 && executable && strcmp(executable, "/init") == 0 &&
-           guest_euid == 0u;
+static inline enum guest_null_stdio_actor guest_null_stdio_actor_for_identity(
+        const struct guest_null_stdio_identity *identity) {
+    if (!identity || !identity->executable || identity->guest_euid != 0u ||
+        !identity->exec_image_committed || !identity->arm32_elf_valid ||
+        !identity->backing_path_approved)
+        return GUEST_NULL_STDIO_ACTOR_DENIED;
+    if (identity->guest_pid == 1 && identity->guest_parent_pid == 0 &&
+        strcmp(identity->executable, "/init") == 0)
+        return GUEST_NULL_STDIO_ACTOR_INIT;
+    if (identity->guest_pid > 1 && identity->guest_parent_pid == 1 &&
+        strcmp(identity->executable, "/sbin/ueventd") == 0)
+        return GUEST_NULL_STDIO_ACTOR_UEVENTD;
+    return GUEST_NULL_STDIO_ACTOR_DENIED;
+}
+
+static inline const char *guest_null_stdio_actor_name(
+        enum guest_null_stdio_actor actor) {
+    switch (actor) {
+        case GUEST_NULL_STDIO_ACTOR_INIT: return "init";
+        case GUEST_NULL_STDIO_ACTOR_UEVENTD: return "ueventd";
+        default: return "denied";
+    }
 }
 
 static inline int guest_null_stdio_mknod(
-        struct guest_null_stdio_runtime *runtime, int guest_pid,
-        const char *executable, uint32_t guest_euid, const char *path,
-        uint32_t mode, uint32_t device) {
+        struct guest_null_stdio_runtime *runtime,
+        const struct guest_null_stdio_identity *identity,
+        const char *path, uint32_t mode, uint32_t device) {
     if (!runtime) return -EINVAL;
     runtime->mknod_attempts++;
     if (!path || strcmp(path, GUEST_NULL_STDIO_PATH) != 0) {
         runtime->mknod_rejected++;
         return -EOPNOTSUPP;
     }
-    if (!guest_null_stdio_is_original_init(guest_pid, executable, guest_euid)) {
+    enum guest_null_stdio_actor actor =
+        guest_null_stdio_actor_for_identity(identity);
+    if (actor == GUEST_NULL_STDIO_ACTOR_DENIED) {
         runtime->mknod_rejected++;
         return -EPERM;
     }
@@ -79,24 +119,28 @@ static inline int guest_null_stdio_mknod(
     return 0;
 }
 
-/* The API10 bionic ARM open wrapper may add its ABI O_LARGEFILE bit.  No
- * create/truncate/append or host open flags are accepted for this virtual node. */
+/* The API10 bionic ARM open wrapper may add O_LARGEFILE. This minimal startup
+ * backend supports one outstanding open description; other device semantics
+ * remain fail-closed rather than sharing an incomplete FD model. */
 static inline int guest_null_stdio_open_validate(
-        struct guest_null_stdio_runtime *runtime, int guest_pid,
-        const char *executable, uint32_t guest_euid, const char *path,
-        uint32_t flags) {
+        struct guest_null_stdio_runtime *runtime,
+        const struct guest_null_stdio_identity *identity,
+        const char *path, uint32_t flags) {
     if (!runtime) return -EINVAL;
     runtime->open_attempts++;
     int result = 0;
     if (!path || strcmp(path, GUEST_NULL_STDIO_PATH) != 0)
         result = -EOPNOTSUPP;
-    else if (!guest_null_stdio_is_original_init(guest_pid, executable, guest_euid))
+    else if (guest_null_stdio_actor_for_identity(identity) ==
+             GUEST_NULL_STDIO_ACTOR_DENIED)
         result = -EPERM;
     else if (!runtime->node_present || runtime->unlinked)
         result = -ENOENT;
     else if ((flags & GUEST_ARM32_O_ACCMODE) != GUEST_ARM32_O_RDWR ||
              (flags & ~(GUEST_ARM32_O_ACCMODE | GUEST_ARM32_O_LARGEFILE)) != 0u)
         result = -EINVAL;
+    else if (runtime->source_fd_open)
+        result = -EBUSY;
     if (result != 0) runtime->open_failed++;
     return result;
 }
@@ -112,21 +156,27 @@ static inline int guest_null_stdio_open_complete(
         runtime->open_failed++;
         return -ENOENT;
     }
+    if (runtime->source_fd_open) {
+        runtime->open_failed++;
+        return -EBUSY;
+    }
     runtime->source_fd = virtual_fd;
     runtime->source_fd_open = 1;
     runtime->open_succeeded++;
     return virtual_fd;
 }
 
-/* The source unlinks even when open() failed.  An already opened virtual FD
- * remains valid because its semantics live in the FD table, not this name. */
+/* API10 unlinks even after open failure. An opened virtual FD remains valid
+ * because its semantics live in the guest descriptor table, not the node name. */
 static inline int guest_null_stdio_unlink(
-        struct guest_null_stdio_runtime *runtime, int guest_pid,
-        const char *executable, uint32_t guest_euid, const char *path) {
+        struct guest_null_stdio_runtime *runtime,
+        const struct guest_null_stdio_identity *identity,
+        const char *path) {
     if (!runtime) return -EINVAL;
     runtime->unlink_attempts++;
     if (!path || strcmp(path, GUEST_NULL_STDIO_PATH) != 0) return -EOPNOTSUPP;
-    if (!guest_null_stdio_is_original_init(guest_pid, executable, guest_euid))
+    if (guest_null_stdio_actor_for_identity(identity) ==
+        GUEST_NULL_STDIO_ACTOR_DENIED)
         return -EPERM;
     if (!runtime->node_present || runtime->unlinked) return -ENOENT;
     runtime->node_present = 0;
@@ -150,8 +200,7 @@ static inline int guest_null_stdio_fd_is_null(
 }
 
 /* Returns 1 when the supervisor must emulate dup2, 0 when another policy
- * handles the call.  The descriptor source is validated against the virtual
- * guest FD table before this helper is called. */
+ * handles it. The descriptor source must be validated against guest state. */
 static inline int guest_null_stdio_dup2(
         struct guest_null_stdio_runtime *runtime, uint8_t *stdio_mask,
         int old_fd, int new_fd, int validated_virtual_null_source,
@@ -174,6 +223,20 @@ static inline int guest_null_stdio_dup2(
     runtime->dup2_succeeded++;
     *result = new_fd;
     return 1;
+}
+
+/* A successful ordinary guest dup2 replaces the target descriptor. Clear a
+ * stale null-device alias only after success; null-backed sources retain it. */
+static inline int guest_null_stdio_note_dup2_result(
+        uint8_t *stdio_mask, int target_fd, int source_is_modeled_null,
+        int32_t result) {
+    if (!stdio_mask || result < 0 || target_fd < 0 || target_fd > 2 ||
+        source_is_modeled_null)
+        return 0;
+    uint8_t bit = (uint8_t)(1u << (unsigned)target_fd);
+    int changed = (*stdio_mask & bit) != 0u;
+    *stdio_mask &= (uint8_t)~bit;
+    return changed;
 }
 
 static inline int guest_null_stdio_close(
