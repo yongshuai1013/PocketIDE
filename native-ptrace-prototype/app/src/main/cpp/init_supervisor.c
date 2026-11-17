@@ -27,6 +27,7 @@
 #include "guest_symlink_ops.h"
 #include "guest_socket_virtual.h"
 #include "guest_goldfish_tty_virtual.h"
+#include "guest_qemud_peer_virtual.h"
 #include "guest_socket_path_ops.h"
 #include "guest_diagnostics.h"
 #include "guest_sigsys_context.h"
@@ -632,6 +633,8 @@ static unsigned long virtual_property_sendto_count;
 static unsigned long virtual_property_recvfrom_count;
 static unsigned long virtual_property_sendto_bytes;
 static unsigned long virtual_property_recvfrom_bytes;
+static unsigned long virtual_property_reads_parked;
+static unsigned long virtual_property_reads_woken;
 static unsigned long virtual_property_stream_errors;
 static unsigned long virtual_property_stream_diagnostics;
 static unsigned long virtual_socketpair_count;
@@ -667,6 +670,12 @@ static unsigned long guest_qemud_exec_count;
 static unsigned long guest_qemu_props_exec_count;
 static unsigned long guest_qemud_exit_count;
 static int guest_qemud_last_exit_code = -1;
+static struct guest_qemud_peer_runtime guest_qemud_peer_runtime;
+static unsigned long guest_qemud_peer_diagnostics_emitted;
+static unsigned long guest_qemud_client_connect_count;
+static unsigned long guest_qemud_client_accept_count;
+static unsigned long guest_qemud_socket_stream_bytes;
+static unsigned long guest_qemud_socket_stream_errors;
 static unsigned long guest_target_elf_text_entry_count;
 static unsigned long guest_target_elf_declared_entry_pc_count;
 static unsigned long guest_app_process_declared_entry_pc_count;
@@ -702,6 +711,9 @@ static int dynamic_exec_blocked;
 static int process_limit_hit;
 static char dynamic_exec_guest_path[PATH_MAX];
 static char dynamic_exec_interpreter[PATH_MAX];
+static int wake_parked_qemud_epolls(void);
+static int wake_parked_qemud_reads(void);
+static int wake_parked_property_reads(void);
 static void cancel_signal_handler(int signo) {
     if (signo == SIGTERM || signo == SIGINT) user_cancel_requested = 1;
 }
@@ -1132,6 +1144,47 @@ static int tracee_is_verified_api10_qemud(const struct tracee_state *state) {
         ((guest_root[0] && path_is_within(state->exec_backing_path, guest_root)) ||
          (native_guest_root[0] &&
           path_is_within(state->exec_backing_path, native_guest_root)));
+}
+
+static int tracee_has_guest_backed_executable(const struct tracee_state *state,
+                                               const char *guest_path) {
+    return state && guest_path && strcmp(state->exec_target, guest_path) == 0 &&
+        state->exec_image_committed && state->target_elf_entry_valid &&
+        state->target_elf_type == ET_EXEC && state->exec_backing_path[0] &&
+        ((guest_root[0] && path_is_within(state->exec_backing_path, guest_root)) ||
+         (native_guest_root[0] &&
+          path_is_within(state->exec_backing_path, native_guest_root)));
+}
+
+static int tracee_is_verified_api10_qemu_props(const struct tracee_state *state) {
+    if (!state || state->guest_pid <= 1) return 0;
+    const struct tracee_state *shell = NULL;
+    int original_init_verified = 0;
+    for (size_t i = 0; i < tracee_count; ++i) {
+        const struct tracee_state *candidate = &tracees[i];
+        if (candidate->alive && !candidate->is_thread && !candidate->guest_reaped &&
+            candidate->guest_pid == state->guest_parent_pid)
+            shell = candidate;
+        if (candidate->alive && !candidate->is_thread && !candidate->guest_reaped &&
+            candidate->guest_pid == 1 &&
+            tracee_has_verified_api10_init_image(candidate))
+            original_init_verified = 1;
+    }
+    struct guest_qemud_client_identity identity = {
+        .client_elf_verified = tracee_has_guest_backed_executable(
+            state, "/system/bin/qemu-props"),
+        .client_guest_euid = (int)state->guest_euid,
+        .client_is_thread = state->is_thread,
+        .script_shell_elf_verified = shell &&
+            tracee_has_guest_backed_executable(shell, "/system/bin/sh"),
+        .script_shell_guest_euid = shell ? (int)shell->guest_euid : -1,
+        .script_shell_is_thread = shell ? shell->is_thread : 1,
+        .exact_init_goldfish_script = shell &&
+            strcmp(shell->exec_script_path, "/system/etc/init.goldfish.sh") == 0,
+        .shell_direct_init_child = shell && shell->guest_parent_pid == 1,
+        .original_init_verified = original_init_verified,
+    };
+    return guest_qemud_client_actor_authorized(&identity);
 }
 
 static int guest_path_uses_native_payload(const char *guest) {
@@ -1979,11 +2032,14 @@ static void release_virtual_fd_if_unreferenced(int fd) {
     if (virtual_fd_referenced(fd)) return;
     struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
     if (entry && (entry->kind == VIRTUAL_FD_DEV_TTY ||
-                  entry->kind == VIRTUAL_FD_QEMUD_LISTENER))
+                  entry->kind == VIRTUAL_FD_QEMUD_LISTENER ||
+                  entry->kind == VIRTUAL_FD_QEMUD_ACCEPTED))
         guest_goldfish_tty_epoll_remove_watched_fd(&guest_goldfish_tty_epolls, fd);
     if (entry && entry->kind == VIRTUAL_FD_DEV_TTY &&
-        guest_goldfish_tty_runtime.tty_fd == fd)
+        guest_goldfish_tty_runtime.tty_fd == fd) {
         (void)guest_goldfish_tty_note_close(&guest_goldfish_tty_runtime, fd);
+        guest_qemud_peer_reset_connection(&guest_qemud_peer_runtime);
+    }
     if (entry && entry->kind == VIRTUAL_FD_EPOLL)
         (void)guest_goldfish_tty_epoll_close(&guest_goldfish_tty_epolls, fd);
     if (guest_vsocket_close_fd(&guest_sockets, fd) != 0) return;
@@ -2037,6 +2093,9 @@ static const char *virtual_fd_source(int fd) {
             ? "software AF_UNIX property-service listener; no host socket"
             : "software AF_UNIX property-service endpoint; no host socket";
         case VIRTUAL_FD_PROPERTY_ACCEPTED: return "software AF_UNIX accepted property client; no host socket";
+        case VIRTUAL_FD_QEMUD_LISTENER: return "software AF_UNIX qemud listener; guest boot-properties profile only; no host socket";
+        case VIRTUAL_FD_QEMUD_CLIENT: return "software AF_UNIX qemu-props client; verified init.goldfish.sh lineage only";
+        case VIRTUAL_FD_QEMUD_ACCEPTED: return "software AF_UNIX accepted qemud local stream; no host socket";
         case VIRTUAL_FD_SIGNAL: return "software AF_UNIX SIGCHLD socketpair; no host socket";
         case VIRTUAL_FD_DEV_NULL: return "guest /dev/null software stream; no host device";
         case VIRTUAL_FD_DEV_ZERO: return "guest /dev/zero software stream; no host device";
@@ -2415,15 +2474,34 @@ static int virtual_guest_socket_connect(pid_t pid, int fd, uint32_t address,
     if (rc != 0) return rc;
     if (!active_tracee || active_tracee->pid != pid ||
         !tracee_owns_virtual_fd(active_tracee, fd)) return -EBADF;
-    rc = guest_vsocket_connect(&guest_sockets, fd, family, guest_path,
-                               active_tracee->guest_pid,
-                               (int32_t)active_tracee->guest_euid,
-                               (int32_t)active_tracee->guest_egid);
+    int qemud_path = guest_vsocket_path_is_qemud_service(guest_path);
+    if (qemud_path) {
+        if (!tracee_is_verified_api10_qemu_props(active_tracee)) {
+            virtual_socket_calls++;
+            virtual_socket_rejected_count++;
+            return -EPERM;
+        }
+        rc = guest_vsocket_qemud_connect(&guest_sockets, fd, family, guest_path,
+            active_tracee->guest_pid, (int32_t)active_tracee->guest_euid,
+            (int32_t)active_tracee->guest_egid);
+    } else {
+        rc = guest_vsocket_connect(&guest_sockets, fd, family, guest_path,
+            active_tracee->guest_pid, (int32_t)active_tracee->guest_euid,
+            (int32_t)active_tracee->guest_egid);
+    }
     virtual_socket_calls++;
     if (rc == 0) {
-        virtual_property_connect_count++;
-        printf("VIRTUAL PROPERTY CONNECT: host-pid=%d guest-pid=%d fd=%d path=%s queued-for-listener; host connect API not called\n",
-               pid, active_tracee->guest_pid, fd, guest_path);
+        if (qemud_path) {
+            guest_qemud_client_connect_count++;
+            printf("VIRTUAL QEMUD CLIENT CONNECT: host-pid=%d guest-pid=%d executable=%s fd=%d path=%s channel=guest-only pending=1 actor=verified-qemu-props-from-init.goldfish.sh; host connect API not called\n",
+                   pid, active_tracee->guest_pid, active_tracee->exec_target,
+                   fd, guest_path);
+            (void)wake_parked_qemud_epolls();
+        } else {
+            virtual_property_connect_count++;
+            printf("VIRTUAL PROPERTY CONNECT: host-pid=%d guest-pid=%d fd=%d path=%s queued-for-listener; host connect API not called\n",
+                   pid, active_tracee->guest_pid, fd, guest_path);
+        }
     } else {
         virtual_socket_rejected_count++;
     }
@@ -2444,10 +2522,12 @@ static int virtual_guest_socket_listen(pid_t pid, int fd, int backlog) {
     int rc = guest_vsocket_listen(&guest_sockets, fd, backlog);
     virtual_socket_calls++;
     if (rc == 0) {
-        printf("VIRTUAL GUEST SERVICE LISTEN: guest-pid=%d executable=%s fd=%d service=%s backlog=%d; no synthetic peer/client; host listen API not called\n",
-               active_tracee->guest_pid, active_tracee->exec_target, fd,
-               entry && entry->kind == VIRTUAL_FD_QEMUD_LISTENER ? "qemud" : "property-service",
-               backlog);
+        if (entry && entry->kind == VIRTUAL_FD_QEMUD_LISTENER)
+            printf("VIRTUAL GUEST SERVICE LISTEN: guest-pid=%d executable=%s fd=%d service=qemud backlog=%d; verified qemu-props client may enter guest-only boot-properties profile; no host listen API\n",
+                   active_tracee->guest_pid, active_tracee->exec_target, fd, backlog);
+        else
+            printf("VIRTUAL GUEST SERVICE LISTEN: guest-pid=%d executable=%s fd=%d service=property-service backlog=%d; app-private property endpoint; host listen API not called\n",
+                   active_tracee->guest_pid, active_tracee->exec_target, fd, backlog);
     }
     else
         virtual_socket_rejected_count++;
@@ -2518,10 +2598,17 @@ static int virtual_guest_socket_accept(pid_t pid, int fd, uint32_t address,
     struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, accepted);
     if (entry) channel = guest_vsocket_channel_get(&guest_sockets, entry->channel);
     virtual_socket_calls++;
-    virtual_property_accept_count++;
-    printf("VIRTUAL PROPERTY ACCEPT: host-pid=%d guest-pid=%d listener=%d accepted=%d peer-guest-pid=%d; host accept API not called\n",
-           pid, active_tracee ? active_tracee->guest_pid : -1, fd, accepted,
-           channel ? channel->peer_pid : -1);
+    if (listener && listener->kind == VIRTUAL_FD_QEMUD_LISTENER) {
+        guest_qemud_client_accept_count++;
+        printf("VIRTUAL QEMUD CLIENT ACCEPT: host-pid=%d guest-pid=%d listener=%d accepted=%d peer-guest-pid=%d service=awaiting-guest-qemud-handshake; app-private byte stream only, host accept API not called\n",
+               pid, active_tracee->guest_pid, fd, accepted,
+               channel ? channel->peer_pid : -1);
+    } else {
+        virtual_property_accept_count++;
+        printf("VIRTUAL PROPERTY ACCEPT: host-pid=%d guest-pid=%d listener=%d accepted=%d peer-guest-pid=%d; host accept API not called\n",
+               pid, active_tracee ? active_tracee->guest_pid : -1, fd, accepted,
+               channel ? channel->peer_pid : -1);
+    }
     return accepted;
 }
 
@@ -2649,6 +2736,14 @@ static int virtual_guest_socket_stream_io(pid_t pid, int fd, uint32_t buffer_add
     struct tracee_state *state = active_tracee && active_tracee->pid == pid ? active_tracee : NULL;
     if (!is_virtual_fd(fd) || !tracee_owns_virtual_fd(state, fd)) return -EBADF;
     struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
+    int qemud_endpoint = entry &&
+        (entry->kind == VIRTUAL_FD_QEMUD_CLIENT ||
+         entry->kind == VIRTUAL_FD_QEMUD_ACCEPTED);
+    if (qemud_endpoint && (!state || state->guest_euid != 0 ||
+        (entry->kind == VIRTUAL_FD_QEMUD_CLIENT &&
+         !tracee_is_verified_api10_qemu_props(state)) ||
+        (entry->kind == VIRTUAL_FD_QEMUD_ACCEPTED &&
+         !tracee_is_verified_api10_qemud(state)))) return -EPERM;
     if (entry && entry->kind == VIRTUAL_FD_SYSFS_UEVENT) {
         if (receive) return -EBADF;
         if (!is_guest_ueventd(pid)) return -EPERM;
@@ -2693,6 +2788,24 @@ static int virtual_guest_socket_stream_io(pid_t pid, int fd, uint32_t buffer_add
         result = guest_vsocket_send(&guest_sockets, fd, buffer, amount, flags);
     } else {
         result = guest_vsocket_peek(&guest_sockets, fd, buffer, amount, flags);
+        if (result == -EAGAIN && entry->kind == VIRTUAL_FD_PROPERTY_ACCEPTED &&
+            tracee_is_verified_api10_init(state) && state->guest_euid == 0 &&
+            !entry->nonblocking && flags == 0)
+            result = GUEST_VSOCKET_READ_PARK;
+        if (result == -EAGAIN && qemud_endpoint && !entry->nonblocking)
+            return GUEST_VSOCKET_READ_PARK;
+        if (result == GUEST_VSOCKET_READ_PARK &&
+            entry->kind == VIRTUAL_FD_PROPERTY_ACCEPTED) {
+            virtual_property_reads_parked++;
+            if (virtual_property_stream_diagnostics < 64u) {
+                virtual_property_stream_diagnostics++;
+                printf("GUEST PROPERTY SERVICE RECV PARKED: guest-pid=%d executable=%s fd=%d length=%u syscall=%s; verified API10 PID1 blocking accepted endpoint, app-private wait only\n",
+                       state->guest_pid, state->exec_target, fd, length,
+                       state->last_syscall == ARM_NR_RECVFROM ? "recvfrom" :
+                       state->last_syscall == ARM_NR_RECV ? "recv" : "read");
+            }
+            return result;
+        }
         if (result > 0) {
             if (write_remote(pid, buffer_address, buffer, (size_t)result) != 0) return -EFAULT;
             if (guest_vsocket_consume(&guest_sockets, fd, (size_t)result) != 0) return -EIO;
@@ -2704,11 +2817,24 @@ static int virtual_guest_socket_stream_io(pid_t pid, int fd, uint32_t buffer_add
             entry->kind == VIRTUAL_FD_SIGNAL ? "sigchld-socketpair" :
             entry->kind == VIRTUAL_FD_PROPERTY ? "property-control" :
             entry->kind == VIRTUAL_FD_PROPERTY_ACCEPTED ? "property-service-client" :
+            entry->kind == VIRTUAL_FD_QEMUD_CLIENT ? "qemud-client" :
+            entry->kind == VIRTUAL_FD_QEMUD_ACCEPTED ? "qemud-service-client" :
             "other-guest-virtual-socket";
         printf("VIRTUAL GUEST SOCKET IO: guest-pid=%d executable=%s fd=%d endpoint=%s direction=%s bytes=%d; app-private software queue only, host socket API not called\n",
                state->guest_pid, state->exec_target, fd, endpoint,
                receive ? "recv" : "send", result);
     }
+    if (qemud_endpoint && result > 0) {
+        guest_qemud_socket_stream_bytes += (unsigned long)result;
+        if (!receive) {
+            (void)wake_parked_qemud_epolls();
+            (void)wake_parked_qemud_reads();
+        }
+    } else if (qemud_endpoint && result < 0 && result != -EAGAIN) {
+        guest_qemud_socket_stream_errors++;
+    }
+    if (!receive && result > 0 && entry->kind == VIRTUAL_FD_PROPERTY)
+        (void)wake_parked_property_reads();
     return result;
 }
 
@@ -2752,6 +2878,15 @@ static int virtual_guest_property_stream_io(pid_t pid,
                             amount, flags, address, (uint32_t)address_length_or_pointer);
                 } else {
                     result = guest_vsocket_peek(&guest_sockets, fd, buffer, amount, 0);
+                    if (result == -EAGAIN && entry &&
+                        entry->kind == VIRTUAL_FD_PROPERTY_ACCEPTED &&
+                        tracee_is_verified_api10_init(state) &&
+                        state->guest_euid == 0 && !entry->nonblocking &&
+                        flags == 0 && address == 0 &&
+                        address_length_or_pointer == 0) {
+                        result = GUEST_VSOCKET_READ_PARK;
+                        virtual_property_reads_parked++;
+                    }
                     if (result > 0) {
                         if (write_remote(pid, buffer_address, buffer,
                                          (size_t)result) != 0) {
@@ -2769,7 +2904,8 @@ static int virtual_guest_property_stream_io(pid_t pid,
     virtual_socket_calls++;
     if (receive) virtual_property_recvfrom_count++;
     else virtual_property_sendto_count++;
-    if (result < 0) virtual_property_stream_errors++;
+    int parked = result == GUEST_VSOCKET_READ_PARK;
+    if (result < 0 && !parked) virtual_property_stream_errors++;
     else if (result > 0) {
         if (receive) virtual_property_recvfrom_bytes += (unsigned long)result;
         else virtual_property_sendto_bytes += (unsigned long)result;
@@ -2781,7 +2917,14 @@ static int virtual_guest_property_stream_io(pid_t pid,
         if (channel)
             queued = channel->data_len[receive ? entry->side : 1 - entry->side];
     }
-    if (virtual_property_stream_diagnostics < 64u) {
+    if (parked && virtual_property_stream_diagnostics < 64u) {
+        virtual_property_stream_diagnostics++;
+        printf("VIRTUAL PROPERTY STREAM SYSCALL: host-pid=%d guest-pid=%d executable=%s syscall=recvfrom fd=%d len=%u flags=0x%x address=0x%08x address-length-or-pointer=0x%08x result=parked-empty-blocking-recv queue-after=%zu; only verified API10 PID1 accepted endpoint is retained for software wake\n",
+               pid, state ? state->guest_pid : -1,
+               state && state->exec_target[0] ? state->exec_target : "<unknown>",
+               fd, guest_length, (unsigned)flags, (unsigned)address,
+               (unsigned)address_length_or_pointer, queued);
+    } else if (!parked && virtual_property_stream_diagnostics < 64u) {
         virtual_property_stream_diagnostics++;
         printf("VIRTUAL PROPERTY STREAM SYSCALL: host-pid=%d guest-pid=%d executable=%s syscall=%s fd=%d len=%u flags=0x%x address=0x%08x address-length-or-pointer=0x%08x result=%d%s%s queue-after=%zu; app-private connected AF_UNIX stream only, host socket API not called\n",
                pid, state ? state->guest_pid : -1,
@@ -2792,6 +2935,8 @@ static int virtual_guest_property_stream_io(pid_t pid,
                result < 0 ? " errno=" : "",
                result < 0 ? guest_diag_errno_name(-result) : "", queued);
     }
+    if (!receive && result > 0 && entry && entry->kind == VIRTUAL_FD_PROPERTY)
+        (void)wake_parked_property_reads();
     return result;
 }
 
@@ -2987,6 +3132,10 @@ static int virtual_poll(pid_t pid, const struct compat_pt_regs *regs) {
                     guest_uevent_queue_readable(&guest_uevent_queue) &&
                     (fds[i].events & GUEST_VSOCKET_POLLIN)
                     ? GUEST_VSOCKET_POLLIN : 0;
+            else if (guest_vsocket_fd_get(&guest_sockets, fd)->kind ==
+                         VIRTUAL_FD_DEV_TTY)
+                fds[i].revents = (int16_t)guest_goldfish_tty_poll_events(
+                    &guest_goldfish_tty_runtime, fd, fds[i].events);
             else
                 fds[i].revents = (int16_t)guest_vsocket_poll_events(
                     &guest_sockets, fd, fds[i].events);
@@ -3631,6 +3780,184 @@ static int fake_entry(pid_t pid, struct compat_pt_regs *regs, int32_t result,
     return 0;
 }
 
+static int wake_parked_qemud_epolls(void) {
+    int woken = 0;
+    for (size_t i = 0; i < tracee_count; ++i) {
+        struct tracee_state *state = &tracees[i];
+        if (!state->alive || state->expect_exit || state->pending ||
+            state->last_syscall != ARM_NR_EPOLL_WAIT ||
+            !tracee_is_verified_api10_qemud(state) || state->guest_euid != 0)
+            continue;
+        struct compat_pt_regs regs;
+        if (get_regs(state->pid, &regs) != 0) continue;
+        int epfd = (int32_t)state->last_syscall_args[0];
+        uint32_t event_pointer = state->last_syscall_args[1];
+        int32_t maxevents = (int32_t)state->last_syscall_args[2];
+        int timeout_ms = (int32_t)state->last_syscall_args[3];
+        if (!tracee_owns_virtual_fd(state, epfd) || timeout_ms != -1) continue;
+        struct guest_arm32_epoll_event events[
+            GUEST_GOLDFISH_TTY_EPOLL_MAX_WATCHES];
+        int ready = guest_goldfish_tty_epoll_collect(
+            &guest_goldfish_tty_epolls, &guest_sockets,
+            &guest_goldfish_tty_runtime, state->virtual_fd_table_id,
+            epfd, maxevents, events);
+        if (ready <= 0) continue;
+        int32_t result = event_pointer &&
+            write_remote(state->pid, event_pointer, events,
+                         (size_t)ready * sizeof(events[0])) == 0
+            ? ready : -EFAULT;
+        if (fake_entry(state->pid, &regs, result, &state->pending_return) != 0) {
+            fprintf(stderr, "qemud epoll wake could not cancel parked syscall guest-pid=%d errno=%d\n",
+                    state->guest_pid, errno);
+            return -1;
+        }
+        state->pending = 1;
+        state->expect_exit = 1;
+        if (resume_trace(state->pid, 0) != 0) {
+            fprintf(stderr, "qemud epoll wake could not resume guest-pid=%d errno=%d\n",
+                    state->guest_pid, errno);
+            return -1;
+        }
+        woken++;
+        if (guest_qemud_peer_diagnostics_emitted < 64u) {
+            guest_qemud_peer_diagnostics_emitted++;
+            printf("GUEST QEMUD VIRTUAL EPOLL WAKE: guest-pid=%d epfd=%d events=%d result=%d timeout=%d; source=app-private tty/socket queue, no host epoll\n",
+                   state->guest_pid, epfd, ready, result, timeout_ms);
+        }
+    }
+    return woken;
+}
+
+static int wake_parked_qemud_reads(void) {
+    int woken = 0;
+    for (size_t i = 0; i < tracee_count; ++i) {
+        struct tracee_state *state = &tracees[i];
+        if (!state->alive || state->expect_exit || state->pending ||
+            state->last_syscall != ARM_NR_READ) continue;
+        int fd = (int32_t)state->last_syscall_args[0];
+        uint32_t address = state->last_syscall_args[1];
+        uint32_t requested = state->last_syscall_args[2];
+        if (requested == 0u || address == 0u) continue;
+        size_t amount = requested > GUEST_VSOCKET_BUFFER_SIZE
+            ? GUEST_VSOCKET_BUFFER_SIZE : (size_t)requested;
+        unsigned char bytes[GUEST_VSOCKET_BUFFER_SIZE];
+        int result = -EAGAIN;
+        int is_tty = 0;
+        struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
+        if (entry && entry->kind == VIRTUAL_FD_DEV_TTY &&
+            tracee_owns_virtual_fd(state, fd) &&
+            tracee_is_verified_api10_qemud(state) && state->guest_euid == 0) {
+            is_tty = 1;
+            result = guest_goldfish_tty_rx_peek(&guest_goldfish_tty_runtime,
+                                                 fd, bytes, amount);
+        } else if (entry &&
+            (entry->kind == VIRTUAL_FD_QEMUD_CLIENT ||
+             entry->kind == VIRTUAL_FD_QEMUD_ACCEPTED) &&
+            tracee_owns_virtual_fd(state, fd) && state->guest_euid == 0 &&
+            ((entry->kind == VIRTUAL_FD_QEMUD_CLIENT &&
+              tracee_is_verified_api10_qemu_props(state)) ||
+             (entry->kind == VIRTUAL_FD_QEMUD_ACCEPTED &&
+              tracee_is_verified_api10_qemud(state)))) {
+            result = guest_vsocket_peek(&guest_sockets, fd, bytes, amount, 0);
+        } else {
+            continue;
+        }
+        if (result == -EAGAIN) continue;
+        if (result > 0 && write_remote(state->pid, address, bytes,
+                                       (size_t)result) != 0)
+            result = -EFAULT;
+        if (result > 0) {
+            int consume = is_tty
+                ? guest_goldfish_tty_rx_consume(&guest_goldfish_tty_runtime,
+                                                fd, (size_t)result)
+                : guest_vsocket_consume(&guest_sockets, fd, (size_t)result);
+            if (consume != 0) result = -EIO;
+        }
+        struct compat_pt_regs regs;
+        if (get_regs(state->pid, &regs) != 0 ||
+            fake_entry(state->pid, &regs, result, &state->pending_return) != 0) {
+            fprintf(stderr, "guest qemud stream wake could not complete parked read guest-pid=%d fd=%d errno=%d\n",
+                    state->guest_pid, fd, errno);
+            return -1;
+        }
+        state->pending = 1;
+        state->expect_exit = 1;
+        if (resume_trace(state->pid, 0) != 0) {
+            fprintf(stderr, "guest qemud stream wake could not resume guest-pid=%d fd=%d errno=%d\n",
+                    state->guest_pid, fd, errno);
+            return -1;
+        }
+        woken++;
+        if (guest_qemud_peer_diagnostics_emitted < 64u) {
+            guest_qemud_peer_diagnostics_emitted++;
+            printf("GUEST QEMUD VIRTUAL READ WAKE: guest-pid=%d fd=%d endpoint=%s result=%d; app-private queue only\n",
+                   state->guest_pid, fd, is_tty ? "ttyS1" : "qemud-socket", result);
+        }
+    }
+    return woken;
+}
+
+static int wake_parked_property_reads(void) {
+    int woken = 0;
+    for (size_t i = 0; i < tracee_count; ++i) {
+        struct tracee_state *state = &tracees[i];
+        if (!state->alive || state->expect_exit || state->pending ||
+            (state->last_syscall != ARM_NR_READ &&
+             state->last_syscall != ARM_NR_RECV &&
+             state->last_syscall != ARM_NR_RECVFROM)) continue;
+        if (state->last_syscall != ARM_NR_READ &&
+            state->last_syscall_args[3] != 0u) continue;
+        if (state->last_syscall == ARM_NR_RECVFROM &&
+            (state->last_syscall_args[4] != 0u ||
+             state->last_syscall_args[5] != 0u)) continue;
+        int fd = (int32_t)state->last_syscall_args[0];
+        uint32_t address = state->last_syscall_args[1];
+        uint32_t requested = state->last_syscall_args[2];
+        struct guest_vsocket_fd *entry = guest_vsocket_fd_get(&guest_sockets, fd);
+        if (!entry || entry->kind != VIRTUAL_FD_PROPERTY_ACCEPTED ||
+            entry->nonblocking || !tracee_owns_virtual_fd(state, fd) ||
+            state->guest_euid != 0 || !tracee_is_verified_api10_init(state) ||
+            requested == 0u || address == 0u) continue;
+
+        size_t amount = requested > GUEST_VSOCKET_BUFFER_SIZE
+            ? GUEST_VSOCKET_BUFFER_SIZE : (size_t)requested;
+        unsigned char bytes[GUEST_VSOCKET_BUFFER_SIZE];
+        int result = guest_vsocket_peek(&guest_sockets, fd, bytes, amount, 0);
+        if (result == -EAGAIN) continue;
+        if (result > 0 && write_remote(state->pid, address, bytes,
+                                       (size_t)result) != 0)
+            result = -EFAULT;
+        if (result > 0 && guest_vsocket_consume(&guest_sockets, fd,
+                                               (size_t)result) != 0)
+            result = -EIO;
+        struct compat_pt_regs regs;
+        if (get_regs(state->pid, &regs) != 0 ||
+            fake_entry(state->pid, &regs, result, &state->pending_return) != 0) {
+            fprintf(stderr, "property-service recv wake could not complete parked guest-pid=%d fd=%d errno=%d\n",
+                    state->guest_pid, fd, errno);
+            return -1;
+        }
+        state->pending = 1;
+        state->expect_exit = 1;
+        if (resume_trace(state->pid, 0) != 0) {
+            fprintf(stderr, "property-service recv wake could not resume parked guest-pid=%d fd=%d errno=%d\n",
+                    state->guest_pid, fd, errno);
+            return -1;
+        }
+        woken++;
+        virtual_property_reads_woken++;
+        if (virtual_property_stream_diagnostics < 64u) {
+            virtual_property_stream_diagnostics++;
+            printf("GUEST PROPERTY SERVICE RECV WAKE: guest-pid=%d executable=%s fd=%d syscall=%s result=%d; source=app-private property queue, PID1 remains traced, no host socket\n",
+                   state->guest_pid, state->exec_target, fd,
+                   state->last_syscall == ARM_NR_RECVFROM ? "recvfrom" :
+                   state->last_syscall == ARM_NR_RECV ? "recv" : "read",
+                   result);
+        }
+    }
+    return woken;
+}
+
 static int guest_path_under(const char *path, const char *root) {
     size_t n = strlen(root);
     return strncmp(path, root, n) == 0 && (path[n] == '\0' || path[n] == '/');
@@ -4039,6 +4366,15 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
                 if (rc != 0) (void)close_virtual_fd(active_tracee, fd);
             }
             if (rc == 0) {
+                rc = guest_goldfish_tty_note_peer_attached(
+                    &guest_goldfish_tty_runtime, fd);
+                if (rc != 0) {
+                    (void)guest_goldfish_tty_note_close(
+                        &guest_goldfish_tty_runtime, fd);
+                    (void)close_virtual_fd(active_tracee, fd);
+                }
+            }
+            if (rc == 0) {
                 set_virtual_fd_open_flags(active_tracee, fd, flags);
                 struct guest_vsocket_fd *tty_fd = guest_vsocket_fd_get(
                     &guest_sockets, fd);
@@ -4058,6 +4394,11 @@ static int path_syscall(pid_t pid, struct compat_pt_regs *regs, int nr,
                    active_tracee ? tracee_is_verified_api10_qemud(active_tracee) : 0,
                    guest, flags, GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR,
                    tty_minor, fd, rc);
+            if (rc == 0)
+                printf("GUEST QEMUD SERIAL PEER ATTACHED: guest-pid=%d service=qemud tty=/dev/ttyS1 dev=synthetic:%u:%u profile=WVGA800 density=%u; API10 control/boot-properties subset only, no host QEMU/serial/response source\n",
+                       active_tracee->guest_pid,
+                       GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR, tty_minor,
+                       GUEST_PROFILE_DISPLAY_DENSITY_DPI);
             return rc == 0 ? 0 : rc;
         }
         struct guest_pseudo_device_metadata metadata;
@@ -5192,20 +5533,42 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
     }
     if (nr == ARM_NR_EPOLL_WAIT) {
         int epfd = (int32_t)regs->uregs[0];
+        uint32_t event_pointer = regs->uregs[1];
         int32_t maxevents = (int32_t)regs->uregs[2];
         int32_t timeout_ms = (int32_t)regs->uregs[3];
         int verified_qemud = state && state->pid == pid &&
             tracee_is_verified_api10_qemud(state) && state->identity.euid == 0;
-        int wait_result = !verified_qemud ? -EPERM :
-            (!tracee_owns_virtual_fd(state, epfd) ? -EBADF :
-             guest_goldfish_tty_epoll_wait_result(&guest_goldfish_tty_epolls,
-                state->virtual_fd_table_id, epfd, maxevents, timeout_ms));
+        int wait_result = -EPERM;
+        if (verified_qemud) {
+            if (!tracee_owns_virtual_fd(state, epfd)) {
+                wait_result = -EBADF;
+            } else {
+                struct guest_arm32_epoll_event events[
+                    GUEST_GOLDFISH_TTY_EPOLL_MAX_WATCHES];
+                int ready = guest_goldfish_tty_epoll_collect(
+                    &guest_goldfish_tty_epolls, &guest_sockets,
+                    &guest_goldfish_tty_runtime, state->virtual_fd_table_id,
+                    epfd, maxevents, events);
+                if (ready < 0) {
+                    wait_result = ready;
+                } else if (ready > 0) {
+                    size_t bytes = (size_t)ready * sizeof(events[0]);
+                    wait_result = event_pointer &&
+                        write_remote(pid, event_pointer, events, bytes) == 0
+                        ? ready : -EFAULT;
+                } else {
+                    wait_result = guest_goldfish_tty_epoll_wait_result(
+                        &guest_goldfish_tty_epolls, state->virtual_fd_table_id,
+                        epfd, maxevents, timeout_ms);
+                }
+            }
+        }
         if (wait_result == GUEST_GOLDFISH_TTY_EPOLL_WAIT_PARK) {
             guest_goldfish_tty_runtime.epoll_empty_waits++;
             *fake = 2; /* keep the verified qemud tracee ptrace-stopped: no event exists */
             if (guest_goldfish_tty_diagnostics_emitted < 64u) {
                 guest_goldfish_tty_diagnostics_emitted++;
-                printf("GUEST QEMUD VIRTUAL EPOLL WAIT PARKED: guest-pid=%d executable=%s epfd=%d maxevents=%d timeout=%d watches=%zu result=parked-no-peer; qemud tty input and listener queue are empty, no synthetic bytes/event and no host epoll_wait\n",
+                printf("GUEST QEMUD VIRTUAL EPOLL WAIT PARKED: guest-pid=%d executable=%s epfd=%d maxevents=%d timeout=%d watches=%zu result=parked-no-ready-guest-data; qemud TTY RX/listener/client queues currently empty, ptrace wake enabled for profile-protocol bytes, no host epoll_wait\n",
                        state->guest_pid, state->exec_target, epfd, maxevents, timeout_ms,
                        guest_goldfish_tty_epoll_watch_count(
                            &guest_goldfish_tty_epolls, epfd));
@@ -5218,7 +5581,7 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         virtual_device_count++;
         if (guest_goldfish_tty_diagnostics_emitted < 64u) {
             guest_goldfish_tty_diagnostics_emitted++;
-            printf("GUEST QEMUD VIRTUAL EPOLL WAIT: guest-pid=%d executable=%s epfd=%d maxevents=%d timeout=%d result=%d; no queued peer events, no host epoll_wait\n",
+            printf("GUEST QEMUD VIRTUAL EPOLL WAIT: guest-pid=%d executable=%s epfd=%d maxevents=%d timeout=%d result=%d; guest queue state only, no host epoll_wait\n",
                    state ? state->guest_pid : -1,
                    state ? state->exec_target : "<unknown>", epfd, maxevents,
                    timeout_ms, wait_result);
@@ -5279,6 +5642,10 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
     if (nr == ARM_NR_SENDTO || nr == ARM_NR_RECVFROM) {
         *pending_return = virtual_guest_property_stream_io(pid, regs,
                                                             nr == ARM_NR_RECVFROM);
+        if (*pending_return == GUEST_VSOCKET_READ_PARK) {
+            *fake = 2;
+            return 0;
+        }
         *fake = 1; return 0;
     }
     if (nr == ARM_NR_SEND || nr == ARM_NR_RECV) {
@@ -5286,6 +5653,10 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         if (is_virtual_fd_number(fd)) {
             *pending_return = virtual_guest_socket_stream_io(pid, fd, regs->uregs[1],
                 regs->uregs[2], (int)regs->uregs[3], nr == ARM_NR_RECV);
+            if (*pending_return == GUEST_VSOCKET_READ_PARK) {
+                *fake = 2;
+                return 0;
+            }
             *fake = 1; return 0;
         }
     }
@@ -5366,18 +5737,76 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
             } else if (regs->uregs[2] == 0) {
                 tty_result = 0;
             } else if (nr == ARM_NR_READ) {
-                tty_result = guest_goldfish_tty_read_result(
-                    &guest_goldfish_tty_runtime, fd, entry->nonblocking);
+                size_t amount = regs->uregs[2] > GUEST_GOLDFISH_TTY_RX_CAPACITY
+                    ? GUEST_GOLDFISH_TTY_RX_CAPACITY : (size_t)regs->uregs[2];
+                unsigned char bytes[GUEST_GOLDFISH_TTY_RX_CAPACITY];
+                tty_result = guest_goldfish_tty_rx_peek(
+                    &guest_goldfish_tty_runtime, fd, bytes, amount);
+                if (tty_result == -EAGAIN) {
+                    guest_goldfish_tty_runtime.empty_reads++;
+                    tty_result = entry->nonblocking ? -EAGAIN :
+                        GUEST_GOLDFISH_TTY_READ_PARK;
+                } else if (tty_result > 0) {
+                    if (write_remote(pid, regs->uregs[1], bytes,
+                                     (size_t)tty_result) != 0) {
+                        tty_result = -EFAULT;
+                    } else if (guest_goldfish_tty_rx_consume(
+                            &guest_goldfish_tty_runtime, fd,
+                            (size_t)tty_result) != 0) {
+                        tty_result = -EIO;
+                    }
+                }
             } else {
-                tty_result = guest_goldfish_tty_write_result(
-                    &guest_goldfish_tty_runtime, fd, regs->uregs[2]);
+                size_t amount = regs->uregs[2] > GUEST_QEMUD_PEER_MAX_FRAME_PAYLOAD
+                    ? GUEST_QEMUD_PEER_MAX_FRAME_PAYLOAD : (size_t)regs->uregs[2];
+                unsigned char bytes[GUEST_QEMUD_PEER_MAX_FRAME_PAYLOAD];
+                if (!regs->uregs[1] || read_remote(pid, regs->uregs[1], bytes,
+                                                   amount) != 0) {
+                    tty_result = -EFAULT;
+                } else {
+                    unsigned long prior_connects =
+                        guest_qemud_peer_runtime.control_connects;
+                    unsigned long prior_lists =
+                        guest_qemud_peer_runtime.service_list_requests;
+                    int peer_result = guest_qemud_peer_feed_serial(
+                        &guest_qemud_peer_runtime, &guest_goldfish_tty_runtime,
+                        bytes, amount);
+                    tty_result = peer_result == 0
+                        ? guest_goldfish_tty_peer_write_result(
+                            &guest_goldfish_tty_runtime, fd, amount)
+                        : peer_result;
+                    if (tty_result > 0) {
+                        (void)wake_parked_qemud_reads();
+                        (void)wake_parked_qemud_epolls();
+                    }
+                    if (guest_qemud_peer_diagnostics_emitted < 64u &&
+                        guest_qemud_peer_runtime.control_connects > prior_connects) {
+                        guest_qemud_peer_diagnostics_emitted++;
+                        printf("GUEST QEMUD PEER CONTROL CONNECT: guest-pid=%d requested-channel=%u boot-properties-connected=%u profile-density=%u result=%d; exact API10 control framing, source-backed service only\n",
+                               state->guest_pid,
+                               guest_qemud_peer_runtime.channel_id,
+                               guest_qemud_peer_runtime.boot_properties_connected,
+                               guest_qemud_peer_runtime.profile_density,
+                               peer_result);
+                    }
+                    if (guest_qemud_peer_diagnostics_emitted < 64u &&
+                        guest_qemud_peer_runtime.service_list_requests > prior_lists) {
+                        guest_qemud_peer_diagnostics_emitted++;
+                        printf("GUEST QEMUD PEER BOOT-PROPERTIES LIST: guest-pid=%d channel=%u records=%lu terminators=%lu profile-density=%u; no AVD/user/shared-network values supplied\n",
+                               state->guest_pid,
+                               guest_qemud_peer_runtime.channel_id,
+                               guest_qemud_peer_runtime.property_records_sent,
+                               guest_qemud_peer_runtime.terminators_sent,
+                               guest_qemud_peer_runtime.profile_density);
+                    }
+                }
             }
             virtual_device_count++;
             if (tty_result == GUEST_GOLDFISH_TTY_READ_PARK) {
                 *fake = 2;
                 if (guest_goldfish_tty_diagnostics_emitted < 64u) {
                     guest_goldfish_tty_diagnostics_emitted++;
-                    printf("GUEST GOLDFISH TTY READ PARKED: guest-pid=%d fd=%d count=%u nonblocking=%d result=parked-no-peer; no bytes fabricated and no host read\n",
+                    printf("GUEST GOLDFISH TTY READ PARKED: guest-pid=%d fd=%d count=%u nonblocking=%d result=parked-empty-guest-peer-queue; ptrace wake occurs when a source-backed peer frame is queued, no host read\n",
                            state->guest_pid, fd, regs->uregs[2],
                            entry->nonblocking);
                 }
@@ -5387,11 +5816,13 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
             *fake = 1;
             if (guest_goldfish_tty_diagnostics_emitted < 64u) {
                 guest_goldfish_tty_diagnostics_emitted++;
-                printf("GUEST GOLDFISH TTY IO: guest-pid=%d executable=%s fd=%d operation=%s count=%u nonblocking=%d result=%d; no serial peer modeled, no host read/write\n",
+                printf("GUEST GOLDFISH TTY IO: guest-pid=%d executable=%s fd=%d operation=%s count=%u nonblocking=%d result=%d rx-queued=%zu peer-attached=%u; app-private API10 peer queue only, no host tty/read/write\n",
                        state ? state->guest_pid : -1,
                        state ? state->exec_target : "<unknown>", fd,
                        nr == ARM_NR_READ ? "read" : "write", regs->uregs[2],
-                       entry->nonblocking, tty_result);
+                       entry->nonblocking, tty_result,
+                       guest_goldfish_tty_runtime.rx_length,
+                       guest_goldfish_tty_runtime.peer_attached);
             }
             return 0;
         } else if (entry && entry->kind == VIRTUAL_FD_DEV_BINDER) {
@@ -5405,6 +5836,10 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
         else
             *pending_return = virtual_guest_socket_stream_io(pid, fd,
                 regs->uregs[1], regs->uregs[2], 0, nr == ARM_NR_READ);
+        if (*pending_return == GUEST_VSOCKET_READ_PARK) {
+            *fake = 2;
+            return 0;
+        }
         *fake = 1; return 0;
     }
     if ((nr == ARM_NR_FCNTL || nr == ARM_NR_FCNTL64) &&
@@ -6068,7 +6503,7 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                            state->guest_pid, state->exec_target);
             } else if (strcmp(state->exec_target, "/system/bin/qemu-props") == 0) {
                 guest_qemu_props_exec_count++;
-                printf("GUEST EMULATOR SERVICE EXEC: guest-pid=%d service=qemu-props target=%s linker-entry follows; boot-properties require the external emulator pipe protocol, not host substitution\n",
+                printf("GUEST EMULATOR SERVICE EXEC: guest-pid=%d service=qemu-props target=%s linker-entry follows; only exact boot-properties list from the app-private synthetic WVGA800 profile is modeled, no host emulator\n",
                        state->guest_pid, state->exec_target);
             }
             successful_guest_execs++;
@@ -6618,9 +7053,16 @@ int main(int argc, char **argv) {
     (void)setvbuf(stdout, NULL, _IOLBF, 0);
     guest_vsocket_table_init(&guest_sockets);
     guest_goldfish_tty_runtime_init(&guest_goldfish_tty_runtime);
+    guest_qemud_peer_runtime_init(&guest_qemud_peer_runtime,
+                                  GUEST_PROFILE_DISPLAY_DENSITY_DPI);
     guest_goldfish_tty_epoll_table_init(&guest_goldfish_tty_epolls);
     guest_qemud_socket_bind_count = 0;
     guest_goldfish_tty_diagnostics_emitted = 0;
+    guest_qemud_peer_diagnostics_emitted = 0;
+    guest_qemud_client_connect_count = 0;
+    guest_qemud_client_accept_count = 0;
+    guest_qemud_socket_stream_bytes = 0;
+    guest_qemud_socket_stream_errors = 0;
     guest_null_stdio_runtime_init(&guest_null_stdio_runtime);
     guest_null_stdio_diagnostics_emitted = 0;
     guest_ueventd_exec_image_validated_count = 0;
@@ -6895,7 +7337,7 @@ int main(int argc, char **argv) {
            coldboot_marker_runtime.last_lstat_observed &&
                coldboot_marker_runtime.last_lstat_result == 0
                    ? (long long)coldboot_marker_runtime.last_lstat.st_size : 0ll);
-    printf("GUEST GOLDFISH TTY SUMMARY: profile=synthetic dev=%u:0-%u qemud=/dev/ttyS1 qemud-service-binds=%lu listener-fd=%d synthetic-dev=%u:%u events=%lu event-mask=0x%02x mknod-attempts=%lu nodes-created=%lu node-mask=0x%02x opens=%lu tty-open=%d TCGETS=%lu TCSETS=%lu empty-reads=%lu writes-without-peer=%lu epoll-create-attempts=%lu epoll-ctl=%lu empty-waits=%lu unsupported=%lu diagnostics-emitted=%u; Goldfish runtime major is unknown/not claimed; no serial peer/data or emulator reply is modeled; host tty/mknod/epoll calls=0\n",
+    printf("GUEST GOLDFISH TTY SUMMARY: profile=synthetic dev=%u:0-%u qemud=/dev/ttyS1 qemud-service-binds=%lu listener-fd=%d synthetic-dev=%u:%u events=%lu event-mask=0x%02x mknod-attempts=%lu nodes-created=%lu node-mask=0x%02x opens=%lu tty-open=%d peer-attached=%u rx-queued=%zu peer-read-bytes=%lu peer-write-bytes=%lu TCGETS=%lu TCSETS=%lu empty-reads=%lu writes-without-peer=%lu epoll-create-attempts=%lu epoll-ctl=%lu empty-waits=%lu unsupported=%lu diagnostics-emitted=%u; Goldfish runtime major unknown/not claimed; only the source-backed synthetic API10 peer subset is modeled; no host tty/QEMU/epoll calls\n",
            GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR,
            GUEST_GOLDFISH_TTY_LINE_COUNT - 1u,
            guest_qemud_socket_bind_count,
@@ -6909,6 +7351,10 @@ int main(int argc, char **argv) {
            guest_goldfish_tty_runtime.node_mask,
            guest_goldfish_tty_runtime.open_attempts,
            guest_goldfish_tty_runtime.tty_fd >= 0,
+           guest_goldfish_tty_runtime.peer_attached,
+           guest_goldfish_tty_runtime.rx_length,
+           guest_goldfish_tty_runtime.peer_read_bytes,
+           guest_goldfish_tty_runtime.peer_write_bytes,
            guest_goldfish_tty_runtime.ioctl_gets,
            guest_goldfish_tty_runtime.ioctl_sets,
            guest_goldfish_tty_runtime.empty_reads,
@@ -6918,9 +7364,26 @@ int main(int argc, char **argv) {
            guest_goldfish_tty_runtime.epoll_empty_waits,
            guest_goldfish_tty_runtime.unsupported,
            guest_goldfish_tty_diagnostics_emitted);
-    printf("VIRTUAL PROPERTY STREAM SUMMARY: ARM sendto=%lu bytes=%lu recvfrom=%lu bytes=%lu errors=%lu diagnostics-emitted=%lu (limit=64); fixed API10 setprop request size=128 bytes; sendto/recvfrom supported only with flags=0 and NULL address outputs/inputs\n",
+    printf("GUEST QEMUD PEER SUMMARY: synthetic-profile=WVGA800 density=%u profile-value=qemu.sf.lcd_density=240 connected=%u channel=%u control-connects=%lu control-disconnects=%lu serial-frames=%lu property-list-requests=%lu records=%lu terminators=%lu ignored=%lu malformed=%lu local-clients=%lu accepted=%lu socket-stream-bytes=%lu stream-errors=%lu; never claims real QEMU/Goldfish runtime, no AVD/user/shared-network data\n",
+           guest_qemud_peer_runtime.profile_density,
+           guest_qemud_peer_runtime.boot_properties_connected,
+           guest_qemud_peer_runtime.channel_id,
+           guest_qemud_peer_runtime.control_connects,
+           guest_qemud_peer_runtime.control_disconnects,
+           guest_qemud_peer_runtime.serial_frames_received,
+           guest_qemud_peer_runtime.service_list_requests,
+           guest_qemud_peer_runtime.property_records_sent,
+           guest_qemud_peer_runtime.terminators_sent,
+           guest_qemud_peer_runtime.ignored_frames,
+           guest_qemud_peer_runtime.malformed_frames,
+           guest_qemud_client_connect_count,
+           guest_qemud_client_accept_count,
+           guest_qemud_socket_stream_bytes,
+           guest_qemud_socket_stream_errors);
+    printf("VIRTUAL PROPERTY STREAM SUMMARY: ARM sendto=%lu bytes=%lu recvfrom=%lu bytes=%lu accepted-blocking-reads-parked=%lu woken=%lu errors=%lu diagnostics-emitted=%lu (limit=64); fixed API10 setprop request size=128 bytes; empty blocking reads park only for verified PID1 property-service accepted streams, no host socket wait\n",
            virtual_property_sendto_count, virtual_property_sendto_bytes,
            virtual_property_recvfrom_count, virtual_property_recvfrom_bytes,
+           virtual_property_reads_parked, virtual_property_reads_woken,
            virtual_property_stream_errors, virtual_property_stream_diagnostics);
     printf("GUEST FB0 OUTPUT SUMMARY: backend-ready=%d graphics-uevent-received=%d node-created=%d opens=%lu ioctls=%lu mmap2=%lu page-flips=%lu software-base-update-acks=%lu; channel-ready=%d frames-published=%lu; producer bytes come only from guest MAP_SHARED backing; Binder/SurfaceFlinger/framework/desktop remain unproven\n",
            guest_fb0_backend_ready, guest_fb0_graphics_uevent_received,

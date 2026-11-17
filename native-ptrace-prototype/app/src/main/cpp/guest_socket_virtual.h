@@ -29,6 +29,7 @@
 #define GUEST_VSOCKET_POLLOUT 0x0004
 #define GUEST_VSOCKET_POLLHUP 0x0010
 #define GUEST_VSOCKET_POLLNVAL 0x0020
+#define GUEST_VSOCKET_READ_PARK INT32_MIN
 
 /* These are guest descriptor kinds, not host kernel socket objects. */
 enum virtual_fd_kind {
@@ -49,11 +50,14 @@ enum virtual_fd_kind {
     VIRTUAL_FD_DEV_TTY = 14,
     VIRTUAL_FD_EPOLL = 15,
     VIRTUAL_FD_QEMUD_LISTENER = 16,
+    VIRTUAL_FD_QEMUD_CLIENT = 17,
+    VIRTUAL_FD_QEMUD_ACCEPTED = 18,
 };
 
 enum guest_vsocket_channel_kind {
     GUEST_VSOCKET_CHANNEL_PROPERTY = 1,
     GUEST_VSOCKET_CHANNEL_SIGNAL = 2,
+    GUEST_VSOCKET_CHANNEL_QEMUD = 3,
 };
 
 struct guest_vsocket_fd {
@@ -95,6 +99,8 @@ struct guest_vsocket_table {
     unsigned long listening;
     unsigned long connected;
     unsigned long accepted;
+    unsigned long qemud_connected;
+    unsigned long qemud_accepted;
     unsigned long sent_bytes;
     unsigned long received_bytes;
     unsigned long poll_readable;
@@ -391,12 +397,63 @@ static inline int guest_vsocket_connect(struct guest_vsocket_table *table,
     return 0;
 }
 
+/* qemu-props is the only allowed local qemud client. The caller must verify
+ * its API10 ELF and init.goldfish.sh ancestry before entering this helper. */
+static inline int guest_vsocket_qemud_connect(struct guest_vsocket_table *table,
+                                               int fd, uint32_t family,
+                                               const char *path,
+                                               int32_t guest_pid,
+                                               int32_t guest_uid,
+                                               int32_t guest_gid) {
+    struct guest_vsocket_fd *client = guest_vsocket_fd_get(table, fd);
+    if (!client) return -EBADF;
+    if (client->kind != VIRTUAL_FD_PROPERTY || client->bound || client->channel >= 0)
+        return -EINVAL;
+    if (family != GUEST_VSOCKET_AF_UNIX) return -EAFNOSUPPORT;
+    if (!guest_vsocket_path_is_qemud_service(path)) return -EACCES;
+    struct guest_vsocket_fd *listener =
+        guest_vsocket_fd_get(table, table->qemud_listener_fd);
+    if (!listener || !listener->listening) return -ECONNREFUSED;
+    int channel_index = guest_vsocket_channel_alloc(table, GUEST_VSOCKET_CHANNEL_QEMUD);
+    if (channel_index < 0) return channel_index;
+    struct guest_vsocket_channel *channel = &table->channels[channel_index];
+    channel->fd[0] = fd;
+    channel->listener_fd = table->qemud_listener_fd;
+    channel->pending = 1;
+    channel->peer_pid = guest_pid;
+    channel->peer_uid = guest_uid;
+    channel->peer_gid = guest_gid;
+    client->kind = VIRTUAL_FD_QEMUD_CLIENT;
+    client->channel = channel_index;
+    client->side = 0;
+    table->qemud_connected++;
+    table->connected++;
+    return 0;
+}
+
 static inline int guest_vsocket_accept(struct guest_vsocket_table *table, int fd) {
     struct guest_vsocket_fd *listener = guest_vsocket_fd_get(table, fd);
     if (!listener) return -EBADF;
     if (listener->kind == VIRTUAL_FD_QEMUD_LISTENER && listener->listening &&
-        table->qemud_listener_fd == fd)
-        return -EAGAIN; /* no qemud client peer is synthesized */
+        table->qemud_listener_fd == fd) {
+        for (size_t i = 0; i < GUEST_VSOCKET_MAX_CHANNELS; ++i) {
+            struct guest_vsocket_channel *channel = &table->channels[i];
+            if (!channel->allocated || channel->kind != GUEST_VSOCKET_CHANNEL_QEMUD ||
+                channel->listener_fd != fd || !channel->pending || channel->fd[0] < 0)
+                continue;
+            int accepted_fd = guest_vsocket_alloc_fd(table, VIRTUAL_FD_QEMUD_ACCEPTED);
+            if (accepted_fd < 0) return accepted_fd;
+            channel->fd[1] = accepted_fd;
+            channel->pending = 0;
+            struct guest_vsocket_fd *accepted = guest_vsocket_fd_get(table, accepted_fd);
+            accepted->channel = (int)i;
+            accepted->side = 1;
+            table->qemud_accepted++;
+            table->accepted++;
+            return accepted_fd;
+        }
+        return -EAGAIN;
+    }
     if (listener->kind != VIRTUAL_FD_PROPERTY || !listener->listening ||
         table->property_listener_fd != fd) return -EINVAL;
     for (size_t i = 0; i < GUEST_VSOCKET_MAX_CHANNELS; ++i) {
@@ -437,11 +494,19 @@ static inline int guest_vsocket_send(struct guest_vsocket_table *table, int fd,
     if (flags != 0) return -EOPNOTSUPP;
     if (!data && length) return -EFAULT;
     if (entry->kind != VIRTUAL_FD_PROPERTY &&
-        entry->kind != VIRTUAL_FD_PROPERTY_ACCEPTED && entry->kind != VIRTUAL_FD_SIGNAL)
+        entry->kind != VIRTUAL_FD_PROPERTY_ACCEPTED &&
+        entry->kind != VIRTUAL_FD_QEMUD_CLIENT &&
+        entry->kind != VIRTUAL_FD_QEMUD_ACCEPTED && entry->kind != VIRTUAL_FD_SIGNAL)
         return -ENOTCONN;
     if (length == 0) return 0;
     struct guest_vsocket_channel *channel = guest_vsocket_channel_get(table, entry->channel);
     if (!channel) return -ENOTCONN;
+    if ((entry->kind == VIRTUAL_FD_QEMUD_CLIENT ||
+         entry->kind == VIRTUAL_FD_QEMUD_ACCEPTED) &&
+        channel->kind != GUEST_VSOCKET_CHANNEL_QEMUD) return -ENOTCONN;
+    if ((entry->kind == VIRTUAL_FD_PROPERTY ||
+         entry->kind == VIRTUAL_FD_PROPERTY_ACCEPTED) &&
+        channel->kind != GUEST_VSOCKET_CHANNEL_PROPERTY) return -ENOTCONN;
     int side = entry->side;
     int peer = 1 - side;
     if (channel->closed[side]) return -EBADF;
@@ -462,11 +527,19 @@ static inline int guest_vsocket_peek(struct guest_vsocket_table *table, int fd,
     if (flags != 0) return -EOPNOTSUPP;
     if (!out && length) return -EFAULT;
     if (entry->kind != VIRTUAL_FD_PROPERTY &&
-        entry->kind != VIRTUAL_FD_PROPERTY_ACCEPTED && entry->kind != VIRTUAL_FD_SIGNAL)
+        entry->kind != VIRTUAL_FD_PROPERTY_ACCEPTED &&
+        entry->kind != VIRTUAL_FD_QEMUD_CLIENT &&
+        entry->kind != VIRTUAL_FD_QEMUD_ACCEPTED && entry->kind != VIRTUAL_FD_SIGNAL)
         return -ENOTCONN;
     if (length == 0) return 0;
     struct guest_vsocket_channel *channel = guest_vsocket_channel_get(table, entry->channel);
     if (!channel) return -ENOTCONN;
+    if ((entry->kind == VIRTUAL_FD_QEMUD_CLIENT ||
+         entry->kind == VIRTUAL_FD_QEMUD_ACCEPTED) &&
+        channel->kind != GUEST_VSOCKET_CHANNEL_QEMUD) return -ENOTCONN;
+    if ((entry->kind == VIRTUAL_FD_PROPERTY ||
+         entry->kind == VIRTUAL_FD_PROPERTY_ACCEPTED) &&
+        channel->kind != GUEST_VSOCKET_CHANNEL_PROPERTY) return -ENOTCONN;
     int side = entry->side;
     if (channel->closed[side]) return -EBADF;
     size_t available = channel->data_len[side];
@@ -569,8 +642,16 @@ static inline int guest_vsocket_poll_events(struct guest_vsocket_table *table,
         }
         return 0;
     }
-    if (entry->kind == VIRTUAL_FD_QEMUD_LISTENER && entry->listening) return 0;
-    if (entry->kind == VIRTUAL_FD_DEV_TTY) return 0; /* no serial input peer */
+    if (entry->kind == VIRTUAL_FD_QEMUD_LISTENER && entry->listening) {
+        for (size_t i = 0; i < GUEST_VSOCKET_MAX_CHANNELS; ++i) {
+            struct guest_vsocket_channel *channel = &table->channels[i];
+            if (channel->allocated && channel->kind == GUEST_VSOCKET_CHANNEL_QEMUD &&
+                channel->listener_fd == fd && channel->pending && channel->fd[0] >= 0)
+                return (events & GUEST_VSOCKET_POLLIN) ? GUEST_VSOCKET_POLLIN : 0;
+        }
+        return 0;
+    }
+    if (entry->kind == VIRTUAL_FD_DEV_TTY) return 0; /* TTY RX readiness is handled by its runtime. */
     struct guest_vsocket_channel *channel = guest_vsocket_channel_get(table, entry->channel);
     if (!channel) return 0;
     int side = entry->side;
@@ -617,6 +698,10 @@ static inline int guest_vsocket_close_fd(struct guest_vsocket_table *table, int 
     if (channel_index >= 0) {
         struct guest_vsocket_channel *channel = guest_vsocket_channel_get(table, channel_index);
         if (channel) {
+            if (side == 0 && channel->pending) {
+                channel->pending = 0;
+                channel->closed[1] = 1;
+            }
             channel->closed[side] = 1;
             channel->fd[side] = -1;
         }
@@ -631,7 +716,18 @@ static inline int guest_vsocket_close_fd(struct guest_vsocket_table *table, int 
             channel->closed[1] = 1;
         }
     }
-    if (table->qemud_listener_fd == fd) table->qemud_listener_fd = -1;
+    if (table->qemud_listener_fd == fd) {
+        table->qemud_listener_fd = -1;
+        for (size_t i = 0; i < GUEST_VSOCKET_MAX_CHANNELS; ++i) {
+            struct guest_vsocket_channel *channel = &table->channels[i];
+            if (!channel->allocated || channel->listener_fd != fd) continue;
+            if (channel->pending) {
+                channel->pending = 0;
+                channel->closed[1] = 1;
+            }
+            channel->listener_fd = -1;
+        }
+    }
     memset(entry, 0, sizeof(*entry));
     entry->fd = fd;
     entry->channel = -1;

@@ -80,6 +80,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_socket_virtual_test.c" -o "$TMP/guest_socket_virtual_test"
 "$TMP/guest_socket_virtual_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_qemud_peer_virtual_test.c" -o "$TMP/guest_qemud_peer_virtual_test"
+"$TMP/guest_qemud_peer_virtual_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_socket_path_ops_test.c" -o "$TMP/guest_socket_path_ops_test"
 "$TMP/guest_socket_path_ops_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -163,6 +166,8 @@ script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
 profile = Path(sys.argv[1]).with_name('guest_hardware_profile.h').read_text()
 qemud_diagnostics = Path(sys.argv[1]).with_name('guest_qemud_diagnostics.h').read_text()
 qemud_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_qemud_diagnostics_test.c').read_text()
+qemud_peer_model = Path(sys.argv[1]).with_name('guest_qemud_peer_virtual.h').read_text()
+qemud_peer_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_qemud_peer_virtual_test.c').read_text()
 tty_model = Path(sys.argv[1]).with_name('guest_goldfish_tty_virtual.h').read_text()
 tty_fs = Path(sys.argv[1]).with_name('guest_goldfish_tty_fs.h').read_text()
 tty_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_goldfish_tty_regression.c').read_text()
@@ -279,7 +284,7 @@ assert '#define ARM_NR_SENDTO 290' in src and '#define ARM_NR_RECVFROM 292' in s
 assert 'virtual_guest_property_stream_io' in src and 'VIRTUAL PROPERTY STREAM SYSCALL:' in src
 assert 'VIRTUAL PROPERTY STREAM SUMMARY:' in src and 'app-private connected AF_UNIX stream only' in src
 assert 'ET_EXEC-e_entry-PC-hits=%lu (app_process=%lu ueventd=%lu other=%lu)' in src
-assert 'ARM sendto=%lu bytes=%lu recvfrom=%lu bytes=%lu errors=%lu' in src
+assert 'ARM sendto=%lu bytes=%lu recvfrom=%lu bytes=%lu accepted-blocking-reads-parked=%lu woken=%lu errors=%lu' in src
 assert 'host AF_UNIX socket/socketpair/bind/connect/listen/accept/setsockopt/getsockopt/send/recv/sendto/recvfrom calls=0' in src
 assert 'VIRTUAL SIGNAL SOCKETPAIR:' in src and 'VIRTUAL GUEST SOCKET IO:' in src
 assert 'endpoint=%s direction=%s' in src and 'sigchld-socketpair' in src
@@ -449,8 +454,37 @@ assert 'guest_goldfish_tty_epoll_remove_watched_fd' in src
 assert 'GUEST QEMUD VIRTUAL EPOLL WAIT PARKED:' in src
 assert 'GUEST GOLDFISH TTY SUMMARY:' in src
 assert 'guest-software-blocked-epoll-wait' in src
-assert 'no serial peer/data or emulator reply is modeled' in src
-assert 'guest_goldfish_tty_read_result' in src and 'guest_goldfish_tty_write_result' in src
+assert 'no host tty/QEMU/epoll calls' in src
+assert 'guest_qemud_client_actor_authorized(&identity)' in src
+assert 'candidate->alive && !candidate->is_thread' in src
+assert 'guest_qemud_peer_feed_serial' in src and 'wake_parked_qemud_epolls()' in src
+assert 'wake_parked_qemud_reads()' in src and 'peer-attached=%u' in src
+assert 'wake_parked_property_reads()' in src
+assert 'GUEST PROPERTY SERVICE RECV PARKED:' in src
+assert 'GUEST PROPERTY SERVICE RECV WAKE:' in src
+assert 'result=parked-empty-blocking-recv' in src
+assert 'accepted-blocking-reads-parked=%lu woken=%lu' in src
+assert 'GUEST QEMUD PEER CONTROL CONNECT:' in src
+assert 'GUEST QEMUD PEER BOOT-PROPERTIES LIST:' in src
+assert 'GUEST QEMUD PEER SUMMARY:' in src
+assert 'GUEST_QEMUD_PEER_BOOT_PROPERTY' in qemud_peer_model
+assert 'guest_qemud_peer_parse_connect' in qemud_peer_model
+assert 'guest_qemud_peer_send_service_record' in qemud_peer_model
+assert 'static const uint8_t terminator[] = {0u}' in qemud_peer_model
+assert 'record[0] == 0u' in qemud_peer_model
+assert 'guest_qemud_peer_reset_connection' in src
+assert 'test_qemu_props_lineage_is_exact_and_fail_closed' in qemud_peer_test
+assert 'test_control_and_boot_properties_framing' in qemud_peer_test
+assert 'test_qemud_connect_accept_stream_and_epoll_edges' in qemud_peer_test
+assert 'test_pending_qemud_client_gets_eof_on_listener_close' in qemud_peer_test
+assert 'test_unaccepted_qemud_client_close_releases_channel' in qemud_peer_test
+assert 'test_response_backpressure_is_atomic' in qemud_peer_test
+assert 'test_boot_properties_to_api10_property_set_wire_request' in qemud_peer_test
+assert '0001\\0' in qemud_peer_test
+assert 'guest_vsocket_sendto' in qemud_peer_test and 'GUEST_API10_PROP_MSG_SETPROP' in qemud_peer_test
+assert 'not a device boot claim' in qemud_peer_test
+assert 'guest_goldfish_tty_rx_peek' in src and 'guest_goldfish_tty_rx_consume' in src
+assert 'guest_goldfish_tty_peer_write_result' in src
 assert 'GUEST GOLDFISH TTY IOCTL:' in src and 'GUEST_GOLDFISH_TTY_TCGETS' in src
 assert 'GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR 240u' in tty_model
 assert 'this is not the Goldfish runtime major' in tty_model
@@ -1023,17 +1057,17 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'Build GingerVM v0.6.33 test-signed Android APK' in workflow
-assert 'gingervm-continuous-trace-v0.6.33-test-signed-apk' in upload
-assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.33-apk.sha256"' in workflow
-assert '${{ runner.temp }}/gingervm-v0.6.33-apk.sha256' in upload
+assert 'Build GingerVM v0.6.34 test-signed Android APK' in workflow
+assert 'gingervm-continuous-trace-v0.6.34-test-signed-apk' in upload
+assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.34-apk.sha256"' in workflow
+assert '${{ runner.temp }}/gingervm-v0.6.34-apk.sha256' in upload
 assert '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 42" in gradle and "versionName '0.6.33'" in gradle
+assert "versionCode 43" in gradle and "versionName '0.6.34'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.33' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.34' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

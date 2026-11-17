@@ -244,6 +244,6 @@ if [[ -x "$AAPT" ]]; then
   "$AAPT" dump badging "$APK" > "$TMP/badging"
   grep -Fq "native-code: 'arm64-v8a'" "$TMP/badging"
   grep -Fq "alt-native-code: 'armeabi-v7a'" "$TMP/badging"
-  grep -Fq "versionName='0.6.33'" "$TMP/badging"
+  grep -Fq "versionName='0.6.34'" "$TMP/badging"
 fi
 printf '%s\n' 'Native ABI metadata regression: PASS (arm64-v8a supervisor + armeabi-v7a original userland; extracted libraries required).'

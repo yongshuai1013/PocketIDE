@@ -305,6 +305,6 @@ int main(int argc, char **argv) {
     make_dir(base);
     test_event_mknod_open_termios_epoll_lifecycle(base);
     test_symlinked_node_and_outside_containment(base);
-    puts("Goldfish ttyS1 uevent/mknod/open/termios/epoll regression: PASS (synthetic 240:1 explicitly guest-only; no host tty, epoll or device node used; no peer bytes/replies fabricated)");
+    puts("Goldfish ttyS1 uevent/mknod/open/termios/epoll regression: PASS (synthetic 240:1 guest-only; this TTY-only fixture adds no peer bytes; source-backed synthetic replies are tested separately; no host tty, epoll or device node)");
     return 0;
 }

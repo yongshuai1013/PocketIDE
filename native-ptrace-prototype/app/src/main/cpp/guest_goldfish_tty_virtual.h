@@ -37,7 +37,9 @@
 #define GUEST_GOLDFISH_TTY_EPOLL_CTL_DEL 2
 #define GUEST_GOLDFISH_TTY_EPOLL_CTL_MOD 3
 #define GUEST_GOLDFISH_TTY_EPOLLIN 0x00000001u
+#define GUEST_GOLDFISH_TTY_EPOLLHUP 0x00000010u
 #define GUEST_GOLDFISH_TTY_EPOLLET 0x80000000u
+#define GUEST_GOLDFISH_TTY_RX_CAPACITY 4096u
 #define GUEST_GOLDFISH_TTY_READ_PARK INT32_MIN
 #define GUEST_GOLDFISH_TTY_EPOLL_WAIT_PARK INT32_MIN
 
@@ -73,7 +75,10 @@ enum guest_goldfish_tty_epoll_status {
 struct guest_goldfish_tty_runtime {
     uint8_t uevent_mask;
     uint8_t node_mask;
+    uint8_t peer_attached;
     int tty_fd;
+    uint8_t rx[GUEST_GOLDFISH_TTY_RX_CAPACITY];
+    size_t rx_length;
     struct guest_arm32_termios termios[GUEST_GOLDFISH_TTY_LINE_COUNT];
     unsigned long events_received;
     unsigned long mknod_attempts;
@@ -83,6 +88,10 @@ struct guest_goldfish_tty_runtime {
     unsigned long ioctl_sets;
     unsigned long empty_reads;
     unsigned long writes_without_peer;
+    unsigned long peer_write_calls;
+    unsigned long peer_write_bytes;
+    unsigned long peer_read_bytes;
+    unsigned long rx_overflows;
     unsigned long epoll_creates;
     unsigned long epoll_controls;
     unsigned long epoll_empty_waits;
@@ -94,6 +103,7 @@ struct guest_goldfish_tty_epoll_watch {
     int fd;
     uint32_t events;
     uint64_t data;
+    uint8_t last_ready;
 };
 
 struct guest_goldfish_tty_epoll_instance {
@@ -310,10 +320,89 @@ static inline int guest_goldfish_tty_note_open(struct guest_goldfish_tty_runtime
     return 0;
 }
 
+static inline int guest_goldfish_tty_note_peer_attached(
+        struct guest_goldfish_tty_runtime *runtime, int fd) {
+    if (!runtime || runtime->tty_fd != fd) return -EBADF;
+    runtime->peer_attached = 1u;
+    return 0;
+}
+
+static inline int guest_goldfish_tty_write_result(
+        struct guest_goldfish_tty_runtime *runtime, int fd, size_t length);
+
+static inline int guest_goldfish_tty_rx_enqueue(
+        struct guest_goldfish_tty_runtime *runtime,
+        const void *bytes, size_t length) {
+    if (!runtime || (!bytes && length)) return -EINVAL;
+    if (runtime->tty_fd < 0 || !runtime->peer_attached) return -ENOTCONN;
+    if (length > GUEST_GOLDFISH_TTY_RX_CAPACITY - runtime->rx_length) {
+        runtime->rx_overflows++;
+        return -ENOBUFS;
+    }
+    if (length) memcpy(runtime->rx + runtime->rx_length, bytes, length);
+    runtime->rx_length += length;
+    return 0;
+}
+
+static inline size_t guest_goldfish_tty_rx_available(
+        const struct guest_goldfish_tty_runtime *runtime) {
+    if (!runtime || runtime->rx_length > GUEST_GOLDFISH_TTY_RX_CAPACITY) return 0u;
+    return GUEST_GOLDFISH_TTY_RX_CAPACITY - runtime->rx_length;
+}
+
+static inline int guest_goldfish_tty_rx_peek(
+        struct guest_goldfish_tty_runtime *runtime, int fd,
+        void *out, size_t length) {
+    if (!runtime || fd != runtime->tty_fd) return -EBADF;
+    if (length == 0u) return 0;
+    if (!out) return -EFAULT;
+    if (runtime->rx_length == 0u) return -EAGAIN;
+    size_t copied = length < runtime->rx_length ? length : runtime->rx_length;
+    memcpy(out, runtime->rx, copied);
+    return (int)copied;
+}
+
+static inline int guest_goldfish_tty_rx_consume(
+        struct guest_goldfish_tty_runtime *runtime, int fd, size_t length) {
+    if (!runtime || fd != runtime->tty_fd) return -EBADF;
+    if (length > runtime->rx_length) return -EINVAL;
+    runtime->rx_length -= length;
+    if (length) memmove(runtime->rx, runtime->rx + length, runtime->rx_length);
+    runtime->peer_read_bytes += length;
+    return 0;
+}
+
+static inline int guest_goldfish_tty_read_bytes(
+        struct guest_goldfish_tty_runtime *runtime, int fd,
+        void *out, size_t length, int nonblocking) {
+    if (!runtime || fd != runtime->tty_fd) return -EBADF;
+    int rc = guest_goldfish_tty_rx_peek(runtime, fd, out, length);
+    if (rc == -EAGAIN) {
+        runtime->empty_reads++;
+        return nonblocking ? -EAGAIN : GUEST_GOLDFISH_TTY_READ_PARK;
+    }
+    if (rc <= 0) return rc;
+    int consume = guest_goldfish_tty_rx_consume(runtime, fd, (size_t)rc);
+    return consume == 0 ? rc : consume;
+}
+
+static inline int guest_goldfish_tty_peer_write_result(
+        struct guest_goldfish_tty_runtime *runtime, int fd, size_t length) {
+    if (!runtime || fd != runtime->tty_fd) return -EBADF;
+    if (length == 0u) return 0;
+    if (!runtime->peer_attached) return guest_goldfish_tty_write_result(runtime, fd, length);
+    if (length > (size_t)INT32_MAX) return -EINVAL;
+    runtime->peer_write_calls++;
+    runtime->peer_write_bytes += length;
+    return (int)length;
+}
+
 static inline int guest_goldfish_tty_note_close(struct guest_goldfish_tty_runtime *runtime,
                                                int fd) {
     if (!runtime || runtime->tty_fd != fd) return -EBADF;
     runtime->tty_fd = -1;
+    runtime->peer_attached = 0u;
+    runtime->rx_length = 0u;
     return 0;
 }
 
@@ -351,12 +440,15 @@ static inline int guest_goldfish_tty_write_result(
     if (!runtime || fd != runtime->tty_fd) return -EBADF;
     if (length == 0u) return 0;
     runtime->writes_without_peer++;
-    return -EOPNOTSUPP; /* no Goldfish MMIO/QEMU serial peer is being emulated */
+    return -EOPNOTSUPP; /* fail closed unless the verified profile peer is attached */
 }
 
-static inline int guest_goldfish_tty_poll_events(int fd, int tty_fd, int16_t events) {
-    (void)events;
-    return fd == tty_fd ? 0 : GUEST_VSOCKET_POLLNVAL;
+static inline int guest_goldfish_tty_poll_events(
+        const struct guest_goldfish_tty_runtime *runtime, int fd,
+        int16_t events) {
+    if (!runtime || fd != runtime->tty_fd) return GUEST_VSOCKET_POLLNVAL;
+    return runtime->rx_length > 0u && (events & GUEST_VSOCKET_POLLIN)
+        ? GUEST_VSOCKET_POLLIN : 0;
 }
 
 static inline struct guest_goldfish_tty_epoll_instance *guest_goldfish_tty_epoll_find(
@@ -397,9 +489,16 @@ static inline int guest_goldfish_tty_epoll_ctl(
     struct guest_vsocket_fd *epoll_fd = guest_vsocket_fd_get(fds, epfd);
     struct guest_vsocket_fd *watched_fd = guest_vsocket_fd_get(fds, fd);
     if (!epoll_fd || epoll_fd->kind != VIRTUAL_FD_EPOLL || !watched_fd) return -EBADF;
+    int qemud_stream = watched_fd->kind == VIRTUAL_FD_QEMUD_ACCEPTED &&
+        watched_fd->channel >= 0;
     if (!((fd == tty_fd && watched_fd->kind == VIRTUAL_FD_DEV_TTY) ||
-          (fd == qemud_listener_fd && watched_fd->kind == VIRTUAL_FD_QEMUD_LISTENER)))
+          (fd == qemud_listener_fd && watched_fd->kind == VIRTUAL_FD_QEMUD_LISTENER) ||
+          qemud_stream))
         return -EPERM;
+    if (operation != GUEST_GOLDFISH_TTY_EPOLL_CTL_DEL &&
+        ((events & GUEST_GOLDFISH_TTY_EPOLLIN) == 0u ||
+         (events & ~(GUEST_GOLDFISH_TTY_EPOLLIN |
+                     GUEST_GOLDFISH_TTY_EPOLLET)) != 0u)) return -EINVAL;
     struct guest_goldfish_tty_epoll_watch *found = NULL;
     struct guest_goldfish_tty_epoll_watch *free_slot = NULL;
     for (size_t i = 0; i < GUEST_GOLDFISH_TTY_EPOLL_MAX_WATCHES; ++i) {
@@ -414,12 +513,14 @@ static inline int guest_goldfish_tty_epoll_ctl(
         free_slot->fd = fd;
         free_slot->events = events;
         free_slot->data = data;
+        free_slot->last_ready = 0u;
         return 0;
     }
     if (operation == GUEST_GOLDFISH_TTY_EPOLL_CTL_MOD) {
         if (!found) return -ENOENT;
         found->events = events;
         found->data = data;
+        found->last_ready = 0u;
         return 0;
     }
     if (operation == GUEST_GOLDFISH_TTY_EPOLL_CTL_DEL) {
@@ -441,6 +542,47 @@ static inline int guest_goldfish_tty_epoll_wait_result(
     if (timeout_ms == 0) return 0;
     if (timeout_ms == -1) return GUEST_GOLDFISH_TTY_EPOLL_WAIT_PARK;
     return -EOPNOTSUPP; /* timed waits need a guest timer source; none is modeled */
+}
+
+static inline int guest_goldfish_tty_epoll_collect(
+        struct guest_goldfish_tty_epoll_table *table,
+        struct guest_vsocket_table *fds,
+        struct guest_goldfish_tty_runtime *tty,
+        uint32_t owner_table_id, int epfd, int maxevents,
+        struct guest_arm32_epoll_event *out) {
+    struct guest_goldfish_tty_epoll_instance *instance =
+        guest_goldfish_tty_epoll_find(table, epfd);
+    if (!instance || instance->owner_table_id != owner_table_id) return -EBADF;
+    if (maxevents <= 0 || !out) return -EINVAL;
+    int count = 0;
+    for (size_t i = 0; i < GUEST_GOLDFISH_TTY_EPOLL_MAX_WATCHES &&
+                       count < maxevents; ++i) {
+        struct guest_goldfish_tty_epoll_watch *watch = &instance->watches[i];
+        if (!watch->registered) continue;
+        uint32_t ready = 0u;
+        if (watch->fd == tty->tty_fd && tty->rx_length > 0u) {
+            ready = GUEST_GOLDFISH_TTY_EPOLLIN;
+        } else {
+            int16_t poll_events = guest_vsocket_poll_events(fds, watch->fd,
+                                                            GUEST_VSOCKET_POLLIN);
+            if (poll_events & GUEST_VSOCKET_POLLIN)
+                ready |= GUEST_GOLDFISH_TTY_EPOLLIN;
+            if (poll_events & GUEST_VSOCKET_POLLHUP)
+                ready |= GUEST_GOLDFISH_TTY_EPOLLHUP;
+        }
+        int is_ready = ready != 0u &&
+            ((watch->events & GUEST_GOLDFISH_TTY_EPOLLIN) != 0u ||
+             (ready & GUEST_GOLDFISH_TTY_EPOLLHUP) != 0u);
+        int edge = (watch->events & GUEST_GOLDFISH_TTY_EPOLLET) != 0u;
+        int report = is_ready && (!edge || !watch->last_ready);
+        watch->last_ready = (uint8_t)is_ready;
+        if (!report) continue;
+        out[count].events = ready;
+        out[count].abi_padding = 0u;
+        out[count].data = watch->data;
+        count++;
+    }
+    return count;
 }
 
 static inline size_t guest_goldfish_tty_epoll_watch_count(
