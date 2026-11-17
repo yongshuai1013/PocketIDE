@@ -386,7 +386,7 @@ static void log_guest_qemud_startup_diagnostics(const struct tracee_state *state
     char safe_tty_path[GUEST_QEMUD_DIAG_PATH_CAP * 4u];
     int tty_path_truncated = guest_diag_escape(diag->tty_open_path,
         safe_tty_path, sizeof(safe_tty_path));
-    printf("GUEST QEMUD STARTUP DIAGNOSTICS: guest-pid=%d wait=%s status=%d observed-syscalls=%u records-selected=%u per-process-records-dropped=%u pending=%d cmdline-open-count=%u cmdline-read-data-observations=%u cmdline-read-observed-bytes=%u observed-qemu-1=%d observed-android.qemud=%d observed-port=%s tty-open-attempts=%u tty-open-path=\"%s\" tty-open-path-truncated=%d tty-open-result=%d exit-request-seen=%d exit-syscall=%d(%s) requested-status=%u exit-pc=0x%08x exit-lr=0x%08x stderr-capture-armed=%d stderr-preview-attempts=%u target-text-PC-seen=%d target-e_entry-PC-seen=%d; raw cmdline omitted, stderr previews are escaped guest bytes, no broker behavior inferred from log-device failures\n",
+    printf("GUEST QEMUD STARTUP DIAGNOSTICS: guest-pid=%d wait=%s status=%d observed-syscalls=%u records-selected=%u per-process-records-dropped=%u pending=%d cmdline-open-count=%u cmdline-read-data-observations=%u cmdline-read-observed-bytes=%u observed-qemu-1=%d observed-android.qemud=%d observed-port=%s tty-open-attempts=%u tty-open-path=\"%s\" tty-open-path-truncated=%d tty-open-result=%d exit-request-seen=%d exit-syscall=%d(%s) requested-status=%u exit-pc=0x%08x exit-lr=0x%08x stderr-capture-armed=%d stderr-capture-reason=%s stderr-preview-attempts=%u target-text-PC-seen=%d target-e_entry-PC-seen=%d; raw cmdline omitted, stderr previews are escaped guest bytes, no broker behavior inferred from log-device failures\n",
            state->guest_pid, wait_kind, wait_status, diag->syscall_count,
            diag->records_emitted, diag->records_suppressed, diag->pending,
            diag->cmdline_open_count, diag->cmdline_read_calls,
@@ -400,6 +400,7 @@ static void log_guest_qemud_startup_diagnostics(const struct tracee_state *state
                ? guest_diag_syscall_name(diag->exit_request_syscall) : "none",
            diag->exit_request_status, diag->exit_request_pc,
            diag->exit_request_lr, diag->stderr_capture_armed,
+           guest_qemud_diag_stderr_reason_name(diag->stderr_capture_reason),
            diag->stderr_preview_chunks,
            state->target_elf_text_seen, state->target_elf_entry_pc_seen);
 }
@@ -5055,6 +5056,9 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
             ? guest_goldfish_tty_epoll_create(&guest_goldfish_tty_epolls,
                 &guest_sockets, size, state->virtual_fd_table_id)
             : -EPERM;
+        if (verified_qemud)
+            guest_qemud_diag_note_epoll_create(&state->qemud_diag,
+                verified_qemud, fd);
         guest_goldfish_tty_runtime.epoll_creates++;
         if (fd >= 0) track_virtual_fd_for_group(state, fd);
         else guest_goldfish_tty_runtime.unsupported++;
@@ -5095,6 +5099,17 @@ static int dispatch_entry(pid_t pid, struct tracee_state *state,
                 event.events, event.data, guest_goldfish_tty_runtime.tty_fd,
                 guest_sockets.qemud_listener_fd);
         }
+        int stderr_armed_by_tty_setup = state &&
+            guest_qemud_diag_note_tty_epoll_ctl(&state->qemud_diag,
+                verified_qemud, epfd, operation, watched_fd, event.events,
+                ctl_result);
+        if (stderr_armed_by_tty_setup &&
+            guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
+            printf("GUEST QEMUD STDERR CAPTURE ARMED: guest-pid=%d reason=%s epoll-fd=%d tty-fd=%d op=%d events=0x%x termios-TCGETS=1 termios-TCSETS=1; subsequent guest fd=2 writes are capped at four 96-byte escaped previews, syscall results unchanged\n",
+                   state->guest_pid,
+                   guest_qemud_diag_stderr_reason_name(
+                       state->qemud_diag.stderr_capture_reason),
+                   epfd, watched_fd, operation, event.events);
         guest_goldfish_tty_runtime.epoll_controls++;
         if (ctl_result < 0) guest_goldfish_tty_runtime.unsupported++;
         *pending_return = ctl_result;
@@ -6151,6 +6166,14 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     struct guest_qemud_diag_record qemud_record;
                     int qemud_record_result = guest_qemud_diag_finish(diag,
                         syscall_result, &qemud_record);
+                    if (qemud_record_result > 0 &&
+                        qemud_record.syscall_number == ARM_NR_IOCTL)
+                        guest_qemud_diag_note_tty_termios(diag,
+                            state->pid == waited &&
+                                tracee_is_verified_api10_qemud(state) &&
+                                state->identity.euid == 0,
+                            (int32_t)qemud_record.args[0],
+                            qemud_record.args[1], syscall_result);
                     if (qemud_record_result > 0 &&
                         guest_qemud_diag_run_budget_take(&guest_qemud_diag_run_budget))
                         log_guest_qemud_syscall(waited, state, &qemud_record);

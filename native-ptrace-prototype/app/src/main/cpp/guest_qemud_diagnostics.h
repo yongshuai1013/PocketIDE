@@ -14,6 +14,18 @@
 #define GUEST_QEMUD_DIAG_STDERR_MAX_CHUNKS 4u
 #define GUEST_QEMUD_DIAG_STDERR_MAX_BYTES 96u
 #define GUEST_QEMUD_DIAG_STDERR_ESCAPED_CAP (GUEST_QEMUD_DIAG_STDERR_MAX_BYTES * 4u + 1u)
+#define GUEST_QEMUD_DIAG_IOCTL_TCGETS 0x5401u
+#define GUEST_QEMUD_DIAG_IOCTL_TCSETS 0x5402u
+#define GUEST_QEMUD_DIAG_EPOLL_CTL_ADD 1
+#define GUEST_QEMUD_DIAG_EPOLL_CTL_MOD 3
+#define GUEST_QEMUD_DIAG_EPOLLIN 0x00000001u
+
+enum guest_qemud_diag_stderr_capture_reason {
+    GUEST_QEMUD_DIAG_STDERR_REASON_NONE = 0,
+    GUEST_QEMUD_DIAG_STDERR_REASON_EPOLL_CREATE_FAILED,
+    GUEST_QEMUD_DIAG_STDERR_REASON_TTY_OPEN_FAILED,
+    GUEST_QEMUD_DIAG_STDERR_REASON_TTY_EPOLL_READY,
+};
 
 struct guest_qemud_diag_fd {
     int used;
@@ -52,6 +64,11 @@ struct guest_qemud_diag_state {
     uint32_t cmdline_read_bytes;
     char cmdline_data[GUEST_QEMUD_DIAG_CMDLINE_CAP];
     size_t cmdline_data_length;
+    int tty_fd;
+    int epoll_fd;
+    int tty_tcgets_succeeded;
+    int tty_tcsets_succeeded;
+    int tty_epoll_add_seen;
     int cmdline_qemu_enabled;
     int cmdline_qemud_parameter_present;
     int cmdline_observation_logged;
@@ -65,6 +82,7 @@ struct guest_qemud_diag_state {
     uint32_t exit_request_pc;
     uint32_t exit_request_lr;
     int stderr_capture_armed;
+    enum guest_qemud_diag_stderr_capture_reason stderr_capture_reason;
     uint32_t stderr_preview_chunks;
 };
 
@@ -88,6 +106,8 @@ static inline void guest_qemud_diag_state_init(struct guest_qemud_diag_state *st
     if (!state) return;
     memset(state, 0, sizeof(*state));
     state->cmdline_fd = -1;
+    state->tty_fd = -1;
+    state->epoll_fd = -1;
     state->tty_open_result = 0;
 }
 
@@ -167,6 +187,32 @@ static inline void guest_qemud_diag_begin(struct guest_qemud_diag_state *state,
     }
 }
 
+static inline int guest_qemud_diag_arm_stderr_capture(
+        struct guest_qemud_diag_state *state,
+        enum guest_qemud_diag_stderr_capture_reason reason) {
+    if (!state || reason == GUEST_QEMUD_DIAG_STDERR_REASON_NONE ||
+        state->stderr_capture_armed)
+        return 0;
+    state->stderr_capture_armed = 1;
+    state->stderr_capture_reason = reason;
+    return 1;
+}
+
+static inline const char *guest_qemud_diag_stderr_reason_name(
+        enum guest_qemud_diag_stderr_capture_reason reason) {
+    switch (reason) {
+        case GUEST_QEMUD_DIAG_STDERR_REASON_EPOLL_CREATE_FAILED:
+            return "epoll-create-failed";
+        case GUEST_QEMUD_DIAG_STDERR_REASON_TTY_OPEN_FAILED:
+            return "tty-open-failed";
+        case GUEST_QEMUD_DIAG_STDERR_REASON_TTY_EPOLL_READY:
+            return "verified-tty-epoll-setup-complete";
+        case GUEST_QEMUD_DIAG_STDERR_REASON_NONE:
+        default:
+            return "not-armed";
+    }
+}
+
 /* Returns 1 for a record, 0 for a successful unselected call, and -1 once the
  * fixed per-process output budget has been exhausted. Negative results are
  * retained even for otherwise unselected syscalls, so unexpected failures do
@@ -175,7 +221,8 @@ static inline int guest_qemud_diag_finish(struct guest_qemud_diag_state *state,
         int32_t result, struct guest_qemud_diag_record *record) {
     if (!state || !state->pending) return 0;
     if (state->pending_syscall_number == 250 && result < 0)
-        state->stderr_capture_armed = 1;
+        (void)guest_qemud_diag_arm_stderr_capture(state,
+            GUEST_QEMUD_DIAG_STDERR_REASON_EPOLL_CREATE_FAILED);
     int retain = state->pending_selected || result < 0;
     if (!retain) {
         state->pending = 0;
@@ -370,9 +417,58 @@ static inline int guest_qemud_diag_is_tty_s_path(const char *path) {
 
 static inline int guest_qemud_diag_is_selected_tty_path(
         const struct guest_qemud_diag_state *state, const char *path) {
-    return state && state->cmdline_qemud_parameter_present &&
+    return state && state->cmdline_qemu_enabled &&
+        state->cmdline_qemud_parameter_present &&
         strcmp(state->cmdline_qemud_port, "ttyS1") == 0 && path &&
         strcmp(path, "/dev/ttyS1") == 0;
+}
+
+static inline int guest_qemud_diag_is_selected_tty_profile(
+        const struct guest_qemud_diag_state *state) {
+    return state && state->cmdline_qemu_enabled &&
+        state->cmdline_qemud_parameter_present &&
+        strcmp(state->cmdline_qemud_port, "ttyS1") == 0;
+}
+
+static inline void guest_qemud_diag_note_epoll_create(
+        struct guest_qemud_diag_state *state, int verified_qemud, int32_t result) {
+    if (!state || !verified_qemud || result < 0 ||
+        !guest_qemud_diag_is_selected_tty_profile(state))
+        return;
+    state->epoll_fd = result;
+}
+
+static inline void guest_qemud_diag_note_tty_termios(
+        struct guest_qemud_diag_state *state, int verified_qemud, int fd,
+        uint32_t request, int32_t result) {
+    if (!state || !verified_qemud || result != 0 ||
+        !guest_qemud_diag_is_selected_tty_profile(state) ||
+        state->tty_fd < 0 || fd != state->tty_fd)
+        return;
+    if (request == GUEST_QEMUD_DIAG_IOCTL_TCGETS)
+        state->tty_tcgets_succeeded = 1;
+    else if (request == GUEST_QEMUD_DIAG_IOCTL_TCSETS)
+        state->tty_tcsets_succeeded = 1;
+}
+
+static inline int guest_qemud_diag_note_tty_epoll_ctl(
+        struct guest_qemud_diag_state *state, int verified_qemud, int epoll_fd,
+        int operation, int watched_fd, uint32_t events, int32_t result) {
+    if (!state || !verified_qemud || result != 0 ||
+        !guest_qemud_diag_is_selected_tty_profile(state) ||
+        state->epoll_fd < 0 || state->tty_fd < 0 ||
+        epoll_fd != state->epoll_fd || watched_fd != state->tty_fd ||
+        !state->tty_tcgets_succeeded || !state->tty_tcsets_succeeded)
+        return 0;
+    if (operation == GUEST_QEMUD_DIAG_EPOLL_CTL_ADD) {
+        state->tty_epoll_add_seen = 1;
+        return 0;
+    }
+    if (operation == GUEST_QEMUD_DIAG_EPOLL_CTL_MOD &&
+        state->tty_epoll_add_seen && (events & GUEST_QEMUD_DIAG_EPOLLIN))
+        return guest_qemud_diag_arm_stderr_capture(state,
+            GUEST_QEMUD_DIAG_STDERR_REASON_TTY_EPOLL_READY);
+    return 0;
 }
 
 static inline void guest_qemud_diag_note_open(struct guest_qemud_diag_state *state,
@@ -390,8 +486,13 @@ static inline void guest_qemud_diag_note_open(struct guest_qemud_diag_state *sta
         state->tty_open_result = result;
         guest_qemud_diag_copy(state->tty_open_path, sizeof(state->tty_open_path), path);
         if (result < 0 && guest_qemud_diag_is_selected_tty_path(state, path))
-            state->stderr_capture_armed = 1;
-        if (result >= 0) guest_qemud_diag_track_fd(state, result, path);
+            (void)guest_qemud_diag_arm_stderr_capture(state,
+                GUEST_QEMUD_DIAG_STDERR_REASON_TTY_OPEN_FAILED);
+        if (result >= 0) {
+            guest_qemud_diag_track_fd(state, result, path);
+            if (guest_qemud_diag_is_selected_tty_path(state, path))
+                state->tty_fd = result;
+        }
     } else if (result >= 0 && strncmp(path, "/dev/log/", 9u) == 0) {
         guest_qemud_diag_track_fd(state, result, path);
     }

@@ -103,6 +103,8 @@ static void test_tty_open_and_exit_request_are_observations_only(void) {
     assert(state.tty_open_result == -EOPNOTSUPP);
     assert(strcmp(state.tty_open_path, "/dev/ttyS1") == 0);
     assert(state.stderr_capture_armed);
+    assert(state.stderr_capture_reason ==
+           GUEST_QEMUD_DIAG_STDERR_REASON_TTY_OPEN_FAILED);
     guest_qemud_diag_note_open(&state, "/dev/ttyp1", -EIO);
     guest_qemud_diag_note_open(&state, "/dev/ttySerial", -EIO);
     guest_qemud_diag_note_open(&state, "/dev/ttyS1-extra", -EIO);
@@ -193,12 +195,131 @@ static void test_failure_armed_stderr_preview_is_bounded_and_escaped(void) {
     guest_qemud_diag_note_open(&state, "/dev/ttyS1-extra", -EOPNOTSUPP);
     assert(!state.stderr_capture_armed);
 
+    guest_qemud_diag_state_init(&state);
+    const char disabled_qemu_cmdline[] = "qemu=0 android.qemud=ttyS1";
+    guest_qemud_diag_note_cmdline_read(&state, disabled_qemu_cmdline,
+        sizeof(disabled_qemu_cmdline) - 1u);
+    guest_qemud_diag_note_open(&state, "/dev/ttyS1", -EOPNOTSUPP);
+    assert(!state.stderr_capture_armed);
+
     const unsigned char raw[] = {'A', 0, '\n', '\r', 0x1b, '"', '\\', 0x7f, 0xff};
     char escaped[GUEST_QEMUD_DIAG_STDERR_ESCAPED_CAP];
     assert(!guest_qemud_diag_escape_bytes(raw, sizeof(raw), escaped, sizeof(escaped)));
     assert(strcmp(escaped, "A\\x00\\x0a\\x0d\\x1b\\\"\\\\\\x7f\\xff") == 0);
     for (size_t i = 0; escaped[i]; ++i)
-        assert((unsigned char)escaped[i] >= 0x20u && (unsigned char)escaped[i] <= 0x7eu);
+    assert((unsigned char)escaped[i] >= 0x20u && (unsigned char)escaped[i] <= 0x7eu);
+}
+
+static void test_successful_tty_epoll_setup_arms_bounded_stderr_capture(void) {
+    struct guest_qemud_diag_state state;
+    struct guest_qemud_diag_record record;
+    size_t amount = 0;
+    uint32_t args[6] = {0};
+    guest_qemud_diag_state_init(&state);
+    const char selected_cmdline[] = "qemu=1 android.qemud=ttyS1";
+    guest_qemud_diag_note_cmdline_read(&state, selected_cmdline,
+        sizeof(selected_cmdline) - 1u);
+
+    /* Mirrors the successful API10 qemud sequence from the device trace. */
+    guest_qemud_diag_note_epoll_create(&state, 1, 5006);
+    guest_qemud_diag_note_open(&state, "/dev/ttyS1", 5008);
+    guest_qemud_diag_note_tty_termios(&state, 1, 5008,
+        GUEST_QEMUD_DIAG_IOCTL_TCGETS, 0);
+    guest_qemud_diag_note_tty_termios(&state, 1, 5008,
+        GUEST_QEMUD_DIAG_IOCTL_TCSETS, 0);
+    assert(state.tty_fd == 5008 && state.epoll_fd == 5006);
+    assert(state.tty_tcgets_succeeded && state.tty_tcsets_succeeded);
+    assert(!state.stderr_capture_armed);
+
+    assert(guest_qemud_diag_note_tty_epoll_ctl(&state, 1, 5006,
+        GUEST_QEMUD_DIAG_EPOLL_CTL_ADD, 5008, 0u, 0) == 0);
+    assert(!state.stderr_capture_armed);
+    assert(guest_qemud_diag_note_tty_epoll_ctl(&state, 1, 5006,
+        GUEST_QEMUD_DIAG_EPOLL_CTL_MOD, 5008,
+        GUEST_QEMUD_DIAG_EPOLLIN, 0) == 1);
+    assert(state.stderr_capture_armed);
+    assert(state.stderr_capture_reason ==
+           GUEST_QEMUD_DIAG_STDERR_REASON_TTY_EPOLL_READY);
+    assert(strcmp(guest_qemud_diag_stderr_reason_name(
+        state.stderr_capture_reason), "verified-tty-epoll-setup-complete") == 0);
+
+    const unsigned char stderr_bytes[] = {'P', 'A', 'N', 'I', 'C', ':', '\n'};
+    args[0] = 2;
+    args[1] = 0x12000u;
+    args[2] = (uint32_t)sizeof(stderr_bytes);
+    guest_qemud_diag_begin(&state, 4, args, 0xafd0b47cu, 0xafd19e2bu,
+        NULL, NULL);
+    assert(guest_qemud_diag_finish(&state, (int32_t)sizeof(stderr_bytes),
+        &record) == 1);
+    assert(record.syscall_number == 4 && record.args[0] == 2u);
+    assert(record.result == (int32_t)sizeof(stderr_bytes));
+    assert(guest_qemud_diag_claim_stderr_preview(&state, 2, record.result,
+        record.args[2], &amount));
+    assert(amount == sizeof(stderr_bytes));
+    char escaped[GUEST_QEMUD_DIAG_STDERR_ESCAPED_CAP];
+    assert(!guest_qemud_diag_escape_bytes(stderr_bytes, amount, escaped,
+        sizeof(escaped)));
+    assert(strcmp(escaped, "PANIC:\\x0a") == 0);
+
+    args[0] = 1;
+    guest_qemud_diag_begin(&state, 248, args, 0xafd0af4cu, 0xafd1d0fbu,
+        NULL, NULL);
+    assert(state.exit_request_seen && state.exit_request_status == 1u);
+    assert(state.exit_request_syscall == 248);
+    assert(state.stderr_preview_chunks == 1u);
+}
+
+static void test_unverified_or_mismatched_setup_never_arms_stderr(void) {
+    struct guest_qemud_diag_state state;
+    const char selected_cmdline[] = "qemu=1 android.qemud=ttyS1";
+    guest_qemud_diag_state_init(&state);
+    guest_qemud_diag_note_cmdline_read(&state, selected_cmdline,
+        sizeof(selected_cmdline) - 1u);
+    guest_qemud_diag_note_epoll_create(&state, 0, 50);
+    guest_qemud_diag_note_open(&state, "/dev/ttyS1", 51);
+    guest_qemud_diag_note_tty_termios(&state, 0, 51,
+        GUEST_QEMUD_DIAG_IOCTL_TCGETS, 0);
+    guest_qemud_diag_note_tty_termios(&state, 0, 51,
+        GUEST_QEMUD_DIAG_IOCTL_TCSETS, 0);
+    assert(guest_qemud_diag_note_tty_epoll_ctl(&state, 0, 50,
+        GUEST_QEMUD_DIAG_EPOLL_CTL_ADD, 51, 0u, 0) == 0);
+    assert(guest_qemud_diag_note_tty_epoll_ctl(&state, 0, 50,
+        GUEST_QEMUD_DIAG_EPOLL_CTL_MOD, 51,
+        GUEST_QEMUD_DIAG_EPOLLIN, 0) == 0);
+    assert(!state.stderr_capture_armed);
+
+    guest_qemud_diag_state_init(&state);
+    const char other_port_cmdline[] = "qemu=1 android.qemud=ttyS2";
+    guest_qemud_diag_note_cmdline_read(&state, other_port_cmdline,
+        sizeof(other_port_cmdline) - 1u);
+    guest_qemud_diag_note_epoll_create(&state, 1, 60);
+    guest_qemud_diag_note_open(&state, "/dev/ttyS2", 61);
+    guest_qemud_diag_note_tty_termios(&state, 1, 61,
+        GUEST_QEMUD_DIAG_IOCTL_TCGETS, 0);
+    guest_qemud_diag_note_tty_termios(&state, 1, 61,
+        GUEST_QEMUD_DIAG_IOCTL_TCSETS, 0);
+    assert(guest_qemud_diag_note_tty_epoll_ctl(&state, 1, 60,
+        GUEST_QEMUD_DIAG_EPOLL_CTL_ADD, 61, 0u, 0) == 0);
+    assert(guest_qemud_diag_note_tty_epoll_ctl(&state, 1, 60,
+        GUEST_QEMUD_DIAG_EPOLL_CTL_MOD, 61,
+        GUEST_QEMUD_DIAG_EPOLLIN, 0) == 0);
+    assert(!state.stderr_capture_armed);
+
+    guest_qemud_diag_state_init(&state);
+    guest_qemud_diag_note_cmdline_read(&state, selected_cmdline,
+        sizeof(selected_cmdline) - 1u);
+    guest_qemud_diag_note_epoll_create(&state, 1, 70);
+    guest_qemud_diag_note_open(&state, "/dev/ttyS1", 71);
+    guest_qemud_diag_note_tty_termios(&state, 1, 71,
+        GUEST_QEMUD_DIAG_IOCTL_TCGETS, 0);
+    guest_qemud_diag_note_tty_termios(&state, 1, 71,
+        GUEST_QEMUD_DIAG_IOCTL_TCSETS, 0);
+    assert(guest_qemud_diag_note_tty_epoll_ctl(&state, 1, 70,
+        GUEST_QEMUD_DIAG_EPOLL_CTL_ADD, 71, 0u, -EIO) == 0);
+    assert(guest_qemud_diag_note_tty_epoll_ctl(&state, 1, 70,
+        GUEST_QEMUD_DIAG_EPOLL_CTL_MOD, 71,
+        GUEST_QEMUD_DIAG_EPOLLIN, 0) == 0);
+    assert(!state.stderr_capture_armed);
 }
 
 static void test_record_budget_is_hard_bounded(void) {
@@ -229,6 +350,8 @@ int main(void) {
     test_cmdline_fd_and_parameter_observation();
     test_tty_open_and_exit_request_are_observations_only();
     test_failure_armed_stderr_preview_is_bounded_and_escaped();
+    test_successful_tty_epoll_setup_arms_bounded_stderr_capture();
+    test_unverified_or_mismatched_setup_never_arms_stderr();
     test_record_budget_is_hard_bounded();
     puts("qemud transport profile and bounded syscall/stderr diagnostics: PASS");
     return 0;

@@ -395,7 +395,10 @@ assert '#include "guest_qemud_diagnostics.h"' in src
 assert 'GUEST QEMUD TRANSPORT PROFILE:' in src
 assert 'GUEST QEMUD SYSCALL:' in src and 'GUEST QEMUD STARTUP DIAGNOSTICS:' in src
 assert 'GUEST QEMUD STDERR PREVIEW (escaped guest bytes):' in src
+assert 'GUEST QEMUD STDERR CAPTURE ARMED:' in src
 assert 'guest_qemud_diag_claim_stderr_preview' in src
+assert 'guest_qemud_diag_note_tty_epoll_ctl' in src
+assert 'guest_qemud_diag_note_tty_termios' in src
 assert 'guest_qemud_diag_escape_bytes' in src and 'read_remote(waited' in src
 assert 'guest_qemud_diag_guest_range_valid' in src and 'if (read_ok)' in src
 assert 'no guest bytes logged' in src
@@ -407,6 +410,8 @@ assert 'GUEST_QEMUD_DIAG_MAX_RECORDS 96u' in qemud_diagnostics
 assert 'GUEST_QEMUD_DIAG_RUN_MAX_LINES 256u' in qemud_diagnostics
 assert 'GUEST_QEMUD_DIAG_STDERR_MAX_CHUNKS 4u' in qemud_diagnostics
 assert 'GUEST_QEMUD_DIAG_STDERR_MAX_BYTES 96u' in qemud_diagnostics
+assert 'GUEST_QEMUD_DIAG_STDERR_REASON_TTY_EPOLL_READY' in qemud_diagnostics
+assert 'stderr-capture-reason=%s' in src
 assert 'guest_qemud_diag_is_selected_tty_path' in qemud_diagnostics
 assert 'address_space_end - (uint64_t)address' in qemud_diagnostics
 assert 'record->lr = state->pending_lr;' in qemud_diagnostics
@@ -461,6 +466,8 @@ assert 'test_source_backed_profile_tokens' in qemud_test
 assert 'test_selected_calls_and_failed_unselected_calls' in qemud_test
 assert 'test_cmdline_fd_and_parameter_observation' in qemud_test
 assert 'test_failure_armed_stderr_preview_is_bounded_and_escaped' in qemud_test
+assert 'test_successful_tty_epoll_setup_arms_bounded_stderr_capture' in qemud_test
+assert 'test_unverified_or_mismatched_setup_never_arms_stderr' in qemud_test
 assert 'guest_qemud_diag_guest_range_valid(UINT32_MAX, 1u)' in qemud_test
 assert 'guest_qemud_diag_is_selected_tty_path(&state, "/dev/ttyS2")' in qemud_test
 assert 'test_record_budget_is_hard_bounded' in qemud_test
@@ -1000,17 +1007,17 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'Build GingerVM v0.6.31 test-signed Android APK' in workflow
-assert 'gingervm-continuous-trace-v0.6.31-test-signed-apk' in upload
-assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.31-apk.sha256"' in workflow
-assert '${{ runner.temp }}/gingervm-v0.6.31-apk.sha256' in upload
+assert 'Build GingerVM v0.6.32 test-signed Android APK' in workflow
+assert 'gingervm-continuous-trace-v0.6.32-test-signed-apk' in upload
+assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.32-apk.sha256"' in workflow
+assert '${{ runner.temp }}/gingervm-v0.6.32-apk.sha256' in upload
 assert '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 40" in gradle and "versionName '0.6.31'" in gradle
+assert "versionCode 41" in gradle and "versionName '0.6.32'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.31' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.32' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
