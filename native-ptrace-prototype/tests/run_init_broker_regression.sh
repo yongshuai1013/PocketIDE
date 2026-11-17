@@ -60,6 +60,9 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_pseudo_device_test.c" -o "$TMP/guest_pseudo_device_test"
 "$TMP/guest_pseudo_device_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_null_stdio_test.c" -o "$TMP/guest_null_stdio_test"
+"$TMP/guest_null_stdio_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_entry_probe_test.c" -o "$TMP/guest_entry_probe_test"
 "$TMP/guest_entry_probe_test"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
@@ -147,6 +150,10 @@ sigsys_context = Path(sys.argv[1]).with_name('guest_sigsys_context.h').read_text
 script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
 profile = Path(sys.argv[1]).with_name('guest_hardware_profile.h').read_text()
 pseudo_device = Path(sys.argv[1]).with_name('guest_pseudo_device.h').read_text()
+null_stdio = Path(sys.argv[1]).with_name('guest_null_stdio.h').read_text()
+null_stdio_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_null_stdio_test.c').read_text()
+path_syscall_start = src.index('static int path_syscall(')
+path_syscall_source = src[path_syscall_start:]
 tracee_slots = Path(sys.argv[1]).with_name('guest_tracee_slots.h').read_text()
 slots_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_tracee_slots_test.c').read_text()
 pending_child_stops = Path(sys.argv[1]).with_name('ptrace_child_stop_queue.h').read_text()
@@ -169,6 +176,8 @@ frame_java_test = (repo_root / 'tests/GuestFramePacketTest.java').read_text()
 framebuffer_model = Path(sys.argv[1]).with_name('guest_framebuffer_virtual.h').read_text()
 identity_model = Path(sys.argv[1]).with_name('guest_identity_compat.h').read_text()
 guest_image = repo_root / 'guest-image/google-api10-android-2.3.7'
+api10_init_source = (repo_root.parent / 'build/aosp/system-core/init/init.c').read_text()
+api10_util_source = (repo_root.parent / 'build/aosp/system-core/init/util.c').read_text()
 system_build_prop = (guest_image / 'system-tree/build.prop').read_text()
 ramdisk_default_prop = (guest_image / 'ramdisk-root/default.prop').read_text()
 goldfish_rc = (guest_image / 'ramdisk-root/init.goldfish.rc').read_text()
@@ -548,7 +557,41 @@ assert 'GUEST_MODE_IFCHR 0020000u' in pseudo_device
 assert 'GUEST PSEUDO-DEVICE STAT64:' in src and 'GUEST PSEUDO-DEVICE FSTAT64:' in src
 assert 'guest_pseudo_device_backing_present(guest)' in src
 assert 'guest_safe_file_open_beneath_root' in src and 'O_NOFOLLOW' in safe_dir
-assert 'GUEST TEMP DEVICE OPEN:' in src and 'app-private temporary placeholder' in src
+assert 'GUEST TEMP DEVICE OPEN:' in src and 'app-private placeholder data only' in src
+assert '#include "guest_null_stdio.h"' in src
+for marker in ('GUEST NULL DEVICE MKNOD:', 'GUEST NULL DEVICE OPEN:',
+               'GUEST NULL DEVICE UNLINK:', 'GUEST NULL STDIO DUP2:',
+               'GUEST NULL STDIO IO:', 'GUEST NULL STDIO SUMMARY:'):
+    assert marker in src, marker
+assert 'guest_null_stdio_virtual_fd_valid' in src and 'child_state->null_stdio_mask = state->null_stdio_mask' in src
+assert 'set_guest_null_stdio_mask_for_group' in src and 'guest_null_stdio_source_fd_closed' in src
+assert 'guest_null_stdio_runtime_init(&guest_null_stdio_runtime)' in src
+assert 'GUEST_NULL_STDIO_MODE 020600u' in null_stdio
+assert 'GUEST_NULL_STDIO_DEVICE 0x00000103u' in null_stdio
+assert 'GUEST_ARM32_O_LARGEFILE 0400000u' in null_stdio
+assert 'guest_null_stdio_mknod' in null_stdio and 'guest_null_stdio_open_validate' in null_stdio
+assert 'guest_null_stdio_unlink' in null_stdio and 'guest_null_stdio_dup2' in null_stdio
+assert 'guest_null_stdio_io' in null_stdio and 'guest_null_stdio_close' in null_stdio
+null_stdio_code = re.sub(r'/\*.*?\*/|//[^\n]*', '', null_stdio, flags=re.S)
+assert not re.search(r'(?<![A-Za-z0-9_])(mknod|open|unlink)\s*\(', null_stdio_code)
+assert 'test_exact_init_sequence' in null_stdio_test and 'test_open_failure_still_unlinks' in null_stdio_test
+assert 'test_mknod_open_unlink_and_dup_fail_closed' in null_stdio_test
+assert '"/dev/__kmsg__"' in null_stdio_test and '"/dev/__null__/../null"' in null_stdio_test
+assert 'guest null-device init stdio state-machine regression: PASS' in null_stdio_test
+assert 'original guest binaries are not executed' in null_stdio_test
+assert path_syscall_source.index('strcmp(guest, GUEST_NULL_STDIO_PATH) == 0') < path_syscall_source.index('rewrite_path_arg(pid, regs, arg, guest')
+assert 'decoded exact-path broker requests, not all syscalls' in src
+api10_null_stdio = api10_util_source.split('void open_devnull_stdio(void)', 1)[1].split('\n}', 1)[0]
+for operation in ('mknod(name, S_IFCHR | 0600, (1 << 8) | 3)',
+                  'open(name, O_RDWR)', 'unlink(name)', 'dup2(fd, 0)',
+                  'dup2(fd, 1)', 'dup2(fd, 2)', 'exit(1)'):
+    assert operation in api10_null_stdio, operation
+api10_log_init = api10_util_source.split('void log_init(void)', 1)[1].split('\n}', 1)[0]
+assert 'mknod(name, S_IFCHR | 0600, (1 << 8) | 11)' in api10_log_init
+assert 'exit(' not in api10_log_init
+api10_main = api10_init_source.split('int main(', 1)[1]
+assert api10_main.index('open_devnull_stdio();') < api10_main.index('log_init();') < api10_main.index('init_parse_config_file("/init.rc")')
+assert 'GUEST NULL STDIO SUMMARY:' in src
 assert 'GUEST HARDWARE PROFILE:' in src and 'not host-phone data' in src
 assert 'packet I/O=unavailable, host network calls=0' in src
 assert 'guest_safe_dir_open_beneath_root' in src and 'guest_safe_dir_open_beneath_root' in safe_dir
@@ -779,14 +822,14 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.23-test-signed-apk' in upload
-assert 'gingervm-v0.6.23-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 32" in gradle and "versionName '0.6.23'" in gradle
+assert 'gingervm-continuous-trace-v0.6.24-test-signed-apk' in upload
+assert 'gingervm-v0.6.24-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 33" in gradle and "versionName '0.6.24'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.23' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.24' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
