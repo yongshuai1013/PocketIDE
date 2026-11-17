@@ -135,7 +135,7 @@ python3 - "$ROOT/app/src/main/cpp/init_supervisor.c" \
   "$ROOT/app/build.gradle" "$ROOT/app/src/main/AndroidManifest.xml" \
   "$ROOT/tests/stage_init_assets.py" "$ROOT/build-native.sh" <<'PY'
 from pathlib import Path
-import re, sys
+import os, re, sys
 src = Path(sys.argv[1]).read_text()
 trace = src.split("static int run_trace(", 1)[1].split("int main(", 1)[0]
 uevent = Path(sys.argv[1]).with_name('guest_uevent_virtual.h').read_text()
@@ -176,8 +176,12 @@ frame_java_test = (repo_root / 'tests/GuestFramePacketTest.java').read_text()
 framebuffer_model = Path(sys.argv[1]).with_name('guest_framebuffer_virtual.h').read_text()
 identity_model = Path(sys.argv[1]).with_name('guest_identity_compat.h').read_text()
 guest_image = repo_root / 'guest-image/google-api10-android-2.3.7'
-api10_init_source = (repo_root.parent / 'build/aosp/system-core/init/init.c').read_text()
-api10_util_source = (repo_root.parent / 'build/aosp/system-core/init/util.c').read_text()
+aosp_source_root = Path(os.environ.get('GINGERVM_AOSP_SOURCE_ROOT', repo_root.parent / 'build/aosp'))
+api10_init_path = aosp_source_root / 'system-core/init/init.c'
+api10_util_path = aosp_source_root / 'system-core/init/util.c'
+api10_source_available = api10_init_path.is_file() and api10_util_path.is_file()
+api10_init_source = api10_init_path.read_text() if api10_source_available else ''
+api10_util_source = api10_util_path.read_text() if api10_source_available else ''
 system_build_prop = (guest_image / 'system-tree/build.prop').read_text()
 ramdisk_default_prop = (guest_image / 'ramdisk-root/default.prop').read_text()
 goldfish_rc = (guest_image / 'ramdisk-root/init.goldfish.rc').read_text()
@@ -581,16 +585,20 @@ assert 'guest null-device init stdio state-machine regression: PASS' in null_std
 assert 'original guest binaries are not executed' in null_stdio_test
 assert path_syscall_source.index('strcmp(guest, GUEST_NULL_STDIO_PATH) == 0') < path_syscall_source.index('rewrite_path_arg(pid, regs, arg, guest')
 assert 'decoded exact-path broker requests, not all syscalls' in src
-api10_null_stdio = api10_util_source.split('void open_devnull_stdio(void)', 1)[1].split('\n}', 1)[0]
-for operation in ('mknod(name, S_IFCHR | 0600, (1 << 8) | 3)',
-                  'open(name, O_RDWR)', 'unlink(name)', 'dup2(fd, 0)',
-                  'dup2(fd, 1)', 'dup2(fd, 2)', 'exit(1)'):
-    assert operation in api10_null_stdio, operation
-api10_log_init = api10_util_source.split('void log_init(void)', 1)[1].split('\n}', 1)[0]
-assert 'mknod(name, S_IFCHR | 0600, (1 << 8) | 11)' in api10_log_init
-assert 'exit(' not in api10_log_init
-api10_main = api10_init_source.split('int main(', 1)[1]
-assert api10_main.index('open_devnull_stdio();') < api10_main.index('log_init();') < api10_main.index('init_parse_config_file("/init.rc")')
+if api10_source_available:
+    api10_null_stdio = api10_util_source.split('void open_devnull_stdio(void)', 1)[1].split('\n}', 1)[0]
+    for operation in ('mknod(name, S_IFCHR | 0600, (1 << 8) | 3)',
+                      'open(name, O_RDWR)', 'unlink(name)', 'dup2(fd, 0)',
+                      'dup2(fd, 1)', 'dup2(fd, 2)', 'exit(1)'):
+        assert operation in api10_null_stdio, operation
+    api10_log_init = api10_util_source.split('void log_init(void)', 1)[1].split('\n}', 1)[0]
+    assert 'mknod(name, S_IFCHR | 0600, (1 << 8) | 11)' in api10_log_init
+    assert 'exit(' not in api10_log_init
+    api10_main = api10_init_source.split('int main(', 1)[1]
+    assert api10_main.index('open_devnull_stdio();') < api10_main.index('log_init();') < api10_main.index('init_parse_config_file("/init.rc")')
+    print('API10 AOSP init/util source contract: PASS')
+else:
+    print('API10 AOSP init/util source contract: SKIP (source tree absent from this checkout; the local source-backed build runs these assertions when present)')
 assert 'GUEST NULL STDIO SUMMARY:' in src
 assert 'GUEST HARDWARE PROFILE:' in src and 'not host-phone data' in src
 assert 'packet I/O=unavailable, host network calls=0' in src
@@ -822,14 +830,14 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'gingervm-continuous-trace-v0.6.24-test-signed-apk' in upload
-assert 'gingervm-v0.6.24-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 33" in gradle and "versionName '0.6.24'" in gradle
+assert 'gingervm-continuous-trace-v0.6.25-test-signed-apk' in upload
+assert 'gingervm-v0.6.25-apk.sha256' in upload and '.keystore' not in upload and 'build.log' not in upload
+assert "versionCode 34" in gradle and "versionName '0.6.25'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.24' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.25' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build
