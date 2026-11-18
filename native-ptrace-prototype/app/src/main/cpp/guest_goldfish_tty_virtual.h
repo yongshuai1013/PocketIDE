@@ -503,10 +503,11 @@ static inline int guest_goldfish_tty_epoll_ctl(
           (fd == qemud_listener_fd && watched_fd->kind == VIRTUAL_FD_QEMUD_LISTENER) ||
           qemud_stream))
         return -EPERM;
+    /* API10's Goldfish 2.6.29 epoll permits an empty interest mask; qemud
+     * installs watches first and enables EPOLLIN later with EPOLL_CTL_MOD. */
     if (operation != GUEST_GOLDFISH_TTY_EPOLL_CTL_DEL &&
-        ((events & GUEST_GOLDFISH_TTY_EPOLLIN) == 0u ||
-         (events & ~(GUEST_GOLDFISH_TTY_EPOLLIN |
-                     GUEST_GOLDFISH_TTY_EPOLLET)) != 0u)) return -EINVAL;
+        (events & ~(GUEST_GOLDFISH_TTY_EPOLLIN |
+                    GUEST_GOLDFISH_TTY_EPOLLET)) != 0u) return -EINVAL;
     struct guest_goldfish_tty_epoll_watch *found = NULL;
     struct guest_goldfish_tty_epoll_watch *free_slot = NULL;
     for (size_t i = 0; i < GUEST_GOLDFISH_TTY_EPOLL_MAX_WATCHES; ++i) {

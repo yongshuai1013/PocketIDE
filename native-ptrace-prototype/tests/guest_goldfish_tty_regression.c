@@ -259,6 +259,116 @@ static void test_event_mknod_open_termios_epoll_lifecycle(const char *base) {
     assert(guest_goldfish_tty_note_close(&runtime, tty_fd) == -EBADF);
 }
 
+static void test_epoll_zero_mask_add_then_enable(void) {
+    struct guest_goldfish_tty_runtime runtime;
+    struct guest_goldfish_tty_epoll_table epolls;
+    struct guest_vsocket_table sockets;
+    guest_goldfish_tty_runtime_init(&runtime);
+    guest_goldfish_tty_epoll_table_init(&epolls);
+    guest_vsocket_table_init(&sockets);
+
+    runtime.uevent_mask = (uint8_t)(1u << GUEST_GOLDFISH_TTY_QEMUD_MINOR);
+    guest_goldfish_tty_note_node_created(&runtime, GUEST_GOLDFISH_TTY_QEMUD_MINOR);
+    int tty_fd = guest_vsocket_alloc_fd(&sockets, VIRTUAL_FD_DEV_TTY);
+    assert(tty_fd >= 0);
+    assert(guest_goldfish_tty_note_open(&runtime,
+        GUEST_GOLDFISH_TTY_QEMUD_MINOR, tty_fd) == 0);
+    assert(guest_goldfish_tty_note_peer_attached(&runtime, tty_fd) == 0);
+
+    int listener_fd = guest_vsocket_alloc_fd(&sockets, VIRTUAL_FD_QEMUD_LISTENER);
+    assert(listener_fd >= 0);
+    sockets.qemud_listener_fd = listener_fd;
+    struct guest_vsocket_fd *listener = guest_vsocket_fd_get(&sockets, listener_fd);
+    assert(listener != NULL);
+    listener->bound = 1;
+    listener->listening = 1;
+
+    int epfd = guest_goldfish_tty_epoll_create(&epolls, &sockets, 4, 7u);
+    assert(epfd >= 0);
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 0, 7u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_ADD, tty_fd, 0u, 0x1122u,
+        tty_fd, listener_fd) == -EPERM);
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 1, 8u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_ADD, tty_fd, 0u, 0x1122u,
+        tty_fd, listener_fd) == -EBADF);
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 1, 7u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_ADD, tty_fd, 0x40000000u, 0x1122u,
+        tty_fd, listener_fd) == -EINVAL);
+
+    const uint64_t tty_data = UINT64_C(0x1122334455667788);
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 1, 7u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_ADD, tty_fd, 0u, tty_data,
+        tty_fd, listener_fd) == 0);
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 1, 7u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_ADD, listener_fd, 0u, 0xfeedu,
+        tty_fd, listener_fd) == 0);
+    assert(guest_goldfish_tty_epoll_watch_count(&epolls, epfd) == 2u);
+
+    const uint8_t serial_byte = 0x41u;
+    struct guest_arm32_epoll_event ready[2];
+    memset(ready, 0, sizeof(ready));
+    assert(guest_goldfish_tty_rx_enqueue(&runtime, &serial_byte, 1u) == 0);
+    assert(guest_goldfish_tty_epoll_collect(&epolls, &sockets, &runtime,
+        7u, epfd, 2, ready) == 0); /* mask zero suppresses readable data */
+
+    const uint32_t read_edge = GUEST_GOLDFISH_TTY_EPOLLIN |
+                               GUEST_GOLDFISH_TTY_EPOLLET;
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 1, 7u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_MOD, tty_fd, read_edge, tty_data,
+        tty_fd, listener_fd) == 0);
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 1, 7u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_MOD, listener_fd,
+        GUEST_GOLDFISH_TTY_EPOLLIN, 0xfeedu, tty_fd, listener_fd) == 0);
+    assert(guest_goldfish_tty_epoll_collect(&epolls, &sockets, &runtime,
+        7u, epfd, 2, ready) == 1);
+    assert((ready[0].events & GUEST_GOLDFISH_TTY_EPOLLIN) != 0u);
+    assert(ready[0].data == tty_data);
+    assert(guest_goldfish_tty_rx_consume(&runtime, tty_fd, 1u) == 0);
+
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 1, 7u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_MOD, tty_fd, 0u, tty_data,
+        tty_fd, listener_fd) == 0);
+    assert(guest_goldfish_tty_rx_enqueue(&runtime, &serial_byte, 1u) == 0);
+    assert(guest_goldfish_tty_epoll_collect(&epolls, &sockets, &runtime,
+        7u, epfd, 2, ready) == 0);
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 1, 7u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_MOD, tty_fd,
+        GUEST_GOLDFISH_TTY_EPOLLIN, tty_data, tty_fd, listener_fd) == 0);
+    assert(guest_goldfish_tty_epoll_collect(&epolls, &sockets, &runtime,
+        7u, epfd, 2, ready) == 1);
+    assert(ready[0].data == tty_data);
+    assert(guest_goldfish_tty_rx_consume(&runtime, tty_fd, 1u) == 0);
+
+    int client_fd = guest_vsocket_alloc_fd(&sockets, VIRTUAL_FD_PROPERTY);
+    assert(client_fd >= 0);
+    assert(guest_vsocket_qemud_connect(&sockets, client_fd,
+        GUEST_VSOCKET_AF_UNIX, GUEST_VSOCKET_QEMUD_PATH, 47, 0, 0) == 0);
+    int accepted_fd = guest_vsocket_accept(&sockets, listener_fd);
+    assert(accepted_fd >= 0);
+    const uint64_t hangup_data = UINT64_C(0x8877665544332211);
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 1, 7u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_ADD, accepted_fd, 0u, hangup_data,
+        tty_fd, listener_fd) == 0);
+    assert(guest_vsocket_close_fd(&sockets, client_fd) == 0);
+    memset(ready, 0, sizeof(ready));
+    assert(guest_goldfish_tty_epoll_collect(&epolls, &sockets, &runtime,
+        7u, epfd, 2, ready) == 1);
+    assert(ready[0].events == GUEST_GOLDFISH_TTY_EPOLLHUP);
+    assert(ready[0].data == hangup_data);
+
+    /* EPOLL_CTL_DEL ignores its event argument, as in the guest kernel. */
+    assert(guest_goldfish_tty_epoll_ctl(&epolls, &sockets, 1, 7u, epfd,
+        GUEST_GOLDFISH_TTY_EPOLL_CTL_DEL, listener_fd, UINT32_MAX, 0,
+        tty_fd, listener_fd) == 0);
+    guest_goldfish_tty_epoll_remove_watched_fd(&epolls, accepted_fd);
+    guest_goldfish_tty_epoll_remove_watched_fd(&epolls, tty_fd);
+    assert(guest_goldfish_tty_epoll_watch_count(&epolls, epfd) == 0u);
+    assert(guest_vsocket_close_fd(&sockets, accepted_fd) == 0);
+    assert(guest_vsocket_close_fd(&sockets, listener_fd) == 0);
+    assert(guest_goldfish_tty_epoll_close(&epolls, epfd) == 0);
+    assert(guest_goldfish_tty_note_close(&runtime, tty_fd) == 0);
+}
+
 static void test_existing_placeholder_reconciliation(const char *base) {
     char case_dir[PATH_MAX], root[PATH_MAX], backing[PATH_MAX];
     format_path(case_dir, sizeof(case_dir), base, "/reuse-case");
@@ -403,6 +513,7 @@ int main(int argc, char **argv) {
     const char *base = argv[1];
     make_dir(base);
     test_event_mknod_open_termios_epoll_lifecycle(base);
+    test_epoll_zero_mask_add_then_enable();
     test_existing_placeholder_reconciliation(base);
     test_symlinked_node_and_outside_containment(base);
     puts("Goldfish ttyS1 uevent/mknod/open/termios/epoll regression: PASS (synthetic 240:1 guest-only; safe prior-run placeholder reconciliation; this TTY-only fixture adds no peer bytes; source-backed synthetic replies are tested separately; no host tty, epoll or device node)");
