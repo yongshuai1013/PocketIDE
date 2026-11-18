@@ -83,6 +83,7 @@ struct guest_goldfish_tty_runtime {
     unsigned long events_received;
     unsigned long mknod_attempts;
     unsigned long nodes_created;
+    unsigned long nodes_reused;
     unsigned long open_attempts;
     unsigned long ioctl_gets;
     unsigned long ioctl_sets;
@@ -294,6 +295,13 @@ static inline void guest_goldfish_tty_note_node_created(
     if (!runtime || minor >= GUEST_GOLDFISH_TTY_LINE_COUNT) return;
     runtime->node_mask |= (uint8_t)(1u << minor);
     runtime->nodes_created++;
+}
+
+static inline void guest_goldfish_tty_note_node_reused(
+        struct guest_goldfish_tty_runtime *runtime, uint32_t minor) {
+    if (!runtime || minor >= GUEST_GOLDFISH_TTY_LINE_COUNT) return;
+    runtime->node_mask |= (uint8_t)(1u << minor);
+    runtime->nodes_reused++;
 }
 
 static inline int guest_goldfish_tty_open_validate(

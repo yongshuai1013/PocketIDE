@@ -7364,6 +7364,10 @@ int main(int argc, char **argv) {
            guest_goldfish_tty_runtime.epoll_empty_waits,
            guest_goldfish_tty_runtime.unsupported,
            guest_goldfish_tty_diagnostics_emitted);
+    printf("GUEST GOLDFISH TTY PLACEHOLDER RECONCILIATION: created=%lu reused-existing-safe=%lu node-mask=0x%02x; existing reuse requires verified ueventd, matching add event/device/mode, no-follow regular file, app UID, one link, empty size and mode 0600\n",
+           guest_goldfish_tty_runtime.nodes_created,
+           guest_goldfish_tty_runtime.nodes_reused,
+           guest_goldfish_tty_runtime.node_mask);
     printf("GUEST QEMUD PEER SUMMARY: synthetic-profile=WVGA800 density=%u profile-value=qemu.sf.lcd_density=240 connected=%u channel=%u control-connects=%lu control-disconnects=%lu serial-frames=%lu property-list-requests=%lu records=%lu terminators=%lu ignored=%lu malformed=%lu local-clients=%lu accepted=%lu socket-stream-bytes=%lu stream-errors=%lu; never claims real QEMU/Goldfish runtime, no AVD/user/shared-network data\n",
            guest_qemud_peer_runtime.profile_density,
            guest_qemud_peer_runtime.boot_properties_connected,

@@ -9,7 +9,9 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/* Create an empty regular app-private placeholder, never a host device node. */
+/* Create or reconcile an empty regular app-private placeholder, never a host
+ * device node. A previous run can leave the VFS backing file behind while the
+ * in-memory uevent/node mask resets; only that exact safe placeholder is reused. */
 static inline int guest_goldfish_tty_create_app_private_placeholder(
         const char *guest_root, const char *guest_path, const char *backing_path,
         struct guest_goldfish_tty_runtime *runtime, int verified_ueventd,
@@ -36,8 +38,45 @@ static inline int guest_goldfish_tty_create_app_private_placeholder(
     int dirfd = guest_safe_dir_open_beneath_root(guest_root, directory, 0, 0);
     if (dirfd < 0) return dirfd;
     struct stat existing;
-    if (fstatat(dirfd, expected_leaf, &existing, AT_SYMLINK_NOFOLLOW) == 0) {
-        int result = S_ISLNK(existing.st_mode) ? -ELOOP : -EEXIST;
+    int existing_fd = openat(dirfd, expected_leaf,
+                             O_PATH | O_CLOEXEC | O_NOFOLLOW);
+    if (existing_fd >= 0) {
+        if (fstat(existing_fd, &existing) != 0) {
+            int saved = errno;
+            close(existing_fd);
+            close(dirfd);
+            return -saved;
+        }
+        struct stat path_now;
+        if (fstatat(dirfd, expected_leaf, &path_now, AT_SYMLINK_NOFOLLOW) != 0) {
+            int saved = errno;
+            close(existing_fd);
+            close(dirfd);
+            return -saved;
+        }
+        if (path_now.st_dev != existing.st_dev || path_now.st_ino != existing.st_ino) {
+            close(existing_fd);
+            close(dirfd);
+            return -ESTALE;
+        }
+        int result = -EEXIST;
+        if (S_ISLNK(existing.st_mode)) {
+            result = -ELOOP;
+        } else if ((runtime->node_mask & (uint8_t)(1u << minor)) == 0u &&
+                   S_ISREG(existing.st_mode) && existing.st_uid == getuid() &&
+                   existing.st_nlink == 1 && existing.st_size == 0 &&
+                   (existing.st_mode & 07777u) == 0600u) {
+            if (close(existing_fd) != 0) {
+                int saved = errno;
+                close(dirfd);
+                return -saved;
+            }
+            if (close(dirfd) != 0) return -errno;
+            guest_goldfish_tty_note_node_reused(runtime, minor);
+            if (minor_out) *minor_out = minor;
+            return 0;
+        }
+        close(existing_fd);
         close(dirfd);
         return result;
     }
@@ -63,7 +102,7 @@ static inline int guest_goldfish_tty_create_app_private_placeholder(
         return -saved;
     }
     if (!S_ISREG(st.st_mode) || st.st_uid != getuid() || st.st_nlink != 1 ||
-        st.st_size != 0 || (st.st_mode & 0777u) != 0600u) {
+        st.st_size != 0 || (st.st_mode & 07777u) != 0600u) {
         close(fd);
         (void)unlinkat(dirfd, expected_leaf, 0);
         close(dirfd);

@@ -453,6 +453,7 @@ assert 'if (nr == ARM_NR_EPOLL_WAIT)' in src and 'guest_goldfish_tty_epoll_wait_
 assert 'guest_goldfish_tty_epoll_remove_watched_fd' in src
 assert 'GUEST QEMUD VIRTUAL EPOLL WAIT PARKED:' in src
 assert 'GUEST GOLDFISH TTY SUMMARY:' in src
+assert 'GUEST GOLDFISH TTY PLACEHOLDER RECONCILIATION:' in src
 assert 'guest-software-blocked-epoll-wait' in src
 assert 'no host tty/QEMU/epoll calls' in src
 assert 'guest_qemud_client_actor_authorized(&identity)' in src
@@ -492,9 +493,15 @@ assert 'GUEST_GOLDFISH_TTY_QEMUD_MINOR 1u' in tty_model
 assert 'GUEST_GOLDFISH_TTY_O_LARGEFILE 0400000u' in tty_model
 assert 'guest_goldfish_tty_create_app_private_placeholder' in tty_fs
 assert 'AT_SYMLINK_NOFOLLOW' in tty_fs and 'O_NOFOLLOW' in tty_fs
+assert 'O_PATH | O_CLOEXEC | O_NOFOLLOW' in tty_fs
+assert 'guest_goldfish_tty_note_node_reused' in tty_fs
+assert 'existing.st_uid == getuid()' in tty_fs and 'existing.st_nlink == 1' in tty_fs
+assert 'existing.st_size == 0' in tty_fs and '(existing.st_mode & 07777u) == 0600u' in tty_fs
 assert 'guest_goldfish_tty_open_validate' in src and 'active_tracee->identity.euid == 0' in src
 assert 'guest_goldfish_tty_ioctl' in src and 'guest_goldfish_tty_epoll_wait_result' in src
 assert 'test_event_mknod_open_termios_epoll_lifecycle' in tty_test
+assert 'test_existing_placeholder_reconciliation' in tty_test
+assert 'link(linked_backing, alias_path)' in tty_test and 'nonempty_backing' in tty_test
 assert 'test_symlinked_node_and_outside_containment' in tty_test
 assert 'descriptor_flags = argument & GUEST_VSOCKET_FD_CLOEXEC' in socket_model
 assert 'argument & ~GUEST_VSOCKET_FD_CLOEXEC' not in socket_model
@@ -1057,17 +1064,17 @@ build_block = android_job.split('name: Build and verify continuous-trace APK', 1
 assert 'GINGERVM_SIGNING_PASSWORD' not in build_block
 assert 'EXPECTED_CERT_SHA256=398effdd769fa7db5bc6e45622b0d222570ffd0af3d889a8c23d0a82782ccc98' in workflow
 upload = workflow.split('      - name: Upload signed APK and checksum only', 1)[1]
-assert 'Build GingerVM v0.6.34 test-signed Android APK' in workflow
-assert 'gingervm-continuous-trace-v0.6.34-test-signed-apk' in upload
-assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.34-apk.sha256"' in workflow
-assert '${{ runner.temp }}/gingervm-v0.6.34-apk.sha256' in upload
+assert 'Build GingerVM v0.6.35 test-signed Android APK' in workflow
+assert 'gingervm-continuous-trace-v0.6.35-test-signed-apk' in upload
+assert 'sha256sum "$APK" > "$RUNNER_TEMP/gingervm-v0.6.35-apk.sha256"' in workflow
+assert '${{ runner.temp }}/gingervm-v0.6.35-apk.sha256' in upload
 assert '.keystore' not in upload and 'build.log' not in upload
-assert "versionCode 43" in gradle and "versionName '0.6.34'" in gradle
+assert "versionCode 44" in gradle and "versionName '0.6.35'" in gradle
 assert 'GINGER_SOURCE_COMMIT' in gradle and 'GITHUB_SHA' in gradle
 assert "gingerSourceCommit = 'local-uncommitted'" in gradle
 assert "gingerSourceCommit ==~ /[0-9a-fA-F]{40}/" in gradle
 assert 'multiArch="true"' in manifest
-assert 'GingerVM v0.6.34' in manifest and 'android:label="GingerVM"' in manifest
+assert 'GingerVM v0.6.35' in manifest and 'android:label="GingerVM"' in manifest
 assert '"$OUT64/libprobe_supervisor.so"' in build
 assert 'app/src/main/cpp/supervisor.c' not in build
 assert '"$OUT32/libprobe_guest.so"' in build

@@ -259,6 +259,105 @@ static void test_event_mknod_open_termios_epoll_lifecycle(const char *base) {
     assert(guest_goldfish_tty_note_close(&runtime, tty_fd) == -EBADF);
 }
 
+static void test_existing_placeholder_reconciliation(const char *base) {
+    char case_dir[PATH_MAX], root[PATH_MAX], backing[PATH_MAX];
+    format_path(case_dir, sizeof(case_dir), base, "/reuse-case");
+    make_dir(case_dir);
+    format_path(root, sizeof(root), case_dir, "/guest");
+    create_tty_directories(root, 1u);
+    format_path(backing, sizeof(backing), root, "/dev/ttyS1");
+
+    uint32_t device = guest_goldfish_tty_makedev(
+        GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR, 1u);
+    uint32_t minor = UINT32_MAX;
+    struct guest_goldfish_tty_runtime previous;
+    struct guest_uevent_queue previous_queue;
+    guest_goldfish_tty_runtime_init(&previous);
+    guest_uevent_queue_init(&previous_queue);
+    enqueue_and_deliver_tty_add(&previous_queue, &previous, 1u);
+    assert(guest_goldfish_tty_create_app_private_placeholder(root,
+        "/dev/ttyS1", backing, &previous, 1, GUEST_GOLDFISH_TTY_MODE,
+        device, &minor) == 0);
+    assert(previous.nodes_created == 1u && previous.nodes_reused == 0u);
+
+    /* A fresh supervisor runtime sees the old app-private VFS file but has no
+       in-memory node mask; only an exact safe placeholder may be reconciled. */
+    struct guest_goldfish_tty_runtime current;
+    struct guest_uevent_queue current_queue;
+    guest_goldfish_tty_runtime_init(&current);
+    guest_uevent_queue_init(&current_queue);
+    enqueue_and_deliver_tty_add(&current_queue, &current, 1u);
+    assert(guest_goldfish_tty_create_app_private_placeholder(root,
+        "/dev/ttyS1", backing, &current, 1, GUEST_GOLDFISH_TTY_MODE,
+        device, &minor) == 0);
+    assert(minor == 1u && current.nodes_created == 0u);
+    assert(current.nodes_reused == 1u && current.node_mask == 0x02u);
+    assert(guest_goldfish_tty_open_validate(&current, 1, "/dev/ttyS1",
+        2u | GUEST_GOLDFISH_TTY_O_LARGEFILE, &minor) == 0);
+    assert(guest_goldfish_tty_create_app_private_placeholder(root,
+        "/dev/ttyS1", backing, &current, 1, GUEST_GOLDFISH_TTY_MODE,
+        device, &minor) == -EEXIST);
+    assert(current.nodes_reused == 1u);
+
+    char bad_root[PATH_MAX], bad_backing[PATH_MAX];
+    format_path(bad_root, sizeof(bad_root), case_dir, "/bad-metadata");
+    create_tty_directories(bad_root, 3u);
+    format_path(bad_backing, sizeof(bad_backing), bad_root, "/dev/ttyS3");
+    int fd = open(bad_backing, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    assert(fd >= 0 && close(fd) == 0);
+    assert(chmod(bad_backing, 0644) == 0);
+    struct guest_goldfish_tty_runtime bad_runtime;
+    struct guest_uevent_queue bad_queue;
+    guest_goldfish_tty_runtime_init(&bad_runtime);
+    guest_uevent_queue_init(&bad_queue);
+    enqueue_and_deliver_tty_add(&bad_queue, &bad_runtime, 3u);
+    uint32_t bad_device = guest_goldfish_tty_makedev(
+        GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR, 3u);
+    assert(guest_goldfish_tty_create_app_private_placeholder(bad_root,
+        "/dev/ttyS3", bad_backing, &bad_runtime, 1,
+        GUEST_GOLDFISH_TTY_MODE, bad_device, &minor) == -EEXIST);
+    assert(bad_runtime.node_mask == 0u && bad_runtime.nodes_reused == 0u);
+
+    char linked_root[PATH_MAX], linked_backing[PATH_MAX], alias_path[PATH_MAX];
+    format_path(linked_root, sizeof(linked_root), case_dir, "/hardlinked");
+    create_tty_directories(linked_root, 4u);
+    format_path(linked_backing, sizeof(linked_backing), linked_root, "/dev/ttyS4");
+    fd = open(linked_backing, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    assert(fd >= 0 && close(fd) == 0);
+    format_path(alias_path, sizeof(alias_path), linked_root, "/placeholder-alias");
+    assert(link(linked_backing, alias_path) == 0);
+    struct guest_goldfish_tty_runtime linked_runtime;
+    struct guest_uevent_queue linked_queue;
+    guest_goldfish_tty_runtime_init(&linked_runtime);
+    guest_uevent_queue_init(&linked_queue);
+    enqueue_and_deliver_tty_add(&linked_queue, &linked_runtime, 4u);
+    uint32_t linked_device = guest_goldfish_tty_makedev(
+        GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR, 4u);
+    assert(guest_goldfish_tty_create_app_private_placeholder(linked_root,
+        "/dev/ttyS4", linked_backing, &linked_runtime, 1,
+        GUEST_GOLDFISH_TTY_MODE, linked_device, &minor) == -EEXIST);
+    assert(linked_runtime.node_mask == 0u && linked_runtime.nodes_reused == 0u);
+
+    char nonempty_root[PATH_MAX], nonempty_backing[PATH_MAX];
+    format_path(nonempty_root, sizeof(nonempty_root), case_dir, "/nonempty");
+    create_tty_directories(nonempty_root, 5u);
+    format_path(nonempty_backing, sizeof(nonempty_backing), nonempty_root,
+                "/dev/ttyS5");
+    fd = open(nonempty_backing, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    assert(fd >= 0 && write(fd, "x", 1u) == 1 && close(fd) == 0);
+    struct guest_goldfish_tty_runtime nonempty_runtime;
+    struct guest_uevent_queue nonempty_queue;
+    guest_goldfish_tty_runtime_init(&nonempty_runtime);
+    guest_uevent_queue_init(&nonempty_queue);
+    enqueue_and_deliver_tty_add(&nonempty_queue, &nonempty_runtime, 5u);
+    uint32_t nonempty_device = guest_goldfish_tty_makedev(
+        GUEST_GOLDFISH_TTY_SYNTHETIC_MAJOR, 5u);
+    assert(guest_goldfish_tty_create_app_private_placeholder(nonempty_root,
+        "/dev/ttyS5", nonempty_backing, &nonempty_runtime, 1,
+        GUEST_GOLDFISH_TTY_MODE, nonempty_device, &minor) == -EEXIST);
+    assert(nonempty_runtime.node_mask == 0u && nonempty_runtime.nodes_reused == 0u);
+}
+
 static void test_symlinked_node_and_outside_containment(const char *base) {
     char root[PATH_MAX], outside[PATH_MAX], guest_node[PATH_MAX], backing[PATH_MAX];
     format_path(root, sizeof(root), base, "/attack-root");
@@ -304,7 +403,8 @@ int main(int argc, char **argv) {
     const char *base = argv[1];
     make_dir(base);
     test_event_mknod_open_termios_epoll_lifecycle(base);
+    test_existing_placeholder_reconciliation(base);
     test_symlinked_node_and_outside_containment(base);
-    puts("Goldfish ttyS1 uevent/mknod/open/termios/epoll regression: PASS (synthetic 240:1 guest-only; this TTY-only fixture adds no peer bytes; source-backed synthetic replies are tested separately; no host tty, epoll or device node)");
+    puts("Goldfish ttyS1 uevent/mknod/open/termios/epoll regression: PASS (synthetic 240:1 guest-only; safe prior-run placeholder reconciliation; this TTY-only fixture adds no peer bytes; source-backed synthetic replies are tested separately; no host tty, epoll or device node)");
     return 0;
 }
