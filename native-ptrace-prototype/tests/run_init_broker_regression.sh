@@ -94,6 +94,8 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_setup_property_trace_test.c" -o "$TMP/guest_setup_property_trace_test"
 "$TMP/guest_setup_property_trace_test"
+python3 "$ROOT/tests/syscall125_diagnostics_contract_test.py" \
+  "$ROOT/app/src/main/cpp/init_supervisor.c"
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_timeout_diagnostics_test.c" -o "$TMP/guest_timeout_diagnostics_test"
 "$TMP/guest_timeout_diagnostics_test"

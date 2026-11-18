@@ -708,6 +708,16 @@ static int trace_cleanup_confirmed;
 static size_t trace_cleanup_unresolved;
 static int guest_root_readonly;
 static int guest_system_readonly;
+struct guest_syscall125_diagnostic {
+    pid_t host_pid;
+    pid_t guest_pid;
+    unsigned long stop_sequence;
+    int last_wait_status;
+    int last_signal;
+    unsigned int last_event;
+    int active;
+};
+static struct guest_syscall125_diagnostic guest_syscall125_diagnostic;
 static struct tracee_state tracees[MAX_TRACEES];
 static struct guest_tracee_slot_pool tracee_slot_pool;
 static size_t tracee_count;
@@ -1844,9 +1854,106 @@ static int fake_syscall(pid_t pid, struct compat_pt_regs *regs) {
     return 0;
 }
 
+static int guest_syscall125_diag_is_setprop(const struct tracee_state *state) {
+    return state && state->setup_property_active &&
+        state->setup_property_tool == GUEST_SETUP_PROPERTY_TOOL_SETPROP &&
+        strcmp(state->exec_target, "/system/bin/setprop") == 0;
+}
+
+static void guest_syscall125_diag_log_entry(pid_t host_pid,
+        const struct tracee_state *state, const struct compat_pt_regs *regs,
+        int wait_status) {
+    if (!guest_syscall125_diag_is_setprop(state) || !regs) return;
+    struct guest_syscall125_diagnostic *diag = &guest_syscall125_diagnostic;
+    if (diag->active && diag->host_pid != host_pid) return;
+    int saved_errno = errno;
+    if (!diag->active) {
+        memset(diag, 0, sizeof(*diag));
+        diag->host_pid = host_pid;
+        diag->guest_pid = state->guest_pid;
+        diag->active = 1;
+        diag->stop_sequence = 1;
+    }
+    diag->last_wait_status = wait_status;
+    diag->last_signal = WIFSTOPPED(wait_status) ? WSTOPSIG(wait_status) : 0;
+    diag->last_event = (unsigned int)wait_status >> 16;
+    printf("GUEST SETPROP ARM SYSCALL125 ENTRY: host-pid=%d guest-pid=%d r0=%u r1=%u r2=%u r3=%u r4=%u r5=%u r7=%u pc=0x%08x lr=0x%08x sp=0x%08x cpsr=0x%08x wait-status=0x%x expect_exit=%d signal=%d event=%u stop-seq=%lu\n",
+           host_pid, state->guest_pid, regs->uregs[0], regs->uregs[1],
+           regs->uregs[2], regs->uregs[3], regs->uregs[4], regs->uregs[5],
+           regs->uregs[7], regs->uregs[15], regs->uregs[14], regs->uregs[13],
+           regs->uregs[17], wait_status, state->expect_exit,
+           diag->last_signal, diag->last_event, diag->stop_sequence);
+    errno = saved_errno;
+}
+
+static void guest_syscall125_diag_log_stop(pid_t host_pid,
+        const struct tracee_state *state, int wait_status) {
+    struct guest_syscall125_diagnostic *diag = &guest_syscall125_diagnostic;
+    if (!diag->active || diag->host_pid != host_pid) return;
+    int saved_errno = errno;
+    diag->stop_sequence++;
+    diag->last_wait_status = wait_status;
+    diag->last_signal = WIFSTOPPED(wait_status) ? WSTOPSIG(wait_status) : 0;
+    diag->last_event = (unsigned int)wait_status >> 16;
+    printf("GUEST SETPROP SYSCALL125 PTRACE STOP: host-pid=%d guest-pid=%d stop-seq=%lu wait-status=0x%x signal=%d event=%u expect_exit=%d last-syscall=%d\n",
+           host_pid, state ? state->guest_pid : diag->guest_pid,
+           diag->stop_sequence, wait_status, diag->last_signal,
+           diag->last_event, state ? state->expect_exit : -1,
+           state ? state->last_syscall : -1);
+    errno = saved_errno;
+}
+
+static void guest_syscall125_diag_log_exit(pid_t host_pid,
+        const struct tracee_state *state, const struct compat_pt_regs *regs,
+        int wait_status) {
+    struct guest_syscall125_diagnostic *diag = &guest_syscall125_diagnostic;
+    if (!diag->active || diag->host_pid != host_pid || !state || !regs ||
+        !state->expect_exit || state->last_syscall != ARM_NR_MPROTECT)
+        return;
+    int saved_errno = errno;
+    printf("GUEST SETPROP ARM SYSCALL125 EXIT: host-pid=%d guest-pid=%d stop-seq=%lu wait-status=0x%x signal=%d event=%u expect_exit=%d r0-raw=0x%08x r0-signed=%d\n",
+           host_pid, state->guest_pid, diag->stop_sequence, wait_status,
+           WIFSTOPPED(wait_status) ? WSTOPSIG(wait_status) : 0,
+           (unsigned int)wait_status >> 16, state->expect_exit,
+           regs->uregs[0], (int32_t)regs->uregs[0]);
+    errno = saved_errno;
+}
+
+static void guest_syscall125_diag_log_terminal(pid_t host_pid,
+        const struct tracee_state *state, int wait_status,
+        int exited, int exit_code, int exit_signal) {
+    struct guest_syscall125_diagnostic *diag = &guest_syscall125_diagnostic;
+    if (!diag->active || diag->host_pid != host_pid) return;
+    int saved_errno = errno;
+    printf("GUEST SETPROP SYSCALL125 TRACE END: host-pid=%d guest-pid=%d wait-status=0x%x exited=%d exit-code=%d exit-signal=%d last-stop-seq=%lu\n",
+           host_pid, state ? state->guest_pid : diag->guest_pid, wait_status,
+           exited, exited ? exit_code : -1, exited ? 0 : exit_signal,
+           diag->stop_sequence);
+    diag->active = 0;
+    errno = saved_errno;
+}
+
 static int resume_trace(pid_t pid, int signal_number) {
-    return ptrace(PTRACE_SYSCALL, pid, NULL,
-                  (void *)(uintptr_t)(unsigned int)signal_number) == 0 ? 0 : -1;
+    int incoming_errno = errno;
+    errno = 0;
+    long ptrace_result = ptrace(PTRACE_SYSCALL, pid, NULL,
+                  (void *)(uintptr_t)(unsigned int)signal_number);
+    int ptrace_errno = ptrace_result == -1 ? errno : 0;
+    struct guest_syscall125_diagnostic *diag = &guest_syscall125_diagnostic;
+    if (diag->active && diag->host_pid == pid) {
+        int diagnostic_errno = errno;
+        printf("GUEST SETPROP SYSCALL125 PTRACE RESUME: host-pid=%d guest-pid=%d stop-seq=%lu request=PTRACE_SYSCALL signal=%d from-wait-status=0x%x from-signal=%d from-event=%u rc=%ld errno=%d\n",
+               pid, diag->guest_pid, diag->stop_sequence, signal_number,
+               diag->last_wait_status, diag->last_signal, diag->last_event,
+               ptrace_result, ptrace_errno);
+        errno = diagnostic_errno;
+    }
+    if (ptrace_result == 0) {
+        errno = incoming_errno;
+        return 0;
+    }
+    errno = ptrace_errno;
+    return -1;
 }
 
 static int seed_regular_file(const char *dir, const char *name, const char *contents) {
@@ -6404,6 +6511,9 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
     guest_setup_property_calls_suppressed = 0;
     guest_setup_shell_wait_events_emitted = 0;
     guest_setup_shell_wait_events_suppressed = 0;
+    memset(&guest_syscall125_diagnostic, 0,
+           sizeof(guest_syscall125_diagnostic));
+    guest_syscall125_diagnostic.host_pid = -1;
     struct tracee_state *root = add_tracee(pid, 0, 1, 1, 0, 0);
     if (!root) { kill_tracee(pid); return -1; }
     root->virtual_fd_table_id = 1;
@@ -6516,6 +6626,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             int diagnostic_errno = errno;
             guest_timeout_note_exit(state, WEXITSTATUS(status), 0);
             guest_setup_property_log_exit(state, 1, WEXITSTATUS(status), 0);
+            guest_syscall125_diag_log_terminal(waited, state, status, 1,
+                                               WEXITSTATUS(status), 0);
             errno = diagnostic_errno;
             printf("GUEST PROCESS EXIT: pid=%d code=%d\n", waited, WEXITSTATUS(status));
             if (!state->is_thread && state->guest_parent_pid > 0) {
@@ -6548,6 +6660,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             int diagnostic_errno = errno;
             guest_timeout_note_exit(state, -1, WTERMSIG(status));
             guest_setup_property_log_exit(state, 0, -1, WTERMSIG(status));
+            guest_syscall125_diag_log_terminal(waited, state, status, 0,
+                                               -1, WTERMSIG(status));
             errno = diagnostic_errno;
             printf("GUEST PROCESS EXIT: pid=%d signal=%d\n", waited, WTERMSIG(status));
             if (!state->is_thread && state->guest_parent_pid > 0) {
@@ -6580,6 +6694,7 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
         int sig = WSTOPSIG(status);
         unsigned event = (unsigned)status >> 16;
         active_tracee = state;
+        guest_syscall125_diag_log_stop(waited, state, status);
         if (event == 0 && sig != ARM_SYSCALL_STOP && sig != SIGTRAP)
             guest_timeout_note_signal(state, sig);
         if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
@@ -6841,6 +6956,9 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 guest_timeout_note_syscall(state, state->last_syscall,
                                            regs.uregs[15]);
                 errno = diagnostic_errno;
+                if (state->last_syscall == ARM_NR_MPROTECT)
+                    guest_syscall125_diag_log_entry(waited, state, &regs,
+                                                    status);
                 if (state->last_syscall == ARM_NR_CLONE) state->clone_flags = regs.uregs[0];
                 syscall_stops++;
                 int fake = 0;
@@ -6911,6 +7029,7 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     return 0;
                 }
             } else {
+                guest_syscall125_diag_log_exit(waited, state, &regs, status);
                 uint32_t syscall_result_bits = state->pending
                     ? (uint32_t)state->pending_return : (uint32_t)regs.uregs[0];
                 int32_t syscall_result = (int32_t)syscall_result_bits;
