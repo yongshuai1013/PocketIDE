@@ -50,6 +50,8 @@
 #include "guest_device_boundary.h"
 #include "ptrace_child_stop_queue.h"
 #include "guest_frame_channel.h"
+#include "guest_setup_property_trace.h"
+#include "guest_timeout_diagnostics.h"
 #include "guest_framebuffer_virtual.h"
 #include "guest_identity_compat.h"
 #include "guest_binder_virtual.h"
@@ -334,6 +336,12 @@ struct tracee_state {
     int pending;
     int needs_options;
     int last_syscall;
+    int setup_property_pending;
+    int setup_property_active;
+    enum guest_setup_property_tool setup_property_tool;
+    enum guest_setup_property_key_status setup_property_key_status;
+    uint32_t setup_property_sequence;
+    char setup_property_key[GUEST_SETUP_PROPERTY_KEY_CAPACITY];
     int exec_was_dynamic;
     int exec_was_script;
     int32_t pending_return;
@@ -362,6 +370,12 @@ struct tracee_state {
 };
 
 static struct guest_qemud_diag_run_budget guest_qemud_diag_run_budget;
+static struct guest_timeout_diagnostics guest_timeout_diagnostics;
+static uint32_t guest_setup_property_call_sequence;
+static uint32_t guest_setup_property_calls_emitted;
+static uint32_t guest_setup_property_calls_suppressed;
+static uint32_t guest_setup_shell_wait_events_emitted;
+static uint32_t guest_setup_shell_wait_events_suppressed;
 
 static void log_guest_qemud_syscall(pid_t host_pid, const struct tracee_state *state,
         const struct guest_qemud_diag_record *record) {
@@ -1154,6 +1168,236 @@ static int tracee_has_guest_backed_executable(const struct tracee_state *state,
         ((guest_root[0] && path_is_within(state->exec_backing_path, guest_root)) ||
          (native_guest_root[0] &&
           path_is_within(state->exec_backing_path, native_guest_root)));
+}
+
+#define GUEST_SETUP_PROPERTY_TRACE_MAX_EVENTS 96u
+
+static int tracee_is_setup_script_lineage(const struct tracee_state *state) {
+    return state && state->guest_pid > 1 &&
+        strcmp(state->exec_script_path, GUEST_API10_GOLDFISH_SCRIPT) == 0;
+}
+
+static int guest_timeout_role_for_tracee(const struct tracee_state *state) {
+    if (!state) return -1;
+    if (state->guest_parent_pid == 1 &&
+        strcmp(state->exec_script_path, GUEST_API10_GOLDFISH_SCRIPT) == 0 &&
+        tracee_has_guest_backed_executable(state, GUEST_API10_SHELL_PATH))
+        return GUEST_TIMEOUT_TRACE_SETUP_SHELL;
+    if (state->setup_property_active &&
+        state->setup_property_tool == GUEST_SETUP_PROPERTY_TOOL_SETPROP &&
+        tracee_has_guest_backed_executable(state, "/system/bin/setprop"))
+        return GUEST_TIMEOUT_TRACE_SETPROP;
+    if (tracee_has_guest_backed_executable(state, "/system/bin/app_process"))
+        return GUEST_TIMEOUT_TRACE_APP_PROCESS;
+    return -1;
+}
+
+static void guest_timeout_note_exec(const struct tracee_state *state) {
+    int role = guest_timeout_role_for_tracee(state);
+    if (role < 0) return;
+    guest_timeout_diagnostics_note_exec(&guest_timeout_diagnostics,
+        (enum guest_timeout_trace_role)role, state->pid, state->guest_pid,
+        state->guest_parent_pid, state->exec_target, state->exec_script_path,
+        role == GUEST_TIMEOUT_TRACE_SETPROP ? state->setup_property_key : NULL);
+}
+
+static void guest_timeout_note_exec_stop_pc(const struct tracee_state *state) {
+    int role = guest_timeout_role_for_tracee(state);
+    if (role < 0) return;
+    struct compat_pt_regs regs;
+    if (get_regs(state->pid, &regs) != 0) return;
+    guest_timeout_diagnostics_note_exec_stop_pc(&guest_timeout_diagnostics,
+        (enum guest_timeout_trace_role)role, state->pid, regs.uregs[15]);
+}
+
+static void guest_timeout_note_syscall(const struct tracee_state *state,
+        int syscall_number, uint32_t pc) {
+    int role = guest_timeout_role_for_tracee(state);
+    if (role < 0) return;
+    guest_timeout_diagnostics_note_syscall(&guest_timeout_diagnostics,
+        (enum guest_timeout_trace_role)role, state->pid, state->guest_pid,
+        state->guest_parent_pid, state->exec_target, state->exec_script_path,
+        role == GUEST_TIMEOUT_TRACE_SETPROP ? state->setup_property_key : NULL,
+        syscall_number, pc);
+}
+
+static void guest_timeout_note_result(const struct tracee_state *state,
+                                      int32_t result) {
+    int role = guest_timeout_role_for_tracee(state);
+    if (role >= 0)
+        guest_timeout_diagnostics_note_result(&guest_timeout_diagnostics,
+            (enum guest_timeout_trace_role)role, state->pid, result);
+}
+
+static void guest_timeout_note_parked(const struct tracee_state *state) {
+    int role = guest_timeout_role_for_tracee(state);
+    if (role >= 0)
+        guest_timeout_diagnostics_note_parked(&guest_timeout_diagnostics,
+            (enum guest_timeout_trace_role)role, state->pid);
+}
+
+static void guest_timeout_note_signal(const struct tracee_state *state,
+                                     int signal_number) {
+    int role = guest_timeout_role_for_tracee(state);
+    if (role >= 0)
+        guest_timeout_diagnostics_note_signal(&guest_timeout_diagnostics,
+            (enum guest_timeout_trace_role)role, state->pid, signal_number);
+}
+
+static void guest_timeout_note_exit(const struct tracee_state *state,
+                                    int exit_code, int exit_signal) {
+    int role = guest_timeout_role_for_tracee(state);
+    if (role < 0) return;
+    if (exit_signal)
+        guest_timeout_diagnostics_note_signal_exit(&guest_timeout_diagnostics,
+            (enum guest_timeout_trace_role)role, state->pid, exit_signal);
+    else
+        guest_timeout_diagnostics_note_exit(&guest_timeout_diagnostics,
+            (enum guest_timeout_trace_role)role, state->pid, exit_code);
+}
+
+static const char *guest_setup_property_key_for_log(
+        const struct tracee_state *state, char *safe_key, size_t safe_capacity,
+        int *truncated) {
+    const char *key = "<unavailable>";
+    if (state->setup_property_key_status == GUEST_SETUP_PROPERTY_KEY_READ ||
+        state->setup_property_key_status == GUEST_SETUP_PROPERTY_KEY_TRUNCATED)
+        key = state->setup_property_key;
+    else if (state->setup_property_key_status == GUEST_SETUP_PROPERTY_KEY_MISSING)
+        key = "<missing>";
+    int escaped_truncated = guest_diag_escape(key, safe_key, safe_capacity);
+    if (truncated) *truncated = escaped_truncated;
+    return safe_key;
+}
+
+static void guest_setup_property_log_call(const struct tracee_state *state) {
+    char safe_key[GUEST_SETUP_PROPERTY_KEY_CAPACITY * 4u];
+    int key_truncated = 0;
+    const char *key = guest_setup_property_key_for_log(state, safe_key,
+        sizeof(safe_key), &key_truncated);
+    if (state->setup_property_sequence <= GUEST_SETUP_PROPERTY_TRACE_MAX_EVENTS) {
+        guest_setup_property_calls_emitted++;
+        printf("GUEST SETUP SHELL PROPERTY CALL: sequence=%u guest-pid=%d parent-guest-pid=%d tool=%s key=\"%s\" key-status=%s key-truncated=%d; argv[2] property value was not read or logged\n",
+               state->setup_property_sequence, state->guest_pid,
+               state->guest_parent_pid,
+               guest_setup_property_tool_name(state->setup_property_tool), key,
+               guest_setup_property_key_status_name(state->setup_property_key_status),
+               key_truncated);
+    } else {
+        guest_setup_property_calls_suppressed++;
+    }
+}
+
+static int guest_setup_property_read_remote(void *context, uint32_t address,
+        void *output, size_t length) {
+    if (!context) return -1;
+    pid_t host_pid = *(const pid_t *)context;
+    return read_remote(host_pid, address, output, length);
+}
+
+static void guest_setup_property_observe_execve(struct tracee_state *state,
+        const char *guest_path, uint32_t argv_address) {
+    if (!state || !guest_path || !tracee_is_setup_script_lineage(state)) return;
+    enum guest_setup_property_tool tool =
+        guest_setup_property_tool_for_path(guest_path);
+    if (tool == GUEST_SETUP_PROPERTY_TOOL_NONE) return;
+
+    state->setup_property_tool = tool;
+    state->setup_property_pending = 1;
+    state->setup_property_active = 0;
+    state->setup_property_sequence = ++guest_setup_property_call_sequence;
+    pid_t host_pid = state->pid;
+    state->setup_property_key_status = guest_setup_property_capture_key(
+        argv_address, guest_setup_property_read_remote,
+        &host_pid, state->setup_property_key,
+        sizeof(state->setup_property_key));
+    guest_setup_property_log_call(state);
+}
+
+static void guest_setup_property_exec_committed(struct tracee_state *state) {
+    if (!state || !state->setup_property_pending ||
+        guest_setup_property_tool_for_path(state->exec_target) !=
+            state->setup_property_tool)
+        return;
+    state->setup_property_pending = 0;
+    state->setup_property_active = 1;
+    if (state->setup_property_sequence > GUEST_SETUP_PROPERTY_TRACE_MAX_EVENTS)
+        return;
+    char safe_key[GUEST_SETUP_PROPERTY_KEY_CAPACITY * 4u];
+    int key_truncated = 0;
+    const char *key = guest_setup_property_key_for_log(state, safe_key,
+        sizeof(safe_key), &key_truncated);
+    printf("GUEST SETUP SHELL PROPERTY EXEC: sequence=%u guest-pid=%d tool=%s key=\"%s\" result=exec-committed key-truncated=%d\n",
+           state->setup_property_sequence, state->guest_pid,
+           guest_setup_property_tool_name(state->setup_property_tool), key,
+           key_truncated);
+}
+
+static void guest_setup_property_exec_failed(struct tracee_state *state,
+                                              int32_t result) {
+    if (!state || !state->setup_property_pending) return;
+    if (state->setup_property_sequence <= GUEST_SETUP_PROPERTY_TRACE_MAX_EVENTS) {
+        char safe_key[GUEST_SETUP_PROPERTY_KEY_CAPACITY * 4u];
+        int key_truncated = 0;
+        const char *key = guest_setup_property_key_for_log(state, safe_key,
+            sizeof(safe_key), &key_truncated);
+        int error_number = result < 0 && result >= -4095 ? -result : 0;
+        printf("GUEST SETUP SHELL PROPERTY EXEC: sequence=%u guest-pid=%d tool=%s key=\"%s\" result=%d errno=%d(%s) exec-committed=0 key-truncated=%d\n",
+               state->setup_property_sequence, state->guest_pid,
+               guest_setup_property_tool_name(state->setup_property_tool), key,
+               result, error_number,
+               error_number ? guest_diag_errno_name(error_number) : "none",
+               key_truncated);
+    }
+    state->setup_property_pending = 0;
+}
+
+static void guest_setup_property_log_exit(const struct tracee_state *state,
+        int exited, int exit_code, int exit_signal) {
+    if (!state || !state->setup_property_active) return;
+    if (state->setup_property_sequence <= GUEST_SETUP_PROPERTY_TRACE_MAX_EVENTS) {
+        char safe_key[GUEST_SETUP_PROPERTY_KEY_CAPACITY * 4u];
+        int key_truncated = 0;
+        const char *key = guest_setup_property_key_for_log(state, safe_key,
+            sizeof(safe_key), &key_truncated);
+        printf("GUEST SETUP SHELL PROPERTY EXIT: sequence=%u guest-pid=%d tool=%s key=\"%s\" wait=%s exit-code=%d exit-signal=%d key-truncated=%d\n",
+               state->setup_property_sequence, state->guest_pid,
+               guest_setup_property_tool_name(state->setup_property_tool), key,
+               exited ? "exited" : "signaled", exited ? exit_code : -1,
+               exited ? 0 : exit_signal, key_truncated);
+    }
+}
+
+static void guest_setup_shell_log_wait_result(pid_t host_pid,
+        const struct tracee_state *state, const struct compat_pt_regs *regs) {
+    if (!state || !regs || !tracee_is_setup_script_lineage(state) ||
+        state->last_syscall != ARM_NR_WAIT4)
+        return;
+    if (guest_setup_shell_wait_events_emitted >= 96u) {
+        guest_setup_shell_wait_events_suppressed++;
+        return;
+    }
+    guest_setup_shell_wait_events_emitted++;
+    int32_t guest_result = (int32_t)regs->uregs[0];
+    uint32_t guest_status = 0;
+    int status_valid = guest_result > 0 && state->last_syscall_args[1] != 0u &&
+        read_remote(host_pid, state->last_syscall_args[1], &guest_status,
+                    sizeof(guest_status)) == 0;
+    int status_kind = status_valid
+        ? (int)(guest_status & 0x7fu) : -1;
+    int guest_exited = status_valid && status_kind == 0;
+    int guest_signaled = status_valid && status_kind > 0 && status_kind < 0x7f;
+    int guest_stopped = status_valid && status_kind == 0x7f;
+    int guest_exit_code = guest_exited ? (int)((guest_status >> 8) & 0xffu) : -1;
+    int guest_exit_signal = guest_signaled ? status_kind : 0;
+    printf("GUEST SETUP SHELL WAIT4: guest-pid=%d requested-child=%d options=0x%x returned-guest-pid=%d wait-result=%d status-valid=%d status=0x%08x child-state=%s child-exit-code=%d child-exit-signal=%d suppressed=%u; status read-only, no wait arguments/results changed\n",
+           state->guest_pid, (int32_t)state->last_syscall_args[0],
+           state->last_syscall_args[2], guest_result, guest_result,
+           status_valid, guest_status,
+           guest_exited ? "exited" : guest_signaled ? "signaled"
+               : guest_stopped ? "stopped" : status_valid ? "other" : "unavailable",
+           guest_exit_code, guest_exit_signal,
+           guest_setup_shell_wait_events_suppressed);
 }
 
 static int tracee_is_verified_api10_qemu_props(const struct tracee_state *state) {
@@ -6154,6 +6398,12 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
     next_guest_pid = 2;
     next_guest_tid = 2;
     next_virtual_fd_table_id = 2;
+    guest_timeout_diagnostics_init(&guest_timeout_diagnostics);
+    guest_setup_property_call_sequence = 0;
+    guest_setup_property_calls_emitted = 0;
+    guest_setup_property_calls_suppressed = 0;
+    guest_setup_shell_wait_events_emitted = 0;
+    guest_setup_shell_wait_events_suppressed = 0;
     struct tracee_state *root = add_tracee(pid, 0, 1, 1, 0, 0);
     if (!root) { kill_tracee(pid); return -1; }
     root->virtual_fd_table_id = 1;
@@ -6200,6 +6450,17 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             long elapsed = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
             if (elapsed >= trace_timeout_ms || stops >= TRACE_STOP_LIMIT) {
                 trace_timed_out = 1;
+                int diagnostic_errno = errno;
+                guest_timeout_diagnostics_log(&guest_timeout_diagnostics,
+                    elapsed >= trace_timeout_ms ? "wall-timeout" : "syscall-stop-limit",
+                    elapsed, stops);
+                printf("GUEST SETUP PROPERTY TRACE SUMMARY: calls=%u emitted=%u suppressed=%u shell-wait4-emitted=%u shell-wait4-suppressed=%u capture=exact-getprop-setprop argv[1] property-key-only argv[2] property-value=not-read-or-logged\n",
+                       guest_setup_property_call_sequence,
+                       guest_setup_property_calls_emitted,
+                       guest_setup_property_calls_suppressed,
+                       guest_setup_shell_wait_events_emitted,
+                       guest_setup_shell_wait_events_suppressed);
+                errno = diagnostic_errno;
                 break;
             }
             nanosleep(&pause, NULL);
@@ -6252,6 +6513,10 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             continue;
         }
         if (WIFEXITED(status)) {
+            int diagnostic_errno = errno;
+            guest_timeout_note_exit(state, WEXITSTATUS(status), 0);
+            guest_setup_property_log_exit(state, 1, WEXITSTATUS(status), 0);
+            errno = diagnostic_errno;
             printf("GUEST PROCESS EXIT: pid=%d code=%d\n", waited, WEXITSTATUS(status));
             if (!state->is_thread && state->guest_parent_pid > 0) {
                 size_t unreaped = count_unreaped_guest_children(state->guest_parent_pid);
@@ -6280,6 +6545,10 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
             continue;
         }
         if (WIFSIGNALED(status)) {
+            int diagnostic_errno = errno;
+            guest_timeout_note_exit(state, -1, WTERMSIG(status));
+            guest_setup_property_log_exit(state, 0, -1, WTERMSIG(status));
+            errno = diagnostic_errno;
             printf("GUEST PROCESS EXIT: pid=%d signal=%d\n", waited, WTERMSIG(status));
             if (!state->is_thread && state->guest_parent_pid > 0) {
                 size_t unreaped = count_unreaped_guest_children(state->guest_parent_pid);
@@ -6311,6 +6580,8 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
         int sig = WSTOPSIG(status);
         unsigned event = (unsigned)status >> 16;
         active_tracee = state;
+        if (event == 0 && sig != ARM_SYSCALL_STOP && sig != SIGTRAP)
+            guest_timeout_note_signal(state, sig);
         if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
             unsigned long child_message = 0;
             if (ptrace(PTRACE_GETEVENTMSG, waited, NULL, &child_message) != 0) {
@@ -6471,6 +6742,11 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 state->exec_script_path[0] = '\0';
             }
             state->pending_exec_script[0] = '\0';
+            int diagnostic_errno = errno;
+            guest_setup_property_exec_committed(state);
+            guest_timeout_note_exec(state);
+            guest_timeout_note_exec_stop_pc(state);
+            errno = diagnostic_errno;
             close_virtual_fds_on_exec(state);
             guest_binder_process_exec_reset(&state->binder);
             state->binder_waiting = 0;
@@ -6561,15 +6837,26 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                 state->last_syscall = (int32_t)regs.uregs[7];
                 memcpy(state->last_syscall_args, regs.uregs, sizeof(state->last_syscall_args));
                 state->last_guest_path[0] = '\0';
+                int diagnostic_errno = errno;
+                guest_timeout_note_syscall(state, state->last_syscall,
+                                           regs.uregs[15]);
+                errno = diagnostic_errno;
                 if (state->last_syscall == ARM_NR_CLONE) state->clone_flags = regs.uregs[0];
                 syscall_stops++;
                 int fake = 0;
                 int32_t result = 0;
                 int rc = dispatch_entry(waited, state, &regs, state->last_syscall, &result, &fake);
-                if (rc != 0) { fprintf(stderr, "broker failure at ARM syscall %d pid=%d: errno=%d\n", state->last_syscall, waited, errno); kill_all_tracees(); return -1; }
+                if (rc != 0) { fprintf(stderr, "broker failure at ARM syscall %d pid=%d errno=%d\n", state->last_syscall, waited, errno); kill_all_tracees(); return -1; }
+                if (state->last_syscall == ARM_NR_EXECVE) {
+                    int property_observer_errno = errno;
+                    guest_setup_property_observe_execve(state,
+                        state->pending_exec_target, state->last_syscall_args[1]);
+                    errno = property_observer_errno;
+                }
                 if (fake == 2) {
                     state->pending = 0;
                     state->expect_exit = 0;
+                    guest_timeout_note_parked(state);
                     const char *blocked_kind = state->last_syscall == ARM_NR_EPOLL_WAIT
                         ? "guest-software-blocked-epoll-wait"
                         : "guest-software-blocked-read";
@@ -6928,10 +7215,18 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     printf("BROKERED RESPONSE COMMITTED: pid=%d wait-status=0x%x ARM syscall=%d virtual result=%d SIGSYS-candidate=%d\n",
                            waited, status, state->last_syscall, state->pending_return,
                            state->broker_sigsys.armed);
+                    int diagnostic_errno = errno;
+                    guest_setup_shell_log_wait_result(waited, state, &regs);
+                    errno = diagnostic_errno;
                 }
                 if (!state->pending && translate_guest_pid_result(waited, state, &regs) != 0) {
                     fprintf(stderr, "cannot translate guest process result pid=%d: errno=%d\n", waited, errno);
                     kill_all_tracees(); return -1;
+                }
+                if (!state->pending) {
+                    int diagnostic_errno = errno;
+                    guest_setup_shell_log_wait_result(waited, state, &regs);
+                    errno = diagnostic_errno;
                 }
                 if (!state->pending && state->last_syscall == ARM_NR_EXECVE &&
                     (int32_t)regs.uregs[0] < 0) {
@@ -6950,6 +7245,11 @@ static int run_trace(pid_t pid, int *exit_code, int *exit_signal) {
                     state->exec_was_dynamic = 0;
                     state->exec_was_script = 0;
                 }
+                int diagnostic_errno = errno;
+                if (state->last_syscall == ARM_NR_EXECVE)
+                    guest_setup_property_exec_failed(state, syscall_result);
+                guest_timeout_note_result(state, syscall_result);
+                errno = diagnostic_errno;
                 state->expect_exit = 0;
                 state->pending = 0;
             }

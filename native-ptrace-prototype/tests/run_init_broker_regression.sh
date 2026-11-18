@@ -91,6 +91,12 @@ cc -std=c11 -O2 -Wall -Wextra -Werror \
 cc -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/tests/guest_diagnostics_test.c" -o "$TMP/guest_diagnostics_test"
 "$TMP/guest_diagnostics_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_setup_property_trace_test.c" -o "$TMP/guest_setup_property_trace_test"
+"$TMP/guest_setup_property_trace_test"
+cc -std=c11 -O2 -Wall -Wextra -Werror \
+  "$ROOT/tests/guest_timeout_diagnostics_test.c" -o "$TMP/guest_timeout_diagnostics_test"
+"$TMP/guest_timeout_diagnostics_test"
 mkdir -p "$TMP/java"
 javac -d "$TMP/java" \
   "$ROOT/app/src/main/java/dev/gingervm/nativeprobe/AppPrivateFileModeRestorer.java" \
@@ -162,6 +168,10 @@ property_protocol = Path(sys.argv[1]).with_name('guest_property_protocol.h').rea
 property_socket_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_property_socket_regression_test.c').read_text()
 diagnostics = Path(sys.argv[1]).with_name('guest_diagnostics.h').read_text()
 sigsys_context = Path(sys.argv[1]).with_name('guest_sigsys_context.h').read_text()
+setup_property_trace = Path(sys.argv[1]).with_name('guest_setup_property_trace.h').read_text()
+timeout_trace = Path(sys.argv[1]).with_name('guest_timeout_diagnostics.h').read_text()
+setup_property_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_setup_property_trace_test.c').read_text()
+timeout_trace_test = Path(sys.argv[1]).parents[4].joinpath('tests/guest_timeout_diagnostics_test.c').read_text()
 script_launch = Path(sys.argv[1]).with_name('guest_script_launch.h').read_text()
 profile = Path(sys.argv[1]).with_name('guest_hardware_profile.h').read_text()
 qemud_diagnostics = Path(sys.argv[1]).with_name('guest_qemud_diagnostics.h').read_text()
@@ -904,6 +914,35 @@ assert 'broker_sigsys_arm(&state->broker_sigsys' in trace
 assert 'broker_sigsys_mark_response_committed(&state->broker_sigsys)' in trace
 assert 'broker_sigsys_expire_before_next_entry(&state->broker_sigsys)' in trace
 assert 'state->expect_exit && state->pending' not in sigsys
+assert 'guest_setup_property_capture_key' in src
+property_observer = src.split('static void guest_setup_property_observe_execve', 1)[1].split('static void guest_setup_property_exec_committed', 1)[0]
+assert 'read_remote_string' not in property_observer
+assert 'guest_setup_property_tool_for_path(guest_path)' in property_observer
+assert 'guest_setup_property_observe_execve(state,' in trace and 'state->pending_exec_target' in trace
+assert 'int diagnostic_errno = errno;' in trace and 'errno = diagnostic_errno;' in trace
+assert 'argv_address + (uint32_t)sizeof(uint32_t)' in setup_property_trace
+assert 'argv_address + 2u' not in setup_property_trace
+assert 'guest_setup_property_tool_for_path' in setup_property_trace
+assert 'GUEST SETUP SHELL PROPERTY CALL:' in src and 'GUEST SETUP SHELL PROPERTY EXIT:' in src
+assert 'GUEST SETUP SHELL WAIT4:' in src and 'child-exit-code=%d child-exit-signal=%d' in src
+assert 'read_remote(host_pid, state->last_syscall_args[1]' in src
+assert 'argv[2] property value was not read or logged' in src
+assert 'dereferences argv[0] or argv[2]' in setup_property_trace
+assert 'guest_setup_property_capture_key' in setup_property_test
+assert 'argv[2] slot' in setup_property_test and 'sensitive-value-must-not-be-read' in setup_property_test
+for role in ('setup-shell', 'setprop', 'app_process'):
+    assert role in timeout_trace
+assert 'last-observed-pc-source=%s' in timeout_trace and 'mapped-file=' in timeout_trace
+assert 'syscall=%d(%s)' in timeout_trace and 'result-state=%s' in timeout_trace
+assert 'last-signal=%d exit-code=%d exit-signal=%d' in timeout_trace
+assert 'guest_timeout_diagnostics_note_syscall' in timeout_trace_test
+assert 'GUEST_TIMEOUT_TRACE_PC_EXEC_STOP' in timeout_trace_test
+timeout_branch = trace.split('if (elapsed >= trace_timeout_ms || stops >= TRACE_STOP_LIMIT)', 1)[1].split('nanosleep(&pause, NULL)', 1)[0]
+assert timeout_branch.index('guest_timeout_diagnostics_log') < timeout_branch.index('break;')
+assert 'VIRTUAL QEMUD CLIENT CONNECT:' in src and 'VIRTUAL QEMUD CLIENT ACCEPT:' in src
+assert 'VIRTUAL PROPERTY CONNECT:' in src and 'VIRTUAL PROPERTY ACCEPT:' in src
+assert 'GUEST QEMUD VIRTUAL EPOLL WAIT PARKED:' in src
+assert 'GUEST QEMUD VIRTUAL EPOLL WAKE:' in src
 sigsys_state = Path(sys.argv[1]).with_name('broker_sigsys_state.h').read_text()
 sigsys_test = Path(sys.argv[1]).parents[4] / 'tests/broker_sigsys_state_test.c'
 assert 'seccomp_syscall_number != -1' in sigsys_state
